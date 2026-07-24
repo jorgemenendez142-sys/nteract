@@ -22,7 +22,7 @@ managed by the app and CLI, not by system package-manager scripts.
 
 For remote workstations (Outerbounds, JupyterHub) that offer compute to
 hosted notebooks, use the headless one-liner — see
-[Remote workstations](docs/remote-workstation.md):
+[Remote workstations](docs/runbooks/remote-workstation.md):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.nteract.io | bash -s -- --headless
@@ -60,6 +60,17 @@ codex plugin marketplace add nteract/agent-plugins
 Restart Codex, then open the plugin directory, choose the nteract marketplace, and install `nteract`.
 
 The distribution repository also includes a `nightly` plugin entry for pre-release builds.
+
+If Codex still does not show notebook tools after restarting, refresh the marketplace and reinstall the selected plugin:
+
+```
+codex plugin marketplace upgrade nteract-plugins
+codex plugin remove nteract@nteract-plugins      # or nightly@nteract-plugins
+codex plugin add nteract@nteract-plugins         # or nightly@nteract-plugins
+codex mcp list
+```
+
+Start a new Codex session after reinstalling; running sessions do not hot-load newly installed MCP tools.
 
 ### Install the Claude Code plugin
 
@@ -134,29 +145,46 @@ nteract/nteract
 │   ├── lib/               # Shared utilities (cn(), dark-mode, error-boundary)
 │   └── styles/            # Global stylesheets
 ├── apps/                   # App entry points
-│   └── notebook/          # Notebook Tauri frontend
+│   ├── notebook/          # Desktop notebook Tauri app
+│   ├── notebook-cloud/    # Hosted notebook worker (Cloudflare)
+│   ├── elements/          # Elements design system catalog
+│   ├── mcp-app/           # MCP widget dev app
+│   └── renderer-test/     # Isolated renderer test harness
+├── packages/               # Shared npm packages
+│   ├── notebook-host/     # Notebook host shell
+│   ├── runtimed/          # Node/NAPI daemon client
+│   ├── runtimed-node/     # Node bindings for daemon
+│   ├── sift/              # Sift visualization renderer
+│   └── odometer/          # Odometer component
 ├── crates/                 # Rust code
 │   ├── runt/              # CLI binary
 │   ├── runtimed/          # Background daemon
 │   ├── runtimed-py/       # Python bindings for the daemon
-│   ├── runtimed-wasm/     # WASM Automerge bindings for frontend (same automerge crate as daemon)
-│   ├── notebook/          # Notebook Tauri app
-│   ├── notebook-doc/      # Shared Automerge document operations (cells, metadata, sync)
+│   ├── runtimed-wasm/     # WASM Automerge bindings for frontend
+│   ├── notebook/          # Notebook Tauri app crate
+│   ├── notebook-doc/      # Automerge document operations
 │   ├── notebook-protocol/ # Notebook wire protocol types
 │   ├── notebook-sync/     # Notebook sync layer
 │   ├── kernel-launch/     # Shared kernel launching API
 │   ├── kernel-env/        # Environment progress reporting
-│   ├── runt-mcp/          # Rust-native MCP server for notebook interaction
+│   ├── runt-mcp/          # Rust-native MCP server
 │   ├── runt-trust/        # Notebook trust extraction
 │   ├── runt-workspace/    # Workspace detection utilities
-│   ├── runtimed-client/   # Shared client library for daemon communication
-│   ├── repr-llm/          # LLM-friendly text summaries of visualization specs
+│   ├── runtimed-client/   # Shared client library for daemon
+│   ├── repr-llm/          # LLM-friendly text summaries of visualizations
 │   ├── xtask/             # Build automation tasks
-│   └── mcp-supervisor/    # nteract-dev MCP server (proxies runt mcp + adds dev tools)
-├── python/                 # Python packages
-│   ├── runtimed/          # PyPI: runtimed (Python bindings for daemon)
-│   ├── nteract/           # PyPI: nteract (thin wrapper that launches `runt mcp`)
-│   └── gremlin/           # Stress-testing agent for nteract notebooks (not published)
+│   └── mcp-supervisor/    # nteract-dev MCP server (proxies runt mcp + dev tools)
+├── python/                 # Python workspace (uv)
+│   ├── runtimed/          # PyPI: runtimed (Python bindings)
+│   ├── nteract/           # PyPI: nteract (thin launcher for `runt mcp`)
+│   ├── gremlin/           # Stress-testing agent
+│   ├── prewarm/           # Environment prewarm script
+│   ├── dx/                # Developer utilities
+│   ├── nteract-kernel-launcher/ # Kernel launcher for hosted notebooks
+│   ├── pr-reviewer/       # PR review agent
+│   └── safari-timeline/   # Safari timeline parser
+├── plugins/                # Agent plugin distribution
+│   └── nteract/           # Codex plugin package
 ```
 
 ## Development
@@ -165,8 +193,8 @@ nteract/nteract
 
 | Tool | Version | Install |
 |------|---------|---------|
-| Node.js | 20+ | https://nodejs.org |
-| pnpm | 10.12+ | `corepack enable` |
+| Node.js | 22.13+ | https://nodejs.org |
+| pnpm | 11.9+ | `corepack enable` |
 | Rust | 1.94.0 | https://rustup.rs (version managed by `rust-toolchain.toml`) |
 
 **Linux only:** Install GTK/WebKit dev libraries:

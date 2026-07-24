@@ -37,7 +37,7 @@ Options:
   --headless           Skip the desktop app: install only runt, runtimed,
                        and nteract-mcp. For remote workstations (Outerbounds,
                        JupyterHub) that offer compute to hosted notebooks.
-                       See docs/remote-workstation.md.
+                       See docs/runbooks/remote-workstation.md.
   --applications-dir <dir>
                        macOS only: where the .app bundle is installed
                        (default: ~/Applications — the install is per-user
@@ -102,6 +102,8 @@ case "$(uname -s):$(uname -m)" in
 esac
 
 REPO="nteract/nteract"
+# release-common.yml stamps these in the uploaded release asset so a copied
+# release installer with no args installs the exact channel and tag it came from.
 DEFAULT_CHANNEL="stable"
 DEFAULT_TAG=""
 CHANNEL="$DEFAULT_CHANNEL"
@@ -230,6 +232,19 @@ base_url() {
   fi
 }
 
+download_url() {
+  local url="$1"
+  local dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --show-error --silent "$url" --output "$dest"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "$dest" "$url"
+  else
+    echo "curl or wget is required to install nteract." >&2
+    exit 1
+  fi
+}
+
 fetch_asset() {
   local asset="$1"
   local dest="$2"
@@ -245,7 +260,7 @@ fetch_asset() {
     local url
     url="$(base_url)/$asset"
     echo "Downloading $url"
-    curl --fail --location --show-error --silent "$url" --output "$dest"
+    download_url "$url" "$dest"
   fi
   chmod 0755 "$dest"
 }
@@ -389,8 +404,16 @@ if [[ "$HEADLESS" == "1" ]]; then
   echo
   echo "Headless workstation install. To offer this machine's compute to a hosted"
   echo "notebook, mint a pairing code from the notebook's workstation panel, then:"
-  echo "  $CLI_NAME workstation connect https://app.runt.run --code <code>"
-  echo "  $CLI_NAME workstation run"
-  echo "(Releases without 'runt workstation' can use the cloud-runtime-agent flow"
-  echo "in docs/remote-workstation.md.)"
+  echo "  \"$BIN_DIR/$CLI_NAME\" workstation connect https://app.runt.run --code <code>"
+  if [[ "$OS" == "linux" ]]; then
+    echo "  \"$BIN_DIR/$CLI_NAME\" workstation service install --start"
+    echo "For tmux/manual testing, foreground mode still works:"
+    echo "  \"$BIN_DIR/$CLI_NAME\" workstation run"
+  else
+    echo "For macOS/non-systemd hosts, keep the foreground process running:"
+    echo "  \"$BIN_DIR/$CLI_NAME\" workstation run"
+    echo "Persistent workstation service management starts with Linux user systemd."
+  fi
+  echo "(Releases without '$CLI_NAME workstation' can use the cloud-runtime-agent flow"
+  echo "in docs/runbooks/remote-workstation.md.)"
 fi

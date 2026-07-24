@@ -19,7 +19,7 @@ const CELLS_MIME_TYPE: &str = "application/json";
 const NOTEBOOK_CONTEXT_PRIORITY: f32 = 0.8;
 
 /// The compiled output renderer HTML, built by `apps/mcp-app/build-html.js`.
-/// Build with: `cd apps/mcp-app && pnpm build`
+/// Build with: `cargo xtask artifacts ensure mcp-widget`
 /// The build script copies the file to `crates/runt-mcp/assets/_output.html`.
 const OUTPUT_HTML: &str = include_str!("../assets/_output.html");
 
@@ -123,6 +123,14 @@ pub fn list_resource_templates() -> ListResourceTemplatesResult {
             IconKind::ReadCell,
             NOTEBOOK_CONTEXT_PRIORITY,
         ),
+        assistant_resource_template(
+            "nteract://notebooks/{notebook_id}/comments",
+            "nteract notebook comments",
+            "Comment threads for a connected or parked notebook session",
+            "application/json",
+            IconKind::ListActiveNotebooks,
+            NOTEBOOK_CONTEXT_PRIORITY,
+        ),
     ];
 
     ListResourceTemplatesResult {
@@ -168,6 +176,18 @@ pub async fn read_resource(
         } => {
             let handle = handle_for_notebook(server, &notebook_id).await?;
             let text = cell_json(&notebook_id, &handle, &cell_id)?;
+            Ok(ReadResourceResult::new(vec![json_resource(uri, text)]))
+        }
+        NotebookResourceUri::Comments { notebook_id } => {
+            let handle = handle_for_notebook(server, &notebook_id).await?;
+            // Settle pending comments/state frames so a read right after join
+            // does not race the daemon's initial CommentsDocSync.
+            let _ = handle.confirm_state_sync().await;
+            let projection = handle
+                .get_comments_projection()
+                .map_err(|e| McpError::internal_error(format!("read comments: {e}"), None))?;
+            let text = serde_json::to_string_pretty(&projection)
+                .map_err(|e| McpError::internal_error(format!("serialize comments: {e}"), None))?;
             Ok(ReadResourceResult::new(vec![json_resource(uri, text)]))
         }
     }
@@ -268,11 +288,17 @@ async fn handle_for_notebook(
 ) -> Result<notebook_sync::handle::DocHandle, McpError> {
     if let Some(session) = server.session.read().await.as_ref() {
         if session.notebook_id == notebook_id {
-            return Ok(session.handle.clone());
+            return session
+                .access(crate::session::SessionRequirement::DocumentRead)
+                .map(|access| access.handle)
+                .map_err(resource_session_access_error);
         }
     }
     if let Some(session) = server.parked_sessions.read().await.get(notebook_id) {
-        return Ok(session.handle.clone());
+        return session
+            .access(crate::session::SessionRequirement::DocumentRead)
+            .map(|access| access.handle)
+            .map_err(resource_session_access_error);
     }
     Err(McpError::resource_not_found(
         format!(
@@ -281,6 +307,20 @@ async fn handle_for_notebook(
         ),
         None,
     ))
+}
+
+fn resource_session_access_error(error: crate::session::SessionAccessError) -> McpError {
+    McpError::internal_error(
+        serde_json::json!({
+            "error": {
+                "code": error.code,
+                "message": error.message,
+            },
+            "session": error.readiness,
+        })
+        .to_string(),
+        None,
+    )
 }
 
 fn json_resource(uri: &str, text: String) -> ResourceContents {
@@ -422,6 +462,9 @@ enum NotebookResourceUri {
         notebook_id: String,
         cell_id: String,
     },
+    Comments {
+        notebook_id: String,
+    },
 }
 
 fn parse_notebook_resource_uri(uri: &str) -> Result<NotebookResourceUri, String> {
@@ -440,6 +483,9 @@ fn parse_notebook_resource_uri(uri: &str) -> Result<NotebookResourceUri, String>
         [notebook_id, "cells", cell_id] => Ok(NotebookResourceUri::Cell {
             notebook_id: decode_segment(notebook_id)?,
             cell_id: decode_segment(cell_id)?,
+        }),
+        [notebook_id, "comments"] => Ok(NotebookResourceUri::Comments {
+            notebook_id: decode_segment(notebook_id)?,
         }),
         _ => Err(format!("Unknown nteract resource URI: {uri}")),
     }

@@ -48,6 +48,7 @@ from traitlets import ObjectName, Unicode
 
 import nteract_kernel_launcher._buffer_hook as _buffer_hook
 import nteract_kernel_launcher._output_redaction as _output_redaction
+import nteract_kernel_launcher._panel as _panel
 import nteract_kernel_launcher._traceback as _traceback
 from nteract_kernel_launcher._buffer_hook import pending_buffers
 from nteract_kernel_launcher._format import (
@@ -203,21 +204,31 @@ def _arrow_stream_mimebundle(source: Any, include=None, exclude=None) -> dict | 
 def _dataset_mimebundle(ds: Any, include=None, exclude=None) -> dict | None:
     """Emit Arrow IPC bytes + HF features summary for a ``datasets.Dataset``.
 
-    The underlying ``ds.data.table`` carries the ``huggingface`` schema KV
+    The Arrow-formatted logical view preserves the ``huggingface`` schema KV
     metadata that Sift uses to detect rich types (Image, ClassLabel,
-    Translation, …). Going through the arrow table preserves that metadata
-    end-to-end. When no underlying table is available (IterableDataset,
-    streaming, …), fall back to the legacy summary-only bundle so the
-    formatter stays best-effort.
+    Translation, …) while also applying any Dataset indices mapping from
+    ``shuffle`` / ``select``. Reading ``ds.data.table`` directly would expose
+    the physical backing rows instead. When no table-backed logical view is
+    available (IterableDataset, streaming, …), fall back to the legacy
+    summary-only bundle so the formatter stays best-effort.
     """
-    table = getattr(getattr(ds, "data", None), "table", None)
     summary = lambda: summarize_dataset(ds)  # noqa: E731
+    table = getattr(getattr(ds, "data", None), "table", None)
 
     if table is None:
         try:
             return {"text/llm+plain": summary()}
         except Exception as exc:  # noqa: BLE001
             log.debug("dataset mimebundle failed: %s", exc)
+            return None
+
+    try:
+        table = ds.with_format("arrow")[:]
+    except Exception as exc:  # noqa: BLE001
+        log.debug("dataset logical Arrow materialization failed: %s", exc)
+        try:
+            return {"text/llm+plain": summary()}
+        except Exception:  # noqa: BLE001
             return None
 
     total_rows = getattr(ds, "num_rows", table.num_rows)
@@ -516,6 +527,11 @@ def _install_buffer_hooks(ip: Any) -> None:
     _buffer_hook.install(ip)
 
 
+def _install_panel_formatter(ip: Any) -> None:
+    """Register Panel's lazy Bokeh document-session adapter."""
+    _panel.install(ip)
+
+
 def _enable_altair_renderer(alt: Any) -> None:
     try:
         alt.renderers.enable("nteract")
@@ -679,6 +695,7 @@ def load_ipython_extension(ip: Any) -> None:
     """
     _run_bootstrap_step("LLM formatter install", lambda: _install_llm_formatter(ip))
     _run_bootstrap_step("dataframe formatter install", lambda: _install_dataframe_formatters(ip))
+    _run_bootstrap_step("Panel formatter install", lambda: _install_panel_formatter(ip))
     _run_bootstrap_step("buffer hook install", lambda: _install_buffer_hooks(ip))
     _run_bootstrap_step("output redaction install", lambda: _output_redaction.install(ip))
     _run_bootstrap_step("third-party renderer enable", _enable_third_party_renderers)
@@ -694,6 +711,7 @@ def unload_ipython_extension(ip: Any) -> None:
     this defined keeps ``%reload_ext nteract_kernel_launcher._bootstrap``
     well-behaved during dev iteration.
     """
+    _panel.uninstall(ip)
     try:
         for pub in (ip.display_pub, ip.displayhook):
             hooks = list(getattr(pub, "_hooks", []))

@@ -11,6 +11,33 @@ pub struct TrustState {
     pub pending_launch: bool,
 }
 
+impl TrustState {
+    /// Trust state for a notebook that declares no dependency metadata:
+    /// nothing needs approval and kernel launch is not gated. This is a
+    /// deliberate verdict, not a default; construct other states explicitly.
+    pub(crate) fn no_dependencies() -> Self {
+        TrustState {
+            status: runt_trust::TrustStatus::NoDependencies,
+            info: runt_trust::TrustInfo {
+                status: runt_trust::TrustStatus::NoDependencies,
+                uv_dependencies: vec![],
+                approved_uv_dependencies: vec![],
+                conda_dependencies: vec![],
+                approved_conda_dependencies: vec![],
+                conda_channels: vec![],
+                approved_conda_channels: vec![],
+                pixi_dependencies: vec![],
+                approved_pixi_dependencies: vec![],
+                pixi_pypi_dependencies: vec![],
+                approved_pixi_pypi_dependencies: vec![],
+                pixi_channels: vec![],
+                approved_pixi_channels: vec![],
+            },
+            pending_launch: false,
+        }
+    }
+}
+
 fn enrich_trust_info(room: &NotebookRoom, trust: &mut TrustState) {
     if let Err(error) = room.trusted_packages.enrich_info(&mut trust.info) {
         warn!(
@@ -817,6 +844,12 @@ pub(crate) fn compute_env_sync_diff(
 /// blob-store hashes, then updates the cell-local `resolved_assets` maps so
 /// isolated markdown rendering can rewrite those refs to blob URLs.
 pub(crate) async fn process_markdown_assets(room: &NotebookRoom) {
+    if room.is_hosted() {
+        // Resolved-asset writes are authored by a daemon actor the hosted room's
+        // actor authorization rejects, and the blob refs are local-only.
+        return;
+    }
+
     let notebook_path = room.file_binding.path().await.filter(|p| p.exists());
     // Capture heads BEFORE async resolution. Later, write resolved assets in
     // an isolated transaction at this baseline so the update composes with
@@ -854,6 +887,9 @@ pub(crate) async fn process_markdown_assets(room: &NotebookRoom) {
 
     let persist_bytes = {
         let mut doc = room.doc.write().await;
+        let rollback_actor = doc.get_actor_id();
+        let rollback_snapshot = doc.save();
+        let durable_baseline_heads = doc.get_heads();
         let wrote_assets = match doc.transact_at_heads_recovering(
             &baseline_heads,
             Some("runtimed:assets"),
@@ -881,6 +917,17 @@ pub(crate) async fn process_markdown_assets(room: &NotebookRoom) {
             }
         };
         if !wrote_assets {
+            return;
+        }
+        if let Err(error) = super::durability::commit_daemon_notebook_mutation(
+            room,
+            &mut doc,
+            &durable_baseline_heads,
+            &rollback_snapshot,
+            &rollback_actor,
+            "markdown asset projection",
+        ) {
+            warn!("[metadata] {error}");
             return;
         }
         doc.save()
@@ -994,12 +1041,25 @@ pub(crate) async fn check_and_update_trust_state(room: &NotebookRoom) {
         let doc = room.doc.read().await;
         doc.get_metadata_snapshot()
     };
-
-    let Some(current_metadata) = current_metadata else {
-        return;
+    let current_metadata = if current_metadata.is_some() {
+        current_metadata
+    } else {
+        let mut doc = room.doc.write().await;
+        match doc.get_metadata_snapshot() {
+            Some(snapshot) => Some(snapshot),
+            // A pristine file-backed room may still be waiting for notebook
+            // metadata to seed from disk/client sync. Preserve its initial
+            // disk-derived trust state until the document has real history.
+            None if doc.is_pristine() => return,
+            None => None,
+        }
     };
 
-    let mut new_trust = verify_trust_from_snapshot(&current_metadata, &room.trusted_packages);
+    let mut new_trust = if let Some(current_metadata) = current_metadata {
+        verify_trust_from_snapshot(&current_metadata, &room.trusted_packages)
+    } else {
+        trust_state_from_metadata(&std::collections::HashMap::new(), &room.trusted_packages)
+    };
     enrich_trust_info(room, &mut new_trust);
 
     let current_runtime_trust = {
@@ -1368,6 +1428,8 @@ pub(crate) async fn capture_env_into_metadata(
     env_id: &str,
 ) -> bool {
     let mut doc = room.doc.write().await;
+    let rollback_actor = doc.get_actor_id();
+    let rollback_snapshot = doc.save();
     let heads = doc.get_heads();
     let changed = match doc.transact_at_heads_recovering(
         &heads,
@@ -1423,6 +1485,19 @@ pub(crate) async fn capture_env_into_metadata(
             false
         }
     };
+    if changed {
+        if let Err(error) = super::durability::commit_daemon_notebook_mutation(
+            room,
+            &mut doc,
+            &heads,
+            &rollback_snapshot,
+            &rollback_actor,
+            "environment metadata capture",
+        ) {
+            warn!("[notebook-sync] {error}");
+            return false;
+        }
+    }
     drop(doc);
     if changed {
         // Notify the autosave debouncer so the capture lands in the .ipynb
@@ -1490,6 +1565,8 @@ pub(crate) async fn flush_launched_deps_to_metadata(
     };
 
     let mut doc = room.doc.write().await;
+    let rollback_actor = doc.get_actor_id();
+    let rollback_snapshot = doc.save();
     let heads = doc.get_heads();
     let changed = match doc.transact_at_heads_recovering(
         &heads,
@@ -1541,6 +1618,19 @@ pub(crate) async fn flush_launched_deps_to_metadata(
             false
         }
     };
+    if changed {
+        if let Err(error) = super::durability::commit_daemon_notebook_mutation(
+            room,
+            &mut doc,
+            &heads,
+            &rollback_snapshot,
+            &rollback_actor,
+            "launched dependency metadata flush",
+        ) {
+            warn!("[notebook-sync] {error}");
+            return false;
+        }
+    }
     drop(doc);
     changed
 }
@@ -1692,6 +1782,74 @@ pub(crate) fn captured_env_disk_state(captured: &CapturedEnv) -> CapturedEnvDisk
         &kernel_env::uv::default_cache_dir_uv(),
         &kernel_env::conda::default_cache_dir_conda(),
     )
+}
+
+/// Force-rebuild an already-resolved notebook-captured environment.
+///
+/// The captured dependency snapshot and `env_id` are the sole identity input;
+/// callers must retain the snapshot from the original launch resolution rather
+/// than re-reading mutable notebook metadata after a failed handshake.
+///
+/// The caller must own the room's single-flight launch admission for the full
+/// rebuild and retry. This helper deliberately publishes `PreparingEnv` and
+/// then `Launching`; if the retry fails, the caller's terminal response arm
+/// replaces `Launching` with its contextual error/reset outcome.
+pub(crate) async fn rebuild_captured_environment(
+    room: &NotebookRoom,
+    captured: &CapturedEnv,
+) -> anyhow::Result<crate::PooledEnv> {
+    room.state
+        .with_doc(|sd| sd.set_lifecycle(&RuntimeLifecycle::PreparingEnv))?;
+
+    let progress_handler: std::sync::Arc<dyn kernel_env::ProgressHandler> = std::sync::Arc::new(
+        crate::inline_env::RuntimeDocProgressHandler::new(room.state.clone()),
+    );
+
+    let env = match captured {
+        CapturedEnv::Uv { deps, env_id } => {
+            let rebuilt = kernel_env::uv::rebuild_environment_unified(
+                deps,
+                env_id,
+                &kernel_env::uv::default_cache_dir_uv(),
+                progress_handler,
+            )
+            .await?;
+            crate::PooledEnv {
+                env_type: crate::EnvType::Uv,
+                venv_path: rebuilt.venv_path,
+                python_path: rebuilt.python_path,
+                prewarmed_packages: deps.dependencies.clone(),
+            }
+        }
+        CapturedEnv::Conda { deps, env_id } => {
+            let rebuilt = kernel_env::conda::rebuild_environment_unified(
+                deps,
+                env_id,
+                &kernel_env::conda::default_cache_dir_conda(),
+                progress_handler,
+            )
+            .await?;
+            crate::PooledEnv {
+                env_type: crate::EnvType::Conda,
+                venv_path: rebuilt.env_path,
+                python_path: rebuilt.python_path,
+                prewarmed_packages: deps.dependencies.clone(),
+            }
+        }
+    };
+
+    {
+        let mut active_path = room.runtime_agent_env_path.write().await;
+        *active_path = Some(env.venv_path.clone());
+    }
+
+    // The runtime agent repeats this transition when it accepts the request,
+    // but publish it before the retry send so the rebuild's PreparingEnv state
+    // cannot remain visible during transport handoff.
+    room.state
+        .with_doc(|sd| sd.set_lifecycle(&RuntimeLifecycle::Launching))?;
+
+    Ok(env)
 }
 
 /// Test-friendly form of [`captured_env_disk_state`] that accepts explicit
@@ -2406,6 +2564,13 @@ pub(crate) fn publish_environment_launch_error(
         sd.set_lifecycle_with_error_details(&RuntimeLifecycle::Error, reason, Some(details))?;
         sd.set_kernel_info("python", "python", env_source)?;
         sd.clear_env_progress()?;
+        // This is the coordinator's terminal launch-error publish on the
+        // authoritative room doc. Resolve any cells still queued against the
+        // launch that just failed: with no kernel they can never run, so
+        // "queued" → "cancelled" (and any stray "running" → "error"). Catches
+        // executions the runtime agent's own abort missed because they were
+        // queued room-side during the launch and never synced to the agent.
+        sd.abort_inflight_executions()?;
         Ok(())
     }) {
         error!(
@@ -2778,15 +2943,105 @@ pub(crate) async fn try_conda_pool_for_inline_deps(
 /// Auto-launch kernel for a trusted notebook when first peer connects.
 /// This is similar to handle_notebook_request(LaunchKernel) but without a request/response.
 ///
-/// Resolves the metadata snapshot from the Automerge doc (if the first client has
-/// already synced) or falls back to reading the .ipynb from disk.
+/// Loops over [`auto_launch_kernel_attempt`]: one iteration per admitted
+/// single-flight token. An iteration hands back a fresh token only when its
+/// benign no-peers abort raced a reconnect. That connect was refused
+/// admission (`InFlight`) while this task still held the gate and has no
+/// retry trigger of its own, so this task retries on its behalf.
 pub(crate) async fn auto_launch_kernel(
     room: &std::sync::Arc<NotebookRoom>,
     notebook_id: &str,
     default_runtime: crate::runtime::Runtime,
     default_python_env: crate::settings_doc::PythonEnvType,
     daemon: std::sync::Arc<crate::daemon::Daemon>,
+    attempt: super::room::AutoLaunchAttempt,
 ) {
+    let mut attempt = attempt;
+    loop {
+        attempt = match auto_launch_kernel_attempt(
+            room,
+            notebook_id,
+            default_runtime.clone(),
+            default_python_env.clone(),
+            daemon.clone(),
+            attempt,
+        )
+        .await
+        {
+            Some(next) => next,
+            None => return,
+        };
+        info!(
+            "[notebook-sync] Auto-launch abort raced a reconnect for {}; retrying",
+            notebook_id
+        );
+        // The abort reset lifecycle to NotStarted; restore Resolving to
+        // mirror what the connect path writes after admission, so the
+        // reconnected peer never sits on stale NotStarted.
+        if let Err(e) = room
+            .state
+            .with_doc(|sd| sd.set_lifecycle(&RuntimeLifecycle::Resolving))
+        {
+            warn!("[runtime-state] {}", e);
+        }
+    }
+}
+
+/// Benign no-peers abort for an in-flight auto-launch attempt.
+///
+/// Releases the single-flight token, then re-checks active peers only after
+/// the release. The order is load-bearing: a connect that lands during the
+/// abort window is refused admission (`InFlight`) and has no retry trigger of
+/// its own, so a peers check taken before the release could see 0, release
+/// the gate, and strand the reconnected peer at `NotStarted` with nobody left
+/// to launch. Checking after the release closes that window: either this
+/// call sees the peer and re-admits on its behalf, or the connect itself got
+/// admitted after the release and owns the next attempt.
+///
+/// Returns a fresh token when the caller should retry the launch; `None`
+/// when the abort stands or another caller won re-admission.
+pub(crate) async fn release_attempt_and_readmit_if_peer_waiting(
+    room: &std::sync::Arc<NotebookRoom>,
+    attempt: super::room::AutoLaunchAttempt,
+) -> Option<super::room::AutoLaunchAttempt> {
+    reset_starting_state(room, None).await;
+    attempt.release_without_cooldown();
+    if room
+        .connections
+        .active_peers
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 0
+    {
+        return None;
+    }
+    match room.try_begin_auto_launch() {
+        super::room::AutoLaunchAdmission::Admitted(next) => Some(next),
+        // InFlight: the racing connect was admitted after the release and
+        // owns the retry. CoolingDown: a concurrent failed attempt armed
+        // the gate between release and re-check; its Error lifecycle is
+        // the signal the connected peer observes.
+        _ => None,
+    }
+}
+
+/// One admitted auto-launch attempt, owned end to end.
+///
+/// Resolves the metadata snapshot from the Automerge doc (if the first client
+/// has already synced) or falls back to reading the .ipynb from disk.
+///
+/// Token disposition: dropping `attempt` on any exit path that did not launch
+/// a kernel (and was not a benign abort) arms the failure cooldown, so error
+/// returns need no per-site handling. Returns `Some(token)` only when a
+/// benign no-peers abort re-admitted a reconnect that raced it; the caller
+/// must retry with that token.
+async fn auto_launch_kernel_attempt(
+    room: &std::sync::Arc<NotebookRoom>,
+    notebook_id: &str,
+    default_runtime: crate::runtime::Runtime,
+    default_python_env: crate::settings_doc::PythonEnvType,
+    daemon: std::sync::Arc<crate::daemon::Daemon>,
+    attempt: super::room::AutoLaunchAttempt,
+) -> Option<super::room::AutoLaunchAttempt> {
     // Check if room still has peers (protect against race condition where client disconnects
     // before we finish launching)
     if room
@@ -2796,8 +3051,7 @@ pub(crate) async fn auto_launch_kernel(
         == 0
     {
         debug!("[notebook-sync] Auto-launch aborted: no peers remaining");
-        reset_starting_state(room, None).await;
-        return;
+        return release_attempt_and_readmit_if_peer_waiting(room, attempt).await;
     }
 
     // For saved notebooks, notebook_path_opt is the file path (kernel cwd = parent dir).
@@ -2874,7 +3128,8 @@ pub(crate) async fn auto_launch_kernel(
         let has_runtime_agent = room.runtime_agent_handle.lock().await.is_some();
         if has_runtime_agent {
             debug!("[notebook-sync] Auto-launch skipped: runtime agent already exists");
-            return;
+            attempt.release_without_cooldown();
+            return None;
         }
     }
 
@@ -2886,8 +3141,7 @@ pub(crate) async fn auto_launch_kernel(
         == 0
     {
         debug!("[notebook-sync] Auto-launch aborted: no peers (after status check)");
-        reset_starting_state(room, None).await;
-        return;
+        return release_attempt_and_readmit_if_peer_waiting(room, attempt).await;
     }
 
     // Clear any stale comm state from a previous kernel (in case it crashed)
@@ -2965,7 +3219,7 @@ pub(crate) async fn auto_launch_kernel(
                     &details,
                 )
                 .await;
-                return;
+                return None;
             }
         }
     };
@@ -3026,7 +3280,7 @@ pub(crate) async fn auto_launch_kernel(
                 }) {
                     warn!("[runtime-state] {}", e);
                 }
-                return;
+                return None;
             }
         }
     }
@@ -3100,7 +3354,7 @@ pub(crate) async fn auto_launch_kernel(
                         Err(()) => {
                             reset_and_publish_prewarmed_acquire_error(room, env_source.as_str())
                                 .await;
-                            return;
+                            return None;
                         }
                     }
                 };
@@ -3160,7 +3414,7 @@ pub(crate) async fn auto_launch_kernel(
                                     env_source.as_str(),
                                 )
                                 .await;
-                                return;
+                                return None;
                             }
                         }
                     };
@@ -3192,7 +3446,7 @@ pub(crate) async fn auto_launch_kernel(
                     Ok(None) => None,
                     Err(()) => {
                         reset_and_publish_prewarmed_acquire_error(room, prewarmed.as_str()).await;
-                        return;
+                        return None;
                     }
                 };
                 ("python", prewarmed, pooled_env)
@@ -3232,7 +3486,7 @@ pub(crate) async fn auto_launch_kernel(
                 }) {
                     warn!("[runtime-state] {}", e);
                 }
-                return;
+                return None;
             }
         }
     }
@@ -3293,7 +3547,7 @@ pub(crate) async fn auto_launch_kernel(
                         Some(KernelErrorReason::EnvironmentPrepareFailed),
                         &details,
                     );
-                    return;
+                    return None;
                 }
             }
         } else {
@@ -3385,7 +3639,7 @@ pub(crate) async fn auto_launch_kernel(
                                     Some(KernelErrorReason::EnvironmentPrepareFailed),
                                     &details,
                                 );
-                                return;
+                                return None;
                             }
                         }
                     }
@@ -3427,7 +3681,7 @@ pub(crate) async fn auto_launch_kernel(
                             Some(KernelErrorReason::EnvironmentPrepareFailed),
                             &details,
                         );
-                        return;
+                        return None;
                     }
                 }
             }
@@ -3513,7 +3767,7 @@ pub(crate) async fn auto_launch_kernel(
                                     Some(KernelErrorReason::EnvironmentPrepareFailed),
                                     &details,
                                 );
-                                return;
+                                return None;
                             }
                         }
                     }
@@ -3547,7 +3801,7 @@ pub(crate) async fn auto_launch_kernel(
                 details,
             )
             .await;
-            return;
+            return None;
         };
 
         let detected_yml = crate::project_file::DetectedProjectFile {
@@ -3572,7 +3826,7 @@ pub(crate) async fn auto_launch_kernel(
                 }) {
                     warn!("[runtime-state] {}", e);
                 }
-                return;
+                return None;
             }
         }
 
@@ -3588,7 +3842,7 @@ pub(crate) async fn auto_launch_kernel(
                     &details,
                 )
                 .await;
-                return;
+                return None;
             }
         };
 
@@ -3714,7 +3968,7 @@ pub(crate) async fn auto_launch_kernel(
                             &details,
                         )
                         .await;
-                        return;
+                        return None;
                     }
                 } else {
                     true
@@ -3751,7 +4005,7 @@ pub(crate) async fn auto_launch_kernel(
                     &details,
                 )
                 .await;
-                return;
+                return None;
             }
             // The banner stays lit until a terminal phase is written. Emit Ready so
             // it clears whether the sync completed or we fell through to the existing env.
@@ -3786,7 +4040,7 @@ pub(crate) async fn auto_launch_kernel(
                     &details,
                 )
                 .await;
-                return;
+                return None;
             }
 
             match kernel_env::conda::prepare_environment_in(
@@ -3836,7 +4090,7 @@ pub(crate) async fn auto_launch_kernel(
                         &details,
                     )
                     .await;
-                    return;
+                    return None;
                 }
             }
         }
@@ -3893,7 +4147,7 @@ pub(crate) async fn auto_launch_kernel(
                     &details,
                 )
                 .await;
-                return;
+                return None;
             }
         }
     } else if matches!(env_source, EnvSource::PixiToml) {
@@ -3923,7 +4177,7 @@ pub(crate) async fn auto_launch_kernel(
                     &details,
                 )
                 .await;
-                return;
+                return None;
             }
         }
     }
@@ -3985,7 +4239,7 @@ pub(crate) async fn auto_launch_kernel(
                 }) {
                     warn!("[runtime-state] {}", e);
                 }
-                return;
+                return None;
             }
         }
     }
@@ -4125,12 +4379,12 @@ pub(crate) async fn auto_launch_kernel(
                             "[notebook-sync] Runtime agent connect cancelled (superseded or died)"
                         );
                         reset_starting_state(room, Some(&runtime_agent_id)).await;
-                        return;
+                        return None;
                     }
                     TimedOneShot::TimedOut => {
                         warn!("[notebook-sync] Agent failed to connect within 30s");
                         reset_starting_state(room, Some(&runtime_agent_id)).await;
-                        return;
+                        return None;
                     }
                 }
 
@@ -4148,8 +4402,10 @@ pub(crate) async fn auto_launch_kernel(
                 launch_env_vars
                     .extend(crate::uv_project::uv_offline_env_vars(uv_pyproject_offline));
                 launch_env_vars.extend(crate::pixi_project::pixi_frozen_env_vars(pixi_toml_frozen));
-                match send_runtime_agent_request_with_kernel_ports(room, |kernel_ports| {
-                    notebook_protocol::protocol::RuntimeAgentRequest::LaunchKernel {
+                match send_runtime_agent_request_with_captured_env_repair(
+                    room,
+                    captured_for_config,
+                    |kernel_ports| notebook_protocol::protocol::RuntimeAgentRequest::LaunchKernel {
                         kernel_type: kernel_type.to_string(),
                         env_source: env_source.clone(),
                         notebook_path: notebook_path_opt
@@ -4159,48 +4415,31 @@ pub(crate) async fn auto_launch_kernel(
                         kernel_ports,
                         env_vars: launch_env_vars.clone(),
                         redact_env_values_in_outputs,
-                    }
-                })
+                    },
+                )
                 .await
                 {
                     Ok(notebook_protocol::protocol::RuntimeAgentResponse::KernelLaunched {
                         env_source: es,
                     }) => {
                         // env path already registered for GC protection above (before spawn)
-
-                        // Store launched config for env sync drift detection
-                        {
-                            let mut lc = room.runtime_agent_launched_config.write().await;
-                            *lc = Some(launched_config.clone());
-                        }
-
-                        let es_label = es.as_str().to_string();
-                        publish_kernel_state_presence(
+                        finish_auto_launch_success(
                             room,
-                            presence::KernelStatus::Idle,
-                            &es_label,
+                            kernel_type,
+                            es.as_str(),
+                            &runtime_agent_id,
+                            launched_config.clone(),
+                            attempt,
                         )
                         .await;
-
-                        // Write Running(Idle) + kernel info to RuntimeStateDoc
-                        // so frontends see "idle" via CRDT sync.
-                        if let Err(e) = room.state.with_doc(|sd| {
-                            sd.set_lifecycle(&RuntimeLifecycle::Running(KernelActivity::Idle))?;
-                            sd.set_kernel_info(kernel_type, kernel_type, &es_label)?;
-                            sd.set_runtime_agent_id(&runtime_agent_id)?;
-                            // Fresh kernel is in sync with its launched config
-                            sd.set_env_sync(true, &[], &[], false, false)?;
-                            Ok(())
-                        }) {
-                            warn!("[runtime-state] {}", e);
-                        }
-
-                        info!(
-                            "[notebook-sync] Auto-launch via runtime agent succeeded: {} kernel with {} environment",
-                            kernel_type, es_label
-                        );
                     }
-                    Ok(notebook_protocol::protocol::RuntimeAgentResponse::Error { error }) => {
+                    Ok(
+                        notebook_protocol::protocol::RuntimeAgentResponse::Error { error }
+                        | notebook_protocol::protocol::RuntimeAgentResponse::KernelLaunchFailed {
+                            error,
+                            ..
+                        },
+                    ) => {
                         warn!("[notebook-sync] Agent kernel launch failed: {}", error);
                         // Surface the failure through CRDT so the UI
                         // doesn't sit on "starting" forever. The error
@@ -4247,6 +4486,59 @@ pub(crate) async fn auto_launch_kernel(
             }
         }
     }
+
+    // Terminal: either the kernel launched (token consumed by
+    // `finish_auto_launch_success`) or a launch/agent error path above
+    // published its lifecycle and the token drops here as a failure,
+    // arming the cooldown.
+    None
+}
+
+/// Terminal bookkeeping for a kernel that launched: record the launched
+/// config for env-sync drift detection, publish Idle presence, write
+/// Running(Idle) + kernel info to RuntimeStateDoc, and mark the
+/// single-flight attempt successful.
+///
+/// The token disposition lives here so the success exit of the launch flow
+/// cannot drop the token as a failure, which would arm the failure cooldown
+/// after every successful launch and block the next legitimate auto-launch
+/// for the cooldown window. The gate reopens with no cooldown; the running
+/// kernel is what keeps later connects from auto-launching again.
+pub(crate) async fn finish_auto_launch_success(
+    room: &NotebookRoom,
+    kernel_type: &str,
+    env_source_label: &str,
+    runtime_agent_id: &str,
+    launched_config: LaunchedEnvConfig,
+    attempt: super::room::AutoLaunchAttempt,
+) {
+    // Store launched config for env sync drift detection
+    {
+        let mut lc = room.runtime_agent_launched_config.write().await;
+        *lc = Some(launched_config);
+    }
+
+    publish_kernel_state_presence(room, presence::KernelStatus::Idle, env_source_label).await;
+
+    // Write Running(Idle) + kernel info to RuntimeStateDoc
+    // so frontends see "idle" via CRDT sync.
+    if let Err(e) = room.state.with_doc(|sd| {
+        sd.set_lifecycle(&RuntimeLifecycle::Running(KernelActivity::Idle))?;
+        sd.set_kernel_info(kernel_type, kernel_type, env_source_label)?;
+        sd.set_runtime_agent_id(runtime_agent_id)?;
+        // Fresh kernel is in sync with its launched config
+        sd.set_env_sync(true, &[], &[], false, false)?;
+        Ok(())
+    }) {
+        warn!("[runtime-state] {}", e);
+    }
+
+    info!(
+        "[notebook-sync] Auto-launch via runtime agent succeeded: {} kernel with {} environment",
+        kernel_type, env_source_label
+    );
+
+    attempt.succeed();
 }
 
 /// Publish the daemon's `KernelState` presence so late-joining peers
@@ -5039,6 +5331,9 @@ pub(crate) async fn format_notebook_cells(room: &NotebookRoom) -> Result<usize, 
     let mut formatted_count = 0;
     if !formatted_updates.is_empty() {
         let mut doc = room.doc.write().await;
+        let rollback_actor = doc.get_actor_id();
+        let rollback_snapshot = doc.save();
+        let durable_baseline_heads = doc.get_heads();
         match doc.transact_at_heads_recovering(
             &baseline_heads,
             Some(&formatter_actor(&runtime)),
@@ -5056,10 +5351,18 @@ pub(crate) async fn format_notebook_cells(room: &NotebookRoom) -> Result<usize, 
             },
         ) {
             Ok((applied, changed)) => {
-                formatted_count = applied;
                 if changed {
+                    super::durability::commit_daemon_notebook_mutation(
+                        room,
+                        &mut doc,
+                        &durable_baseline_heads,
+                        &rollback_snapshot,
+                        &rollback_actor,
+                        "save-time formatting",
+                    )?;
                     let _ = room.broadcasts.changed_tx.send(());
                 }
+                formatted_count = applied;
                 info!(
                     "[format] Formatted {} code cells (runtime: {})",
                     formatted_count, runtime

@@ -6,6 +6,7 @@ use automerge::ChangeHash;
 use runtime_doc::RuntimeLifecycle;
 use tracing::warn;
 
+use crate::notebook_sync_server::durability::commit_daemon_notebook_mutation;
 use crate::notebook_sync_server::{
     detect_room_runtime, format_source, formatter_actor, NotebookRoom,
 };
@@ -46,9 +47,18 @@ pub(crate) async fn handle_with_submitter(
     room: &Arc<NotebookRoom>,
     cell_id: String,
     execution_id: Option<String>,
+    disable_auto_format: bool,
     submitter_actor_label: Option<&str>,
 ) -> NotebookResponse {
-    handle_inner(room, cell_id, execution_id, None, submitter_actor_label).await
+    handle_inner(
+        room,
+        cell_id,
+        execution_id,
+        None,
+        disable_auto_format,
+        submitter_actor_label,
+    )
+    .await
 }
 
 pub(crate) async fn handle_guarded_with_submitter(
@@ -56,6 +66,7 @@ pub(crate) async fn handle_guarded_with_submitter(
     cell_id: String,
     execution_id: Option<String>,
     observed_heads: Vec<String>,
+    disable_auto_format: bool,
     submitter_actor_label: Option<&str>,
 ) -> NotebookResponse {
     if let Err(rejection) = guarded::ensure_trusted(room).await {
@@ -66,6 +77,7 @@ pub(crate) async fn handle_guarded_with_submitter(
         cell_id,
         execution_id,
         Some(observed_heads),
+        disable_auto_format,
         submitter_actor_label,
     )
     .await
@@ -76,6 +88,7 @@ async fn handle_inner(
     cell_id: String,
     requested_execution_id: Option<String>,
     observed_heads: Option<Vec<String>>,
+    disable_auto_format: bool,
     submitter_actor_label: Option<&str>,
 ) -> NotebookResponse {
     // Agent-backed kernel: write execution to RuntimeStateDoc queue. During
@@ -128,33 +141,50 @@ async fn handle_inner(
                 QueueCellResult::Response(response) => return *response,
             };
 
-            let room_clone = Arc::clone(room);
-            let cell_id_clone = cell_id.clone();
-            let source_clone = source.clone();
-            spawn_best_effort("cell-formatter", async move {
-                if let Some(runtime) = detect_room_runtime(&room_clone).await {
-                    if let Some(formatted) = format_source(&source_clone, &runtime).await {
-                        let mut doc = room_clone.doc.write().await;
-                        match doc.transact_at_heads_recovering(
-                            &format_heads,
-                            Some(&formatter_actor(&runtime)),
-                            "format-transaction",
-                            |doc| {
-                                let changed = doc.update_source(&cell_id_clone, &formatted)?;
-                                Ok(changed)
-                            },
-                        ) {
-                            Ok(true) => {
-                                let _ = room_clone.broadcasts.changed_tx.send(());
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                warn!("[format] transaction failed: {}", e);
+            if !disable_auto_format {
+                let room_clone = Arc::clone(room);
+                let cell_id_clone = cell_id.clone();
+                let source_clone = source.clone();
+                spawn_best_effort("cell-formatter", async move {
+                    if let Some(runtime) = detect_room_runtime(&room_clone).await {
+                        if let Some(formatted) = format_source(&source_clone, &runtime).await {
+                            let mut doc = room_clone.doc.write().await;
+                            let rollback_actor = doc.get_actor_id();
+                            let rollback_snapshot = doc.save();
+                            let baseline_heads = doc.get_heads();
+                            match doc.transact_at_heads_recovering(
+                                &format_heads,
+                                Some(&formatter_actor(&runtime)),
+                                "format-transaction",
+                                |doc| {
+                                    let changed = doc.update_source(&cell_id_clone, &formatted)?;
+                                    Ok(changed)
+                                },
+                            ) {
+                                Ok(true) => {
+                                    match commit_daemon_notebook_mutation(
+                                        &room_clone,
+                                        &mut doc,
+                                        &baseline_heads,
+                                        &rollback_snapshot,
+                                        &rollback_actor,
+                                        "cell formatter",
+                                    ) {
+                                        Ok(()) => {
+                                            let _ = room_clone.broadcasts.changed_tx.send(());
+                                        }
+                                        Err(error) => warn!("[format] {error}"),
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    warn!("[format] transaction failed: {}", e);
+                                }
                             }
                         }
                     }
-                }
-            });
+                });
+            }
 
             return NotebookResponse::CellQueued {
                 cell_id,
@@ -250,6 +280,10 @@ async fn queue_cell_if_current(
         }
     }
 
+    let rollback_actor = doc.get_actor_id();
+    let rollback_snapshot = doc.save();
+    let baseline_heads = doc.get_heads();
+
     let mut execution_id = requested_execution_id
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -318,6 +352,21 @@ async fn queue_cell_if_current(
         return QueueCellResult::Response(Box::new(NotebookResponse::Error {
             error: format!("failed to stamp execution pointer: {e}"),
         }));
+    }
+    if let Err(error) = commit_daemon_notebook_mutation(
+        room,
+        &mut doc,
+        &baseline_heads,
+        &rollback_snapshot,
+        &rollback_actor,
+        "execute cell",
+    ) {
+        let rollback_id = execution_id.clone();
+        let _ = room.state.with_doc(|state| {
+            state.remove_executions(&[rollback_id])?;
+            Ok(())
+        });
+        return QueueCellResult::Response(Box::new(NotebookResponse::Error { error }));
     }
     if let Some(previous_execution_id) = current_execution_id.as_deref() {
         room.persistence

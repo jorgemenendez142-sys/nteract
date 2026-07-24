@@ -5,6 +5,7 @@ import {
   CLOUD_CONNECTION_EDIT_ACCESS_APPROVED_DIAGNOSTIC,
   CLOUD_CONNECTION_EDIT_ACCESS_PENDING_DIAGNOSTIC,
   CLOUD_CONNECTION_NO_ACCESS_DIAGNOSTIC,
+  CLOUD_CONNECTION_NOT_FOUND_DIAGNOSTIC,
   CLOUD_CONNECTION_SIGN_IN_DIAGNOSTIC,
   cloudConnectionDiagnosticBlocksNotebookBody,
   cloudConnectionErrorWithAccessDiagnostic,
@@ -41,7 +42,17 @@ describe("cloud connection diagnostics", () => {
       },
     });
 
-    assert.match(diagnostic ?? "", /does not have access/);
+    assert.equal(diagnostic, CLOUD_CONNECTION_NO_ACCESS_DIAGNOSTIC);
+  });
+
+  it("reports missing notebooks separately from account access problems", async () => {
+    const diagnostic = await diagnoseCloudConnectionAccess({
+      accessRequestsEndpoint: "/api/n/missing/access-requests",
+      authState: authState("dev"),
+      fetchImpl: async () => Response.json({ error: "not found" }, { status: 404 }),
+    });
+
+    assert.equal(diagnostic, CLOUD_CONNECTION_NOT_FOUND_DIAGNOSTIC);
   });
 
   it("probes access with same-origin cookies for app-session browsers", async () => {
@@ -58,7 +69,7 @@ describe("cloud connection diagnostics", () => {
       },
     });
 
-    assert.match(diagnostic ?? "", /does not have access/);
+    assert.equal(diagnostic, CLOUD_CONNECTION_NO_ACCESS_DIAGNOSTIC);
   });
 
   it("keeps successful authenticated access silent", async () => {
@@ -158,6 +169,7 @@ describe("late access diagnostics never displace a terminal WASM-failure notice"
 
   it("identifies access diagnostics that should survive reconnect noise", () => {
     assert.equal(isCloudConnectionAccessDiagnostic(CLOUD_CONNECTION_NO_ACCESS_DIAGNOSTIC), true);
+    assert.equal(isCloudConnectionAccessDiagnostic(CLOUD_CONNECTION_NOT_FOUND_DIAGNOSTIC), true);
     assert.equal(isCloudConnectionAccessDiagnostic(CLOUD_CONNECTION_SIGN_IN_DIAGNOSTIC), true);
     assert.equal(isCloudConnectionAccessDiagnostic("cloud sync socket failed"), false);
     assert.equal(isCloudConnectionAccessDiagnostic(null), false);
@@ -166,6 +178,10 @@ describe("late access diagnostics never displace a terminal WASM-failure notice"
   it("identifies diagnostics that should block notebook body rendering", () => {
     assert.equal(
       cloudConnectionDiagnosticBlocksNotebookBody(CLOUD_CONNECTION_NO_ACCESS_DIAGNOSTIC),
+      true,
+    );
+    assert.equal(
+      cloudConnectionDiagnosticBlocksNotebookBody(CLOUD_CONNECTION_NOT_FOUND_DIAGNOSTIC),
       true,
     );
     assert.equal(
@@ -185,8 +201,8 @@ describe("late access diagnostics never displace a terminal WASM-failure notice"
   });
 
   // Session wiring pins (the hook cannot run under node): the kick-time
-  // guard on the connect-failure path, and BOTH late-resolution sites
-  // merging through the resolution-time guard.
+  // guard on the connect-failure path, the sustained-reconnect diagnostic,
+  // and both late-resolution sites merging through the resolution-time guard.
   it("the session guards at kick time and at every resolution site", () => {
     const sessionSource = readFileSync(
       new URL("../viewer/cloud-viewer-session.ts", import.meta.url),
@@ -199,8 +215,8 @@ describe("late access diagnostics never displace a terminal WASM-failure notice"
           /setConnectionError\(\(current\) =>\s*cloudConnectionErrorWithAccessDiagnostic\(current, diagnostic\),\s*\)/g,
         ) ?? []
       ).length,
-      2,
-      "both diagnostic resolution sites must merge through the resolution-time guard",
+      3,
+      "all diagnostic resolution sites must merge through the resolution-time guard",
     );
     assert.match(
       sessionSource,

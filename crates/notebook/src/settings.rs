@@ -18,7 +18,7 @@ use std::path::PathBuf;
 // Re-export types that notebook code uses from runtimed
 pub use runtimed::runtime::Runtime;
 pub use runtimed::settings_doc::{
-    ColorTheme, CondaDefaults, PixiDefaults, PythonEnvType, ThemeMode, UvDefaults,
+    ColorTheme, CondaDefaults, EditorSettings, PixiDefaults, PythonEnvType, ThemeMode, UvDefaults,
 };
 
 /// Get the path to the settings file
@@ -63,6 +63,10 @@ pub fn load_settings() -> SyncedSettings {
             .get("color_theme")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or(defaults.color_theme),
+        editor: json
+            .get("editor")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or(defaults.editor.clone()),
         default_runtime: json
             .get("default_runtime")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -113,6 +117,14 @@ pub fn load_settings() -> SyncedSettings {
             .get("disable_nteract_launcher")
             .and_then(|v| v.as_bool())
             .unwrap_or(defaults.disable_nteract_launcher),
+        enable_comments: json
+            .get("enable_comments")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.enable_comments),
+        disable_auto_format: json
+            .get("disable_auto_format")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(defaults.disable_auto_format),
         redact_env_values_in_outputs: json
             .get("redact_env_values_in_outputs")
             .and_then(|v| v.as_bool())
@@ -179,6 +191,9 @@ mod tests {
         assert!(settings.conda.default_packages.is_empty());
         assert!(settings.install_default_data_packages);
         assert!(!settings.disable_nteract_launcher);
+        assert!(!settings.enable_comments);
+        assert!(!settings.disable_auto_format);
+        assert_eq!(settings.editor, EditorSettings::default());
         assert!(settings.redact_env_values_in_outputs);
     }
 
@@ -187,6 +202,11 @@ mod tests {
         let settings = SyncedSettings {
             theme: ThemeMode::Dark,
             color_theme: ColorTheme::default(),
+            editor: EditorSettings {
+                code_font_family: "\"Hack\", monospace".into(),
+                markdown_font_family: "Georgia, serif".into(),
+                line_numbers: true,
+            },
             default_runtime: Runtime::Deno,
             default_python_env: PythonEnvType::Uv,
             uv: UvDefaults {
@@ -201,6 +221,8 @@ mod tests {
             pixi_pool_size: 6,
             install_default_data_packages: true,
             disable_nteract_launcher: false,
+            enable_comments: true,
+            disable_auto_format: true,
             ..SyncedSettings::default()
         };
 
@@ -211,6 +233,11 @@ mod tests {
         assert_eq!(parsed.default_runtime, Runtime::Deno);
         assert_eq!(parsed.default_python_env, PythonEnvType::Uv);
         assert_eq!(parsed.uv.default_packages, vec!["numpy", "pandas"]);
+        assert!(parsed.enable_comments);
+        assert!(parsed.disable_auto_format);
+        assert_eq!(parsed.editor.code_font_family, "\"Hack\", monospace");
+        assert_eq!(parsed.editor.markdown_font_family, "Georgia, serif");
+        assert!(parsed.editor.line_numbers);
     }
 
     #[test]
@@ -360,6 +387,10 @@ mod tests {
                 .get("color_theme")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or(defaults.color_theme),
+            editor: json_val
+                .get("editor")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or(defaults.editor.clone()),
             default_runtime: json_val
                 .get("default_runtime")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -393,6 +424,8 @@ mod tests {
             pixi_pool_size: defaults.pixi_pool_size,
             install_default_data_packages: defaults.install_default_data_packages,
             disable_nteract_launcher: defaults.disable_nteract_launcher,
+            enable_comments: defaults.enable_comments,
+            disable_auto_format: defaults.disable_auto_format,
             ..defaults
         };
         // Valid fields are preserved

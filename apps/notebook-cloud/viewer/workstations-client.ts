@@ -1,4 +1,4 @@
-import type { NotebookRegisteredWorkstation } from "runtimed";
+import type { NotebookRegisteredWorkstation, WorkstationAcceleratorState } from "runtimed";
 
 import { fetchWithCloudPrototypeAuth, type CloudPrototypeAuthState } from "./collaborator-auth";
 
@@ -18,6 +18,18 @@ export interface CloudWorkstationRefreshCadenceOptions {
 
 export const CLOUD_WORKSTATIONS_ACTIVE_REFRESH_INTERVAL_MS = 10_000;
 export const CLOUD_WORKSTATIONS_ATTACH_REFRESH_INTERVAL_MS = 2_500;
+export const CLOUD_WORKSTATION_DEBIAN_PREP_COMMAND =
+  "sudo apt update && sudo apt install -y curl tmux";
+export const CLOUD_WORKSTATION_HEADLESS_INSTALL_COMMAND =
+  "curl --proto '=https' --tlsv1.2 -sSf https://sh.nteract.io | bash -s -- --headless";
+export const CLOUD_WORKSTATION_PATH_EXPORT_COMMAND = 'export PATH="$HOME/.local/bin:$PATH"';
+
+export interface CloudWorkstationPairingCommand {
+  id: string;
+  label: string;
+  command: string;
+  optional?: boolean;
+}
 
 interface CloudWorkstationsResponse {
   default_workstation_id?: unknown;
@@ -27,12 +39,22 @@ interface CloudWorkstationsResponse {
 interface CloudWorkstationAttachmentResponse {
   job?: {
     job_id?: unknown;
+    workstation_id?: unknown;
     status?: unknown;
+  };
+  workstation?: {
+    workstation_id?: unknown;
   };
 }
 
 export interface RequestCloudWorkstationAttachmentOptions {
   replaceExisting?: boolean;
+}
+
+export interface CloudWorkstationAttachmentRequestResult {
+  jobId: string | null;
+  status: string | null;
+  workstationId: string | null;
 }
 
 export async function fetchCloudWorkstations(
@@ -90,7 +112,7 @@ export async function requestCloudWorkstationAttachment(
   authState: CloudPrototypeAuthState,
   workstationId: string,
   options: RequestCloudWorkstationAttachmentOptions = {},
-): Promise<{ jobId: string | null; status: string | null }> {
+): Promise<CloudWorkstationAttachmentRequestResult> {
   const response = await fetchWithCloudPrototypeAuth(
     endpoint,
     {
@@ -113,6 +135,9 @@ export async function requestCloudWorkstationAttachment(
   return {
     jobId: scalarString(payload.job?.job_id),
     status: scalarString(payload.job?.status),
+    workstationId:
+      scalarString(payload.job?.workstation_id) ??
+      scalarString(payload.workstation?.workstation_id),
   };
 }
 
@@ -185,7 +210,55 @@ export async function fetchCloudWorkstationPairingStatus(
 }
 
 export function cloudWorkstationConnectCommand(origin: string, code: string): string {
-  return `runt workstation connect ${origin} --code ${code} && runt workstation run`;
+  return `runt workstation connect ${origin} --code ${code}`;
+}
+
+export function cloudWorkstationRunCommand(): string {
+  return "runt workstation run";
+}
+
+export function cloudWorkstationServiceInstallCommand(): string {
+  return "runt workstation service install --start";
+}
+
+export function cloudWorkstationPairingCommands(
+  origin: string,
+  code: string,
+): readonly CloudWorkstationPairingCommand[] {
+  return [
+    {
+      id: "debian-prep",
+      label: "Fresh Debian/Ubuntu only",
+      command: CLOUD_WORKSTATION_DEBIAN_PREP_COMMAND,
+      optional: true,
+    },
+    {
+      id: "install",
+      label: "Install nteract headless",
+      command: CLOUD_WORKSTATION_HEADLESS_INSTALL_COMMAND,
+    },
+    {
+      id: "path",
+      label: "Use installed CLI in this shell",
+      command: CLOUD_WORKSTATION_PATH_EXPORT_COMMAND,
+    },
+    {
+      id: "connect",
+      label: "Pair this workstation",
+      command: cloudWorkstationConnectCommand(origin, code),
+    },
+    {
+      id: "run",
+      label: "Linux user systemd service",
+      command: cloudWorkstationServiceInstallCommand(),
+    },
+    {
+      id: "foreground-run",
+      label: "macOS/non-systemd fallback",
+      command: cloudWorkstationRunCommand(),
+      optional: true,
+    },
+  ];
 }
 
 export function cloudWorkstationRefreshIntervalMs({
@@ -225,12 +298,56 @@ function normalizeCloudWorkstation(value: unknown): NotebookRegisteredWorkstatio
     statusMessage: scalarString(raw.status_message),
     defaultEnvironmentLabel: scalarString(raw.default_environment_label),
     environmentPolicy: scalarString(raw.environment_policy),
+    installedBuild: scalarString(raw.installed_build),
+    channel: scalarString(raw.channel),
+    latestBuild: scalarString(raw.latest_build),
+    isOutdated: raw.is_outdated === true || raw.isOutdated === true,
     workingDirectory: scalarString(raw.working_directory),
     cpuCount: scalarNumber(raw.cpu_count),
     memoryBytes: scalarNumber(raw.memory_bytes),
+    accelerators: normalizeCloudAccelerators(raw.accelerators),
     updatedAt: scalarString(raw.updated_at) ?? scalarString(raw.last_seen_at),
     environments: normalizeCloudEnvironments(raw.environments),
   };
+}
+
+function normalizeCloudAccelerators(value: unknown): readonly WorkstationAcceleratorState[] | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const accelerators: WorkstationAcceleratorState[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") return null;
+    const item = raw as Record<string, unknown>;
+    const kind = scalarString(item.kind);
+    const count = positiveInteger(item.count);
+    const readiness = item.readiness;
+    if (
+      !kind ||
+      count === null ||
+      (readiness !== "ready" && readiness !== "not_ready" && readiness !== "unknown")
+    ) {
+      return null;
+    }
+    const memoryBytesPerDevice = positiveInteger(
+      item.memory_bytes_per_device ?? item.memoryBytesPerDevice,
+    );
+    accelerators.push(
+      Object.freeze({
+        kind,
+        vendor: scalarString(item.vendor),
+        model: scalarString(item.model),
+        count,
+        memory_bytes_per_device: memoryBytesPerDevice,
+        readiness,
+        diagnostic: scalarString(item.diagnostic),
+      }),
+    );
+  }
+  return Object.freeze(accelerators);
 }
 
 function normalizeCloudEnvironments(value: unknown): NotebookRegisteredWorkstation["environments"] {
@@ -279,6 +396,10 @@ function scalarString(value: unknown): string | null {
 
 function scalarNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function positiveInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
 }
 
 async function responseErrorMessage(response: Response, fallback: string): Promise<string> {

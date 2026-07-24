@@ -5,21 +5,36 @@
 //!
 //! These tests spawn a real daemon and test client interactions.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use comments_doc::local_path_comments_doc_id;
 use notebook_doc::presence::PresenceMessage;
 use notebook_protocol::connection::LaunchSpec;
 use notebook_sync::connect;
+use notebook_sync::ConnectionState;
 use notebook_wire::frame_types;
 use runtime_doc::RuntimeLifecycle;
 use runtimed::client::PoolClient;
-use runtimed::daemon::{Daemon, DaemonConfig};
+use runtimed::daemon::{Daemon, DaemonConfig, TestRecoveryManifestFacts, TestRoomRecoveryFacts};
 use runtimed::protocol::{DependencyGuard, NotebookRequest, NotebookResponse};
 use runtimed::EnvType;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+
+/// Spec for creating a "python" notebook as `actor_label`, with every other
+/// field at its default: non-ephemeral, no deps, daemon-chosen notebook id.
+/// Tests override individual fields with struct update syntax.
+fn create_spec(actor_label: &str) -> connect::CreateNotebookSpec {
+    connect::CreateNotebookSpec {
+        actor_label: actor_label.to_string(),
+        ..connect::CreateNotebookSpec::new("python")
+    }
+}
 
 /// Write a test .ipynb notebook file with the given cells.
 /// Each cell is a tuple of (id, cell_type, source, outputs_json_strings).
@@ -91,6 +106,7 @@ fn test_config(temp_dir: &TempDir) -> DaemonConfig {
         // false-pass on a developer machine and false-fail on CI depending
         // on what ran before them.
         trusted_packages_db_path: temp_dir.path().join("trusted-packages.sqlite"),
+        notebook_registry_db_path: temp_dir.path().join("notebook-registry.sqlite"),
         uv_pool_size: 0, // Don't create real envs in tests
         conda_pool_size: 0,
         max_age_secs: 3600,
@@ -111,6 +127,90 @@ fn test_config(temp_dir: &TempDir) -> DaemonConfig {
 
 fn test_runtime_agent_exe() -> Option<std::path::PathBuf> {
     option_env!("CARGO_BIN_EXE_runtimed").map(std::path::PathBuf::from)
+}
+
+const UNDEAD_ROOM_4065_STEM: &str =
+    "da7e893a89ff5536a4ef83a99531299e092fb557d1371cb72d6c303a8fc9ef32";
+
+struct PreparedUndeadRoomFixture {
+    notebook_path: PathBuf,
+    journal_path: PathBuf,
+    manifest: TestRecoveryManifestFacts,
+}
+
+fn undead_room_4065_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("undead-room-4065")
+}
+
+fn prepare_undead_room_4065_fixture(
+    temp_dir: &TempDir,
+    config: &DaemonConfig,
+) -> PreparedUndeadRoomFixture {
+    let fixture_dir = undead_room_4065_fixture_dir();
+    std::fs::create_dir_all(&config.notebook_docs_dir).unwrap();
+
+    for extension in ["automerge", "recovery", "recovery.manifest.json"] {
+        let file_name = format!("{UNDEAD_ROOM_4065_STEM}.{extension}");
+        std::fs::copy(
+            fixture_dir.join(&file_name),
+            config.notebook_docs_dir.join(&file_name),
+        )
+        .unwrap();
+    }
+
+    let notebook_path = temp_dir.path().join("tinker1.ipynb");
+    std::fs::copy(fixture_dir.join("tinker1.ipynb"), &notebook_path).unwrap();
+    let canonical_path = std::fs::canonicalize(&notebook_path).unwrap();
+    let journal_path = config
+        .notebook_docs_dir
+        .join(format!("{UNDEAD_ROOM_4065_STEM}.recovery"));
+    let manifest = Daemon::test_rewrite_recovery_canonical_path(&journal_path, &canonical_path)
+        .expect("fixture recovery journal should be rewritable through recovery types");
+
+    let source_sha = hex::encode(Sha256::digest(std::fs::read(&canonical_path).unwrap()));
+    assert_eq!(
+        manifest.source_fingerprint_hex, source_sha,
+        "fixture notebook bytes must match the recovery manifest fingerprint"
+    );
+    assert_eq!(manifest.source_phase, "Pending");
+    assert_eq!(manifest.source_generation, 0);
+    assert_eq!(manifest.peer_change_count, 1);
+    assert_eq!(manifest.file_save_sequence, Some(1));
+    assert!(
+        manifest.full_head_coverage,
+        "the incident fixture must model a full file checkpoint baseline"
+    );
+    assert_eq!(manifest.durable_head_count, manifest.exported_head_count);
+
+    PreparedUndeadRoomFixture {
+        notebook_path: canonical_path,
+        journal_path,
+        manifest,
+    }
+}
+
+async fn wait_for_room_recovery_facts(
+    daemon: &Arc<Daemon>,
+    uuid: uuid::Uuid,
+    predicate: impl Fn(&TestRoomRecoveryFacts) -> bool,
+) -> TestRoomRecoveryFacts {
+    let start = std::time::Instant::now();
+    while start.elapsed() < SESSION_READY_TIMEOUT {
+        if let Some(facts) = daemon.test_room_recovery_facts(uuid).await {
+            if predicate(&facts) {
+                return facts;
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "room {uuid} did not reach expected recovery facts within {:?}: {:?}",
+        SESSION_READY_TIMEOUT,
+        daemon.test_room_recovery_facts(uuid).await
+    );
 }
 
 /// Max time we'll wait for a test daemon's socket to accept `ping`.
@@ -695,13 +795,12 @@ async fn test_blob_server_health() {
     let client = PoolClient::new(socket_path);
     assert!(wait_for_daemon(&client).await);
 
-    // Read daemon info to find blob port
-    let info_path = temp_dir.path().join("daemon.json");
-    let info_json = tokio::fs::read_to_string(&info_path)
+    // Query daemon info over the socket to find the blob port.
+    let info = client
+        .daemon_info()
         .await
-        .expect("daemon.json should exist");
-    let info: serde_json::Value = serde_json::from_str(&info_json).unwrap();
-    let blob_port = info["blob_port"].as_u64().expect("blob_port should be set");
+        .expect("daemon info should be available");
+    let blob_port = info.blob_port.expect("blob_port should be set");
 
     // Hit the health endpoint
     let resp = reqwest::get(format!("http://127.0.0.1:{}/health", blob_port))
@@ -739,12 +838,10 @@ async fn test_local_identity_handshake_and_presence_rewrite() {
 
     let result = connect::connect_create(
         socket_path.clone(),
-        "python",
-        None,
-        "agent:codex:s1",
-        true,
-        None,
-        vec![],
+        connect::CreateNotebookSpec {
+            ephemeral: true,
+            ..create_spec("agent:codex:s1")
+        },
     )
     .await
     .expect("client should connect");
@@ -761,6 +858,19 @@ async fn test_local_identity_handshake_and_presence_rewrite() {
     assert_eq!(
         result.info.capabilities.connection_scope.as_deref(),
         Some("owner")
+    );
+    let expected_comments_doc_id = format!("comments:local-room:{}", result.info.notebook_id);
+    assert_eq!(
+        result.info.capabilities.comments_doc_id.as_deref(),
+        Some(expected_comments_doc_id.as_str())
+    );
+    let expected_comments_notebook_ref = serde_json::json!({
+        "kind": "local_room",
+        "room_id": result.info.notebook_id
+    });
+    assert_eq!(
+        result.info.capabilities.comments_notebook_ref.as_ref(),
+        Some(&expected_comments_notebook_ref)
     );
     assert_eq!(
         notebook_sync::presence::actor_label(&result.handle).as_deref(),
@@ -784,6 +894,14 @@ async fn test_local_identity_handshake_and_presence_rewrite() {
     assert_eq!(
         relay.capabilities.connection_scope.as_deref(),
         Some("owner")
+    );
+    assert_eq!(
+        relay.capabilities.comments_doc_id.as_deref(),
+        Some(expected_comments_doc_id.as_str())
+    );
+    assert_eq!(
+        relay.capabilities.comments_notebook_ref.as_ref(),
+        Some(&expected_comments_notebook_ref)
     );
 
     let forged = notebook_doc::presence::encode_custom_update_labeled(
@@ -837,12 +955,10 @@ async fn test_local_identity_rejects_foreign_automerge_actor() {
 
     let owner = connect::connect_create(
         socket_path.clone(),
-        "python",
-        None,
-        "desktop:owner",
-        true,
-        None,
-        vec![],
+        connect::CreateNotebookSpec {
+            ephemeral: true,
+            ..create_spec("desktop:owner")
+        },
     )
     .await
     .expect("owner should connect");
@@ -904,17 +1020,9 @@ async fn test_notebook_sync_via_unified_socket() {
     assert!(wait_for_daemon(&pool_client).await);
 
     // Create first notebook via connect_create — should get daemon starter cell
-    let result1 = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .expect("client1 should connect");
+    let result1 = connect::connect_create(socket_path.clone(), create_spec("test"))
+        .await
+        .expect("client1 should connect");
     assert_eq!(
         result1.info.cell_count, 1,
         "CreateNotebook handshake should report the daemon starter cell"
@@ -968,17 +1076,9 @@ async fn test_notebook_sync_via_unified_socket() {
     );
 
     // Create a different notebook — should be independent
-    let result3 = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .expect("client3 should connect");
+    let result3 = connect::connect_create(socket_path.clone(), create_spec("test"))
+        .await
+        .expect("client3 should connect");
     assert_eq!(
         result3.info.cell_count, 1,
         "second CreateNotebook handshake should report its own daemon starter cell"
@@ -1022,17 +1122,9 @@ async fn test_notebook_sync_cross_window_propagation() {
     assert!(wait_for_daemon(&pool_client).await);
 
     // First client creates a notebook; second client joins it
-    let result = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+        .await
+        .unwrap();
     let notebook_id = result.info.notebook_id.clone();
     let client1 = result.handle;
     let client2 = connect::connect(socket_path.clone(), notebook_id, "test")
@@ -1095,17 +1187,9 @@ async fn test_parallel_cell_mutations_same_session_no_disconnect() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
-    let result = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+        .await
+        .unwrap();
     let notebook_id = result.info.notebook_id.clone();
     let handle = result.handle;
 
@@ -1183,17 +1267,9 @@ async fn test_untrusted_launch_and_sync_environment_are_daemon_rejected() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
-    let result = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+        .await
+        .unwrap();
     let handle = result.handle;
 
     assert!(
@@ -1266,15 +1342,13 @@ async fn test_launch_kernel_environment_mode_controls_project_priority() {
         let project_dir = project_dir.clone();
         let notebook_path = notebook_path.clone();
         async move {
-            let result = connect::connect_create_with_environment_mode(
+            let result = connect::connect_create(
                 socket_path,
-                "python",
-                Some(project_dir),
-                label,
-                false,
-                None,
-                vec![],
-                Some(mode),
+                connect::CreateNotebookSpec {
+                    working_dir: Some(project_dir),
+                    environment_mode: Some(mode),
+                    ..create_spec(label)
+                },
             )
             .await
             .unwrap();
@@ -1345,12 +1419,11 @@ async fn test_sync_environment_guard_rejects_stale_observed_dependencies() {
 
     let result = connect::connect_create(
         socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        Some(notebook_protocol::connection::PackageManager::Uv),
-        vec!["pandas".to_string()],
+        connect::CreateNotebookSpec {
+            package_manager: Some(notebook_protocol::connection::PackageManager::Uv),
+            dependencies: vec!["pandas".to_string()],
+            ..create_spec("test")
+        },
     )
     .await
     .unwrap();
@@ -1403,12 +1476,11 @@ async fn test_approve_trust_guard_rejects_stale_observed_dependencies() {
 
     let result = connect::connect_create(
         socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        Some(notebook_protocol::connection::PackageManager::Uv),
-        vec!["pandas".to_string()],
+        connect::CreateNotebookSpec {
+            package_manager: Some(notebook_protocol::connection::PackageManager::Uv),
+            dependencies: vec!["pandas".to_string()],
+            ..create_spec("test")
+        },
     )
     .await
     .unwrap();
@@ -1459,17 +1531,9 @@ async fn test_sync_environment_no_deps_reaches_existing_no_kernel_path() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
-    let result = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+        .await
+        .unwrap();
     let handle = result.handle;
 
     assert!(
@@ -1510,17 +1574,9 @@ async fn test_parallel_daemon_requests_same_session_no_disconnect() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
-    let result = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+        .await
+        .unwrap();
     let handle = result.handle;
 
     assert!(
@@ -1582,17 +1638,9 @@ async fn test_untitled_notebook_persists_through_eviction() {
     // Phase 1: Two clients connect, add cells, then both disconnect
     let notebook_id;
     {
-        let result = connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
+        let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+            .await
+            .unwrap();
         notebook_id = result.info.notebook_id.clone();
         let client1 = result.handle;
         let _client2 = connect::connect(socket_path.clone(), notebook_id.clone(), "test")
@@ -1722,17 +1770,9 @@ async fn test_eviction_flushes_before_reconnect() {
     // the `.automerge` debouncer is the only thing keeping content durable.
     let notebook_id;
     {
-        let result = connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
+        let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+            .await
+            .unwrap();
         notebook_id = result.info.notebook_id.clone();
         let client = result.handle;
 
@@ -1818,17 +1858,9 @@ async fn test_kernel_teardown_keeps_room_resident() {
     // trigger the kernel-teardown task.
     let notebook_id;
     {
-        let result = connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
+        let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+            .await
+            .unwrap();
         notebook_id = result.info.notebook_id.clone();
         let client = result.handle;
 
@@ -1951,17 +1983,9 @@ async fn test_ghost_reaper_removes_after_ttl() {
 
     let notebook_id;
     {
-        let result = connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
+        let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+            .await
+            .unwrap();
         notebook_id = result.info.notebook_id.clone();
         let client = result.handle;
         assert!(wait_for_session_ready(&client, SESSION_READY_TIMEOUT).await);
@@ -2056,17 +2080,9 @@ async fn test_ghost_reaper_skips_reconnected_room() {
 
     let notebook_id;
     {
-        let result = connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
+        let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+            .await
+            .unwrap();
         notebook_id = result.info.notebook_id.clone();
         let client = result.handle;
         assert!(wait_for_session_ready(&client, SESSION_READY_TIMEOUT).await);
@@ -2115,6 +2131,241 @@ async fn test_ghost_reaper_skips_reconnected_room() {
     let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
 }
 
+#[tokio::test]
+async fn test_undead_room_4065_fixture_recovers_and_auto_launches_once() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = test_config(&temp_dir);
+    let socket_path = config.socket_path.clone();
+    let fixture = prepare_undead_room_4065_fixture(&temp_dir, &config);
+
+    let daemon = Daemon::new_for_test(config).unwrap();
+    daemon
+        .test_trust_notebook_file_dependencies(&fixture.notebook_path)
+        .expect("fixture dependencies should be trusted in the isolated test store");
+    let daemon_for_inspect = daemon.clone();
+    let daemon_handle = tokio::spawn(async move {
+        daemon.run().await.ok();
+    });
+
+    let pool_client = PoolClient::new(socket_path.clone());
+    assert!(wait_for_daemon(&pool_client).await);
+
+    let owner = connect::connect_open(socket_path.clone(), fixture.notebook_path.clone(), "owner")
+        .await
+        .expect("incident fixture owner should open");
+    let notebook_uuid = uuid::Uuid::parse_str(&owner.info.notebook_id).unwrap();
+    assert_eq!(notebook_uuid, fixture.manifest.notebook_id);
+    assert_session_ready(&owner.handle, "undead-room owner").await;
+
+    let peer = connect::connect_open(socket_path.clone(), fixture.notebook_path.clone(), "peer")
+        .await
+        .expect("incident fixture peer should join");
+    assert_session_ready(&peer.handle, "undead-room peer").await;
+    let peer_status = peer.handle.status();
+    assert_eq!(peer_status.connection, ConnectionState::Connected);
+    assert!(
+        peer_status.session_ready(),
+        "peer must stay session-ready after joining recovered room: {peer_status:?}"
+    );
+
+    let facts = wait_for_room_recovery_facts(&daemon_for_inspect, notebook_uuid, |facts| {
+        facts.initial_load_state.starts_with("Ready")
+            && facts.availability == "Interactive"
+            && facts.source_phase == "Ready"
+            && facts.auto_launch_admissions == 1
+    })
+    .await;
+    assert!(
+        !facts.is_degraded,
+        "recovered room must not be degraded: {facts:?}"
+    );
+    assert_eq!(facts.durable_head_count, facts.exported_head_count);
+
+    let promoted = Daemon::test_recovery_manifest_facts(&fixture.journal_path)
+        .expect("promoted recovery manifest should be readable");
+    assert_eq!(promoted.source_phase, "Ready");
+    assert_eq!(promoted.source_generation, 0);
+    assert!(promoted.full_head_coverage);
+
+    drop(peer);
+    drop(owner);
+    pool_client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
+}
+
+#[tokio::test]
+async fn test_undead_room_4065_fixture_missing_exported_head_degrades() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = test_config(&temp_dir);
+    let socket_path = config.socket_path.clone();
+    let fixture = prepare_undead_room_4065_fixture(&temp_dir, &config);
+    let corrupted = Daemon::test_drop_recovery_exported_head(&fixture.journal_path)
+        .expect("fixture recovery journal should be corruptible through recovery types");
+    assert_eq!(corrupted.source_phase, "Pending");
+    assert!(!corrupted.full_head_coverage);
+    assert!(
+        corrupted.exported_head_count < corrupted.durable_head_count,
+        "negative control must remove checkpoint coverage"
+    );
+
+    let daemon = Daemon::new_for_test(config).unwrap();
+    daemon
+        .test_trust_notebook_file_dependencies(&fixture.notebook_path)
+        .expect("fixture dependencies should be trusted in the isolated test store");
+    let daemon_for_inspect = daemon.clone();
+    let daemon_handle = tokio::spawn(async move {
+        daemon.run().await.ok();
+    });
+
+    let pool_client = PoolClient::new(socket_path.clone());
+    assert!(wait_for_daemon(&pool_client).await);
+
+    let opened = connect::connect_open(socket_path.clone(), fixture.notebook_path.clone(), "owner")
+        .await
+        .expect("handshake succeeds before the room reports source degradation");
+    let notebook_uuid = uuid::Uuid::parse_str(&opened.info.notebook_id).unwrap();
+    assert_eq!(notebook_uuid, fixture.manifest.notebook_id);
+
+    match opened
+        .handle
+        .await_session_ready_timeout(SESSION_READY_TIMEOUT)
+        .await
+    {
+        Err(notebook_sync::error::SyncError::Protocol(message)) => {
+            assert!(
+                message.contains("source_degraded"),
+                "negative control should fail as source_degraded, got {message}"
+            );
+        }
+        Err(notebook_sync::error::SyncError::Disconnected) => {}
+        Err(other) => panic!("expected source_degraded protocol failure, got {other:?}"),
+        Ok(()) => panic!("negative control should not become session-ready"),
+    }
+
+    let facts = wait_for_room_recovery_facts(&daemon_for_inspect, notebook_uuid, |facts| {
+        facts.initial_load_state.starts_with("Failed") && facts.availability == "Degraded"
+    })
+    .await;
+    assert!(
+        facts.initial_load_state.contains("source_degraded"),
+        "negative control must preserve the source_degraded reason: {facts:?}"
+    );
+    assert_eq!(facts.source_phase, "Pending");
+    assert_eq!(facts.exported_head_count, 0);
+
+    drop(opened);
+    pool_client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
+}
+
+/// A `SourceState` degradation (healthy journal, conflicted source) does
+/// not pin a room resident: `requires_durability_repair()` lets the
+/// reaper's candidate filter and `remove_if` predicate pass. The reaper
+/// then runs steps clean shutdown does not, the persist-debouncer flush
+/// and the autosave-debouncer final save, against a Degraded room. The
+/// degraded-save guard in `save_notebook_to_disk` must keep that final
+/// save from overwriting the user's external edits on the conflicted
+/// file: the room is reaped and the on-disk bytes stay byte-identical.
+#[tokio::test]
+async fn test_ghost_reaper_sweeps_source_conflicted_room_without_touching_disk() {
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut config = test_config(&temp_dir);
+    config.room_eviction_delay_ms = Some(0);
+    let socket_path = config.socket_path.clone();
+
+    let daemon = Daemon::new_for_test(config).unwrap();
+    let daemon_for_inspect = daemon.clone();
+    let daemon_handle = tokio::spawn(async move {
+        daemon.run().await.ok();
+    });
+
+    let pool_client = PoolClient::new(socket_path.clone());
+    assert!(wait_for_daemon(&pool_client).await);
+
+    let nb_path = temp_dir.path().join("conflicted.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+
+    let notebook_id;
+    {
+        let result = connect::connect_open(socket_path.clone(), nb_path.clone(), "test")
+            .await
+            .unwrap();
+        notebook_id = result.info.notebook_id.clone();
+        let client = result.handle;
+        assert!(wait_for_session_ready(&client, SESSION_READY_TIMEOUT).await);
+    }
+
+    let uuid = uuid::Uuid::parse_str(&notebook_id).unwrap();
+
+    // Wait for kernel teardown to stamp the timestamp so the room is a
+    // reaper candidate. Eviction flushes settle before this stamp lands.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(room) = daemon_for_inspect.test_get_room(uuid).await {
+            if room
+                .connections
+                .last_kernel_torn_down_at
+                .load(Ordering::Relaxed)
+                != 0
+                && room.connections.active_peers.load(Ordering::Relaxed) == 0
+            {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("kernel teardown did not stamp last_kernel_torn_down_at within 5s");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    let room = daemon_for_inspect.test_get_room(uuid).await.unwrap();
+
+    // Quiesce the file watcher so the external overwrite below stays a
+    // plain on-disk fact instead of racing the injected conflict marker.
+    room.file_binding.shutdown_notebook_watcher().await;
+
+    // Leave the live doc ahead of disk. A direct doc mutation schedules no
+    // autosave, so the only save that could reach disk after this point is
+    // the reaper's own final autosave, the exact write the degraded-save
+    // guard must block.
+    {
+        let mut doc = room.doc.write().await;
+        doc.update_source("c1", "unsaved_live_edit = 1").unwrap();
+    }
+
+    assert!(
+        daemon_for_inspect
+            .test_mark_room_source_conflict(
+                uuid,
+                "source_conflict: external source changed while journal heads were not exported; both versions were preserved",
+            )
+            .await
+    );
+
+    // The user's external edit is the current disk truth.
+    let external_bytes =
+        br#"{"cells":[],"metadata":{"edited":"externally"},"nbformat":4,"nbformat_minor":5}"#;
+    std::fs::write(&nb_path, external_bytes).unwrap();
+
+    let before = std::fs::read(&nb_path).unwrap();
+    daemon_for_inspect.ghost_room_reaper_sweep(0).await;
+    assert_eq!(
+        daemon_for_inspect.test_room_count().await,
+        0,
+        "a SourceState-degraded room must be reapable"
+    );
+    let after = std::fs::read(&nb_path).unwrap();
+    assert_eq!(
+        before, after,
+        "reaping a conflicted room must not rewrite the on-disk notebook"
+    );
+
+    pool_client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
+}
+
 /// PR 1 codex P1: the connection-generation bump on peer connect must
 /// preempt an in-flight teardown that snapshotted the previous value.
 /// Stage a teardown task with a delay, reconnect a peer before the
@@ -2145,17 +2396,9 @@ async fn test_peer_reconnect_bumps_generation() {
     let notebook_id;
     let gen_before_disconnect;
     {
-        let result = connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
+        let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+            .await
+            .unwrap();
         notebook_id = result.info.notebook_id.clone();
         let client = result.handle;
         assert!(wait_for_session_ready(&client, SESSION_READY_TIMEOUT).await);
@@ -2225,17 +2468,9 @@ async fn test_resident_room_reaper_lru_cap_evicts_oldest() {
     // creation order (oldest first).
     let mut notebook_ids: Vec<String> = Vec::new();
     for tag in ["a", "b", "c"] {
-        let result = connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            tag,
-            false,
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
+        let result = connect::connect_create(socket_path.clone(), create_spec(tag))
+            .await
+            .unwrap();
         let notebook_id = result.info.notebook_id.clone();
         let client = result.handle;
         assert!(wait_for_session_ready(&client, SESSION_READY_TIMEOUT).await);
@@ -2346,17 +2581,9 @@ async fn test_resident_room_reaper_lru_cap_exempts_active() {
     let mut clients = Vec::new();
     let mut notebook_ids = Vec::new();
     for tag in ["a", "b", "c"] {
-        let result = connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            tag,
-            false,
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
+        let result = connect::connect_create(socket_path.clone(), create_spec(tag))
+            .await
+            .unwrap();
         notebook_ids.push(result.info.notebook_id.clone());
         let client = result.handle;
         assert!(wait_for_session_ready(&client, SESSION_READY_TIMEOUT).await);
@@ -2422,17 +2649,9 @@ async fn test_resident_room_reaper_skips_reserved_room() {
 
     let notebook_id;
     {
-        let result = connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
+        let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+            .await
+            .unwrap();
         notebook_id = result.info.notebook_id.clone();
         let client = result.handle;
         assert!(wait_for_session_ready(&client, SESSION_READY_TIMEOUT).await);
@@ -2519,17 +2738,9 @@ async fn test_notebook_cell_delete_propagation() {
     assert!(wait_for_daemon(&pool_client).await);
 
     // Client1 creates a notebook with three cells
-    let result = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+        .await
+        .unwrap();
     let notebook_id = result.info.notebook_id.clone();
     let client1 = result.handle;
 
@@ -2630,33 +2841,9 @@ async fn test_multiple_notebooks_concurrent_isolation() {
 
     // Create three notebooks concurrently via connect_create
     let (nb_a, nb_b, nb_c) = tokio::join!(
-        connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![]
-        ),
-        connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![]
-        ),
-        connect::connect_create(
-            socket_path.clone(),
-            "python",
-            None,
-            "test",
-            false,
-            None,
-            vec![]
-        ),
+        connect::connect_create(socket_path.clone(), create_spec("test"),),
+        connect::connect_create(socket_path.clone(), create_spec("test"),),
+        connect::connect_create(socket_path.clone(), create_spec("test"),),
     );
     let nb_a = nb_a.unwrap();
     let nb_b = nb_b.unwrap();
@@ -2872,6 +3059,48 @@ async fn test_streaming_load_via_open_notebook() {
     // Handshake reports 0 cells (streaming load is deferred)
     assert_eq!(info.cell_count, 0);
     assert!(info.error.is_none());
+    let canonical_path = std::fs::canonicalize(&nb_path).unwrap();
+    let expected_comments_doc_id = local_path_comments_doc_id(canonical_path.to_string_lossy());
+    assert_eq!(
+        info.capabilities.comments_doc_id.as_deref(),
+        Some(expected_comments_doc_id.as_str())
+    );
+    let expected_comments_notebook_ref = serde_json::json!({
+        "kind": "local_path",
+        "canonical_path": canonical_path.to_string_lossy()
+    });
+    assert_eq!(
+        info.capabilities.comments_notebook_ref.as_ref(),
+        Some(&expected_comments_notebook_ref)
+    );
+
+    // The control-plane projection waits on the room-owned load rather than
+    // depending on this peer's bootstrap progress. It must expose the complete
+    // ordered notebook and the causal heads a caller can use as a sync guard.
+    let projection = pool_client
+        .get_notebook_projection(&info.notebook_id, Duration::from_secs(10))
+        .await
+        .expect("room projection should settle independently of the peer");
+    assert_eq!(
+        projection.schema_version,
+        runtimed_client::protocol::NOTEBOOK_PROJECTION_SCHEMA_VERSION
+    );
+    assert_eq!(projection.load_generation, 1);
+    assert_eq!(projection.notebook_id, info.notebook_id);
+    assert_eq!(projection.notebook_path.as_deref(), canonical_path.to_str());
+    assert_eq!(
+        projection
+            .cells
+            .iter()
+            .map(|cell| cell.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c1", "c2", "c3", "c4", "c5", "c6", "c7"]
+    );
+    assert_eq!(projection.cells[0].source_preview, "x = 1");
+    assert!(
+        !projection.notebook_heads.is_empty(),
+        "projection should carry the room's notebook heads"
+    );
 
     assert_session_ready(&handle, "OpenNotebook streaming load").await;
     let mut cells = handle.get_cells();
@@ -3029,6 +3258,246 @@ async fn test_streaming_load_second_client_joins() {
     let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
 }
 
+/// Same regression surface as the desktop app: the first peer is a relay
+/// frontend that owns the NotebookDoc replica, then an MCP-style full peer
+/// joins the existing daemon room by UUID.
+#[tokio::test]
+async fn test_uuid_joiner_receives_existing_cells_after_relay_loader() {
+    use automerge::sync;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config = test_config(&temp_dir);
+    let socket_path = config.socket_path.clone();
+
+    let daemon = Daemon::new_for_test(config).unwrap();
+    let daemon_handle = tokio::spawn(async move {
+        daemon.run().await.ok();
+    });
+
+    let pool_client = PoolClient::new(socket_path.clone());
+    assert!(wait_for_daemon(&pool_client).await);
+
+    let nb_path = temp_dir.path().join("relay_uuid_join.ipynb");
+    write_test_ipynb(
+        &nb_path,
+        &[
+            ("relay-1", "code", "x = 1", vec![]),
+            ("relay-2", "markdown", "# loaded by relay", vec![]),
+        ],
+    );
+
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+    let relay = connect::connect_open_relay_with_operator(
+        socket_path.clone(),
+        nb_path.clone(),
+        frame_tx,
+        Some("desktop".to_string()),
+    )
+    .await
+    .expect("desktop relay loader should connect");
+    let notebook_id = relay.info.notebook_id.clone();
+    let relay_handle = relay.handle;
+
+    let mut frontend_doc = notebook_doc::NotebookDoc::bootstrap(
+        notebook_doc::TextEncoding::Utf16CodeUnit,
+        "desktop:test",
+    );
+    let mut frontend_state = sync::State::new();
+    let start = std::time::Instant::now();
+    while start.elapsed() < SESSION_READY_TIMEOUT {
+        if frontend_doc.cell_count() == 2 {
+            break;
+        }
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), frame_rx.recv())
+            .await
+            .expect("relay frontend should receive daemon frame")
+            .expect("relay frame stream should stay open");
+        let Some((&frame_type, payload)) = frame.split_first() else {
+            continue;
+        };
+        if frame_type != frame_types::AUTOMERGE_SYNC {
+            continue;
+        }
+
+        let message = sync::Message::decode(payload).expect("valid NotebookDoc sync frame");
+        frontend_doc
+            .receive_sync_message_recovering(&mut frontend_state, message, "relay-frontend-recv")
+            .expect("frontend applies daemon NotebookDoc frame");
+        if let Some(reply) = frontend_doc
+            .generate_sync_message_recovering(&mut frontend_state, "relay-frontend-reply")
+            .expect("frontend generates NotebookDoc reply")
+        {
+            relay_handle
+                .forward_frame(frame_types::AUTOMERGE_SYNC, reply.encode())
+                .await
+                .expect("frontend reply forwarded to daemon");
+        }
+    }
+    assert_eq!(
+        frontend_doc.cell_count(),
+        2,
+        "relay frontend should receive the file-loaded cells"
+    );
+
+    let joiner = connect::connect(socket_path.clone(), notebook_id, "mcp")
+        .await
+        .expect("MCP UUID joiner should connect")
+        .handle;
+    assert_session_ready(&joiner, "MCP UUID joiner after relay loader").await;
+
+    let cells = joiner.get_cells();
+    assert_eq!(
+        cells.len(),
+        2,
+        "MCP UUID joiner should have existing NotebookDoc cells after relay loader; status={:?}; cells={:?}",
+        joiner.status(),
+        cells
+    );
+    assert_eq!(cells[0].id, "relay-1");
+    assert_eq!(cells[0].source, "x = 1");
+    assert_eq!(cells[1].id, "relay-2");
+
+    drop(relay_handle);
+    pool_client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
+}
+
+/// Desktop-authored changes travel through the relay/frontend Automerge path,
+/// not the file streaming loader. A later MCP UUID joiner must receive those
+/// already-admitted NotebookDoc cells.
+#[tokio::test]
+async fn test_uuid_joiner_receives_frontend_authored_relay_cells() {
+    use automerge::sync;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config = test_config(&temp_dir);
+    let socket_path = config.socket_path.clone();
+
+    let daemon = Daemon::new_for_test(config).unwrap();
+    let daemon_handle = tokio::spawn(async move {
+        daemon.run().await.ok();
+    });
+
+    let pool_client = PoolClient::new(socket_path.clone());
+    assert!(wait_for_daemon(&pool_client).await);
+
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let relay =
+        connect::connect_create_relay(socket_path.clone(), create_spec("desktop"), frame_tx)
+            .await
+            .expect("desktop relay create should connect");
+    let notebook_id = relay.info.notebook_id.clone();
+    let relay_handle = relay.handle;
+
+    let mut frontend_doc = notebook_doc::NotebookDoc::bootstrap(
+        notebook_doc::TextEncoding::Utf16CodeUnit,
+        "desktop:test",
+    );
+    let mut frontend_state = sync::State::new();
+
+    for _ in 0..32 {
+        if frontend_doc.cell_count() >= 1 {
+            break;
+        }
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), frame_rx.recv())
+            .await
+            .expect("relay frontend should receive initial daemon frame")
+            .expect("relay frame stream should stay open");
+        let Some((&frame_type, payload)) = frame.split_first() else {
+            continue;
+        };
+        if frame_type != frame_types::AUTOMERGE_SYNC {
+            continue;
+        }
+
+        let message = sync::Message::decode(payload).expect("valid NotebookDoc sync frame");
+        frontend_doc
+            .receive_sync_message_recovering(&mut frontend_state, message, "relay-create-recv")
+            .expect("frontend applies initial NotebookDoc frame");
+        if let Some(reply) = frontend_doc
+            .generate_sync_message_recovering(&mut frontend_state, "relay-create-reply")
+            .expect("frontend generates initial NotebookDoc reply")
+        {
+            relay_handle
+                .forward_frame(frame_types::AUTOMERGE_SYNC, reply.encode())
+                .await
+                .expect("frontend initial reply forwarded to daemon");
+        }
+    }
+    assert!(
+        frontend_doc.cell_count() >= 1,
+        "relay frontend should receive the daemon starter cell"
+    );
+
+    frontend_doc
+        .add_cell(1, "relay-authored", "code")
+        .expect("frontend adds a code cell");
+    frontend_doc
+        .update_source("relay-authored", "created_by = 'frontend relay'")
+        .expect("frontend updates source");
+    let outbound = frontend_doc
+        .generate_sync_message_recovering(&mut frontend_state, "relay-authored-outbound")
+        .expect("frontend generates authored changes")
+        .expect("frontend has authored changes to send");
+    relay_handle
+        .forward_frame(frame_types::AUTOMERGE_SYNC, outbound.encode())
+        .await
+        .expect("frontend-authored changes forwarded to daemon");
+
+    // Let the daemon process the authored changes and, if it emits an ack, keep
+    // the relay/frontend sync state moving before the MCP peer joins.
+    for _ in 0..16 {
+        let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(250), frame_rx.recv()).await
+        else {
+            break;
+        };
+        let Some((&frame_type, payload)) = frame.split_first() else {
+            continue;
+        };
+        if frame_type != frame_types::AUTOMERGE_SYNC {
+            continue;
+        }
+
+        let message = sync::Message::decode(payload).expect("valid NotebookDoc sync ack");
+        frontend_doc
+            .receive_sync_message_recovering(&mut frontend_state, message, "relay-authored-ack")
+            .expect("frontend applies daemon ack");
+        if let Some(reply) = frontend_doc
+            .generate_sync_message_recovering(&mut frontend_state, "relay-authored-ack-reply")
+            .expect("frontend generates ack reply")
+        {
+            relay_handle
+                .forward_frame(frame_types::AUTOMERGE_SYNC, reply.encode())
+                .await
+                .expect("frontend ack reply forwarded to daemon");
+        }
+    }
+
+    let joiner = connect::connect(socket_path.clone(), notebook_id, "mcp")
+        .await
+        .expect("MCP UUID joiner should connect")
+        .handle;
+    assert_session_ready(&joiner, "MCP UUID joiner after frontend relay mutation").await;
+
+    let cells = joiner.get_cells();
+    assert!(
+        cells
+            .iter()
+            .any(|cell| cell.id == "relay-authored"
+                && cell.source == "created_by = 'frontend relay'"),
+        "MCP UUID joiner should receive frontend-authored relay cells after session-ready; status={:?}; cells={:?}",
+        joiner.status(),
+        cells
+    );
+
+    drop(relay_handle);
+    pool_client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
+}
+
 /// An older stable app sends a pool ping during upgrade to check whether a
 /// daemon is already running and whether it needs replacement. The pool channel
 /// must accept the old preamble version and still return version metadata.
@@ -3100,6 +3569,30 @@ async fn test_pool_ping_from_old_stable_preamble_returns_version_metadata() {
     let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
 }
 
+/// Seed a resident room and return its id (plus a keep-alive handle).
+///
+/// `NotebookSync` is attach-only, so relay/pipe tests must attach to a room the
+/// daemon has already created (via `CreateNotebook`). Hold the returned handle
+/// for the room to stay resident while the test attaches the relay and peer.
+async fn seed_pipe_room(
+    socket_path: &std::path::Path,
+) -> (notebook_sync::connect::CreateResult, String) {
+    let seed = connect::connect_create(
+        socket_path.to_path_buf(),
+        connect::CreateNotebookSpec {
+            ephemeral: true,
+            ..create_spec("test:seed")
+        },
+    )
+    .await
+    .expect("seed room create should succeed");
+    // No session-ready wait: the relay and peer do their own sync wait; the seed
+    // only needs the room to exist so they can attach to it. An untitled
+    // ephemeral notebook does not auto-launch a kernel, so this stays light.
+    let id = seed.info.notebook_id.clone();
+    (seed, id)
+}
+
 #[tokio::test]
 async fn test_pipe_mode_forwards_sync_frames() {
     let temp_dir = TempDir::new().unwrap();
@@ -3114,27 +3607,22 @@ async fn test_pipe_mode_forwards_sync_frames() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
+    // Seed a resident room and attach by its id (NotebookSync is attach-only).
+    let (_seed, notebook_id) = seed_pipe_room(&socket_path).await;
+
     // Create a pipe channel
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // Connect pipe client (relay mode — no local doc, no initial sync)
-    let _result = connect::connect_relay(
-        socket_path.clone(),
-        "00000000-0000-0000-0000-000000000001".to_string(),
-        frame_tx,
-    )
-    .await
-    .unwrap();
+    let _result = connect::connect_relay(socket_path.clone(), notebook_id.clone(), frame_tx)
+        .await
+        .unwrap();
 
     // Second client (full peer) adds a cell and updates source
-    let client2 = connect::connect(
-        socket_path.clone(),
-        "00000000-0000-0000-0000-000000000001".to_string(),
-        "test",
-    )
-    .await
-    .unwrap()
-    .handle;
+    let client2 = connect::connect(socket_path.clone(), notebook_id.clone(), "test")
+        .await
+        .unwrap()
+        .handle;
     // Initial sync must deliver the daemon's cells map before we can
     // mutate it. Otherwise `add_cell_after` panics with
     // `InvalidObjId("cells map not found")` — a flake under loaded CI.
@@ -3192,15 +3680,12 @@ async fn test_pipe_mode_preserves_initial_session_status_frame() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
+    let (_seed, notebook_id) = seed_pipe_room(&socket_path).await;
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    let _result = connect::connect_relay(
-        socket_path.clone(),
-        "00000000-0000-0000-0000-000000000011".to_string(),
-        frame_tx,
-    )
-    .await
-    .unwrap();
+    let _result = connect::connect_relay(socket_path.clone(), notebook_id.clone(), frame_tx)
+        .await
+        .unwrap();
 
     let first_frame = tokio::time::timeout(Duration::from_secs(2), frame_rx.recv())
         .await
@@ -3243,28 +3728,21 @@ async fn test_pipe_mode_only_pipes_allowed_frame_types() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
+    let (_seed, notebook_id) = seed_pipe_room(&socket_path).await;
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    let _result = connect::connect_relay(
-        socket_path.clone(),
-        "00000000-0000-0000-0000-000000000002".to_string(),
-        frame_tx,
-    )
-    .await
-    .unwrap();
+    let _result = connect::connect_relay(socket_path.clone(), notebook_id.clone(), frame_tx)
+        .await
+        .unwrap();
 
     // Second client adds a cell to trigger sync activity.
     // Note: this only produces AutomergeSync frames — actual Broadcast frames
     // require a kernel launch, which is covered by E2E tests. This test
     // verifies the type-byte filter, not broadcast-specific forwarding.
-    let client2 = connect::connect(
-        socket_path.clone(),
-        "00000000-0000-0000-0000-000000000002".to_string(),
-        "test",
-    )
-    .await
-    .unwrap()
-    .handle;
+    let client2 = connect::connect(socket_path.clone(), notebook_id.clone(), "test")
+        .await
+        .unwrap()
+        .handle;
     assert!(
         wait_for_cells_map(&client2, SESSION_READY_TIMEOUT).await,
         "initial sync did not deliver the cells map within {:?}",
@@ -3290,13 +3768,14 @@ async fn test_pipe_mode_only_pipes_allowed_frame_types() {
 
     // Every piped frame must have a valid type byte from the forwarded set:
     // AutomergeSync, Broadcast, Presence, RuntimeStateSync, CommsDocSync,
-    // PoolStateSync, or SessionControl — never Request or Response.
+    // CommentsDocSync, PoolStateSync, or SessionControl, never Request or Response.
     let allowed_types = [
         frame_types::AUTOMERGE_SYNC,
         frame_types::BROADCAST,
         frame_types::PRESENCE,
         frame_types::RUNTIME_STATE_SYNC,
         frame_types::COMMS_DOC_SYNC,
+        frame_types::COMMENTS_DOC_SYNC,
         frame_types::POOL_STATE_SYNC,
         frame_types::SESSION_CONTROL,
     ];
@@ -3304,7 +3783,7 @@ async fn test_pipe_mode_only_pipes_allowed_frame_types() {
         assert!(!frame.is_empty(), "frame {} should not be empty", i);
         assert!(
             allowed_types.contains(&frame[0]),
-            "frame {} has unexpected type byte 0x{:02x} — only AUTOMERGE_SYNC, BROADCAST, PRESENCE, RUNTIME_STATE_SYNC, COMMS_DOC_SYNC, POOL_STATE_SYNC, and SESSION_CONTROL are piped",
+            "frame {} has unexpected type byte 0x{:02x}, only AUTOMERGE_SYNC, BROADCAST, PRESENCE, RUNTIME_STATE_SYNC, COMMS_DOC_SYNC, COMMENTS_DOC_SYNC, POOL_STATE_SYNC, and SESSION_CONTROL are piped",
             i,
             frame[0]
         );
@@ -3329,15 +3808,12 @@ async fn test_pipe_mode_does_not_forward_response_frames() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
+    let (_seed, notebook_id) = seed_pipe_room(&socket_path).await;
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    let result = connect::connect_relay(
-        socket_path.clone(),
-        "00000000-0000-0000-0000-000000000004".to_string(),
-        frame_tx,
-    )
-    .await
-    .unwrap();
+    let result = connect::connect_relay(socket_path.clone(), notebook_id.clone(), frame_tx)
+        .await
+        .unwrap();
     let handle = result.handle;
 
     // Send a request that produces a Response frame
@@ -3401,25 +3877,18 @@ async fn test_pipe_mode_preserves_frame_order() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
+    let (_seed, notebook_id) = seed_pipe_room(&socket_path).await;
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-    let _result = connect::connect_relay(
-        socket_path.clone(),
-        "00000000-0000-0000-0000-000000000003".to_string(),
-        frame_tx,
-    )
-    .await
-    .unwrap();
+    let _result = connect::connect_relay(socket_path.clone(), notebook_id.clone(), frame_tx)
+        .await
+        .unwrap();
 
     // Second client rapidly adds multiple cells
-    let client2 = connect::connect(
-        socket_path.clone(),
-        "00000000-0000-0000-0000-000000000003".to_string(),
-        "test",
-    )
-    .await
-    .unwrap()
-    .handle;
+    let client2 = connect::connect(socket_path.clone(), notebook_id.clone(), "test")
+        .await
+        .unwrap()
+        .handle;
     // Initial sync must deliver the daemon's cells map before we can
     // mutate it. Otherwise `add_cell_after` panics with
     // `InvalidObjId("cells map not found")` — a flake under loaded CI.
@@ -3492,14 +3961,10 @@ async fn test_pipe_mode_preserves_frame_order() {
     // Connect a third full-peer client and verify convergence — this proves
     // the daemon processed all mutations and that the sync traffic the pipe
     // received (in channel order) represents the correct state transitions.
-    let client3 = connect::connect(
-        socket_path.clone(),
-        "00000000-0000-0000-0000-000000000003".to_string(),
-        "test",
-    )
-    .await
-    .unwrap()
-    .handle;
+    let client3 = connect::connect(socket_path.clone(), notebook_id.clone(), "test")
+        .await
+        .unwrap()
+        .handle;
     assert!(
         wait_for_session_ready(&client3, SESSION_READY_TIMEOUT).await,
         "third client should reach session-ready state within 2s"
@@ -3514,6 +3979,46 @@ async fn test_pipe_mode_preserves_frame_order() {
     assert_eq!(cells[2].source, "c = 3");
 
     // Shutdown
+    pool_client.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
+}
+
+/// NotebookSync is attach-only: connecting by a UUID that has no resident room
+/// and no persisted doc is refused, and must NOT mint a phantom empty room.
+/// This is what lets the rejoin trust the daemon instead of guessing with
+/// list_rooms, while a recoverable (persisted) untitled notebook still reloads.
+#[tokio::test]
+async fn test_notebook_sync_refuses_gone_uuid_without_phantom() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = test_config(&temp_dir);
+    let socket_path = config.socket_path.clone();
+
+    let daemon = Daemon::new_for_test(config).unwrap();
+    let daemon_handle = tokio::spawn(async move {
+        daemon.run().await.ok();
+    });
+
+    let pool_client = PoolClient::new(socket_path.clone());
+    assert!(wait_for_daemon(&pool_client).await);
+
+    // A UUID the daemon has never seen: not resident, no persisted doc.
+    let gone = "00000000-0000-0000-0000-0000000000ff".to_string();
+    match connect::connect(socket_path.clone(), gone.clone(), "test").await {
+        Err(notebook_sync::SyncError::NotebookUnavailable(ref m))
+            if m.contains("no longer available") => {}
+        Err(other) => panic!("gone uuid refused with an unexpected error: {other:?}"),
+        Ok(_) => {
+            panic!("connect to a gone uuid should be refused, but it succeeded (phantom room)")
+        }
+    }
+
+    // The refusal must not have created a phantom room.
+    let rooms = pool_client.list_rooms().await.unwrap();
+    assert!(
+        !rooms.iter().any(|r| r.notebook_id == gone),
+        "refused NotebookSync must not mint a phantom room: {rooms:?}"
+    );
+
     pool_client.shutdown().await.ok();
     let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
 }
@@ -3720,12 +4225,11 @@ async fn test_create_notebook_with_deps() {
     // Create notebook with conda + two deps
     let result = connect::connect_create(
         socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        Some(notebook_protocol::connection::PackageManager::Conda),
-        vec!["pandas".to_string(), "numpy".to_string()],
+        connect::CreateNotebookSpec {
+            package_manager: Some(notebook_protocol::connection::PackageManager::Conda),
+            dependencies: vec!["pandas".to_string(), "numpy".to_string()],
+            ..create_spec("test")
+        },
     )
     .await
     .expect("should create notebook with deps");
@@ -3788,12 +4292,10 @@ async fn test_create_notebook_with_explicit_manager_no_deps() {
     // Create notebook with pixi manager, no deps
     let result = connect::connect_create(
         socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        Some(notebook_protocol::connection::PackageManager::Pixi),
-        vec![],
+        connect::CreateNotebookSpec {
+            package_manager: Some(notebook_protocol::connection::PackageManager::Pixi),
+            ..create_spec("test")
+        },
     )
     .await
     .expect("should create notebook with pixi manager");
@@ -3859,12 +4361,10 @@ async fn test_create_notebook_default_manager_with_deps() {
     // Create notebook with deps but no explicit package manager
     let result = connect::connect_create(
         socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec!["requests".to_string()],
+        connect::CreateNotebookSpec {
+            dependencies: vec!["requests".to_string()],
+            ..create_spec("test")
+        },
     )
     .await
     .expect("should create notebook with default manager + deps");
@@ -3928,12 +4428,10 @@ async fn test_create_notebook_with_deps_reports_no_trust_approval_needed() {
 
     let result = connect::connect_create(
         socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec!["scipy".to_string()],
+        connect::CreateNotebookSpec {
+            dependencies: vec!["scipy".to_string()],
+            ..create_spec("test")
+        },
     )
     .await
     .expect("create with explicit deps should succeed");
@@ -3966,17 +4464,9 @@ async fn test_create_notebook_with_no_deps_reports_no_trust_approval_needed() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
-    let result = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "test",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .expect("create with no deps should succeed");
+    let result = connect::connect_create(socket_path.clone(), create_spec("test"))
+        .await
+        .expect("create with no deps should succeed");
 
     assert!(
         !result.info.needs_trust_approval,
@@ -4010,17 +4500,9 @@ async fn test_auto_heartbeat_keeps_idle_peer_connected() {
     let pool_client = PoolClient::new(socket_path.clone());
     assert!(wait_for_daemon(&pool_client).await);
 
-    let result = connect::connect_create(
-        socket_path.clone(),
-        "python",
-        None,
-        "heartbeat-peer",
-        false,
-        None,
-        vec![],
-    )
-    .await
-    .expect("client should connect");
+    let result = connect::connect_create(socket_path.clone(), create_spec("heartbeat-peer"))
+        .await
+        .expect("client should connect");
     let client = result.handle;
     assert_session_ready(&client, "heartbeat client").await;
 
@@ -4039,4 +4521,560 @@ async fn test_auto_heartbeat_keeps_idle_peer_connected() {
 
     pool_client.shutdown().await.ok();
     let _ = tokio::time::timeout(Duration::from_secs(2), daemon_handle).await;
+}
+
+// ============================================================================
+// Cross-channel file claims (issue #4053)
+// ============================================================================
+
+/// Start a daemon whose file-claim registry lives at `claims_dir`, with all
+/// other state isolated under a fresh tempdir. Returns the tempdir (keep it
+/// alive), the daemon socket path, and the running daemon task.
+async fn start_claiming_daemon(
+    claims_dir: &std::path::Path,
+) -> (TempDir, std::path::PathBuf, tokio::task::JoinHandle<()>) {
+    let (temp_dir, socket_path, daemon_handle, _daemon) =
+        start_claiming_daemon_with(claims_dir, |_| {}).await;
+    (temp_dir, socket_path, daemon_handle)
+}
+
+/// `start_claiming_daemon` plus a config hook and the daemon handle, for
+/// tests that tune the claim grace or drive `reconcile_file_claims_once`
+/// synchronously instead of waiting on the reconciler interval.
+async fn start_claiming_daemon_with(
+    claims_dir: &std::path::Path,
+    tweak: impl FnOnce(&mut DaemonConfig),
+) -> (
+    TempDir,
+    std::path::PathBuf,
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<Daemon>,
+) {
+    let temp_dir = TempDir::new().unwrap();
+    let mut config = DaemonConfig {
+        file_claims_dir: Some(claims_dir.to_path_buf()),
+        ..test_config(&temp_dir)
+    };
+    tweak(&mut config);
+    let socket_path = config.socket_path.clone();
+    let daemon = Daemon::new_for_test(config).unwrap();
+    let run_daemon = daemon.clone();
+    let daemon_handle = tokio::spawn(async move {
+        run_daemon.run().await.ok();
+    });
+    let pool_client = PoolClient::new(socket_path.clone());
+    assert!(wait_for_daemon(&pool_client).await);
+    (temp_dir, socket_path, daemon_handle, daemon)
+}
+
+/// Gracefully stop a daemon started by `start_claiming_daemon`.
+async fn stop_claiming_daemon(socket: &std::path::Path, handle: tokio::task::JoinHandle<()>) {
+    PoolClient::new(socket.to_path_buf()).shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
+fn foreign_claim_owner(socket: &str, pid: u32) -> runt_workspace::file_claims::FileClaimOwner {
+    runt_workspace::file_claims::FileClaimOwner {
+        channel: "runt".to_string(),
+        socket_path: socket.to_string(),
+        pid,
+    }
+}
+
+/// A second daemon process (different socket) with a live claim on the path
+/// refuses the open with the structured `file_active_elsewhere` error,
+/// delivered verbatim through the handshake error channel MCP clients read.
+#[tokio::test]
+async fn test_open_notebook_refused_while_foreign_daemon_claim_is_live() {
+    let claims_root = TempDir::new().unwrap();
+    let claims_dir = claims_root.path().join("file-claims");
+
+    let (dir_a, socket_a, handle_a) = start_claiming_daemon(&claims_dir).await;
+    let (_dir_b, socket_b, handle_b) = start_claiming_daemon(&claims_dir).await;
+
+    let nb_path = dir_a.path().join("claimed.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+    let canonical = std::fs::canonicalize(&nb_path).unwrap();
+
+    // Daemon A opens the file and takes the claim.
+    let opened = connect::connect_open(socket_a.clone(), nb_path.clone(), "owner")
+        .await
+        .expect("daemon A should open the notebook");
+    let registry = runt_workspace::file_claims::FileClaimRegistry::at_dir(claims_dir.clone());
+    let claim = registry
+        .read(&canonical)
+        .expect("daemon A should have claimed the path");
+    assert_eq!(claim.socket_path, socket_a.to_string_lossy());
+    assert_eq!(claim.pid, std::process::id());
+    assert_eq!(claim.notebook_id, opened.info.notebook_id);
+
+    // Daemon B (same test process, so the pid is live; different socket, so
+    // it is a different daemon) must refuse with the exact structured error.
+    let refused = connect::connect_open(socket_b.clone(), nb_path.clone(), "intruder").await;
+    let expected = format!(
+        "file_active_elsewhere: {} is open in {} (socket {}); connect there or close it first",
+        canonical.display(),
+        runt_workspace::cache_namespace(),
+        socket_a.display(),
+    );
+    match refused {
+        Err(notebook_sync::error::SyncError::Protocol(message)) => {
+            assert_eq!(message, expected);
+        }
+        Err(other) => panic!("expected verbatim file_active_elsewhere refusal, got {other:?}"),
+        Ok(_) => panic!("expected refusal, but the open succeeded"),
+    }
+
+    // Daemon B did not steal the claim.
+    assert_eq!(
+        registry.read(&canonical).unwrap().socket_path,
+        socket_a.to_string_lossy()
+    );
+
+    stop_claiming_daemon(&socket_a, handle_a).await;
+    stop_claiming_daemon(&socket_b, handle_b).await;
+}
+
+/// A claim whose owner pid is dead is stale: the open reaps it and proceeds.
+/// This is the crash-safety path, a crashed daemon must not brick the file.
+#[tokio::test]
+async fn test_open_notebook_reaps_stale_claim_from_dead_pid() {
+    let claims_root = TempDir::new().unwrap();
+    let claims_dir = claims_root.path().join("file-claims");
+    let (dir_a, socket_a, handle_a) = start_claiming_daemon(&claims_dir).await;
+
+    let nb_path = dir_a.path().join("crashed-owner.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+    let canonical = std::fs::canonicalize(&nb_path).unwrap();
+
+    // Fresh claim from a "crashed daemon": recent refresh, but a pid that
+    // cannot exist (u32::MAX exceeds every platform's pid range).
+    let registry = runt_workspace::file_claims::FileClaimRegistry::at_dir(claims_dir.clone());
+    registry
+        .record(
+            &canonical,
+            &foreign_claim_owner("/tmp/crashed-daemon.sock", u32::MAX),
+            "room-of-the-dead",
+        )
+        .unwrap();
+
+    let opened = connect::connect_open(socket_a.clone(), nb_path.clone(), "survivor")
+        .await
+        .expect("stale dead-pid claim must not brick the path");
+    let claim = registry.read(&canonical).unwrap();
+    assert_eq!(claim.socket_path, socket_a.to_string_lossy());
+    assert_eq!(claim.notebook_id, opened.info.notebook_id);
+
+    stop_claiming_daemon(&socket_a, handle_a).await;
+}
+
+/// A claim outside its refresh window is stale even when its pid is alive:
+/// the open reaps it and proceeds. This is the pid-reuse safety net.
+#[tokio::test]
+async fn test_open_notebook_reaps_stale_claim_past_refresh_window() {
+    let claims_root = TempDir::new().unwrap();
+    let claims_dir = claims_root.path().join("file-claims");
+    let (dir_a, socket_a, handle_a) = start_claiming_daemon(&claims_dir).await;
+
+    let nb_path = dir_a.path().join("expired-owner.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+    let canonical = std::fs::canonicalize(&nb_path).unwrap();
+
+    // Live pid (this test process), lapsed refresh: write the record
+    // directly so the timestamp predates the TTL window.
+    let registry = runt_workspace::file_claims::FileClaimRegistry::at_dir(claims_dir.clone());
+    let expired = runt_workspace::file_claims::FileClaim {
+        schema_version: runt_workspace::file_claims::FILE_CLAIM_SCHEMA_VERSION,
+        channel: "runt".to_string(),
+        socket_path: "/tmp/zombie-daemon.sock".to_string(),
+        notebook_id: "room-expired".to_string(),
+        pid: std::process::id(),
+        path: canonical.to_string_lossy().into_owned(),
+        refreshed_at_unix_ms: 0,
+    };
+    std::fs::create_dir_all(&claims_dir).unwrap();
+    std::fs::write(
+        registry.claim_file(&canonical),
+        serde_json::to_vec_pretty(&expired).unwrap(),
+    )
+    .unwrap();
+
+    connect::connect_open(socket_a.clone(), nb_path.clone(), "survivor")
+        .await
+        .expect("expired claim must not brick the path");
+    assert_eq!(
+        registry.read(&canonical).unwrap().socket_path,
+        socket_a.to_string_lossy()
+    );
+
+    stop_claiming_daemon(&socket_a, handle_a).await;
+}
+
+/// The same daemon reopening a path it already serves refreshes its own
+/// claim and never refuses.
+#[tokio::test]
+async fn test_open_notebook_same_daemon_reopen_refreshes_claim() {
+    let claims_root = TempDir::new().unwrap();
+    let claims_dir = claims_root.path().join("file-claims");
+    let (dir_a, socket_a, handle_a) = start_claiming_daemon(&claims_dir).await;
+
+    let nb_path = dir_a.path().join("reopened.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+    let canonical = std::fs::canonicalize(&nb_path).unwrap();
+
+    let first = connect::connect_open(socket_a.clone(), nb_path.clone(), "first")
+        .await
+        .expect("first open should succeed");
+    let registry = runt_workspace::file_claims::FileClaimRegistry::at_dir(claims_dir.clone());
+    let first_claim = registry.read(&canonical).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let second = connect::connect_open(socket_a.clone(), nb_path.clone(), "second")
+        .await
+        .expect("same-daemon reopen must never be refused");
+    assert_eq!(second.info.notebook_id, first.info.notebook_id);
+
+    let second_claim = registry.read(&canonical).unwrap();
+    assert_eq!(second_claim.socket_path, socket_a.to_string_lossy());
+    assert!(
+        second_claim.refreshed_at_unix_ms > first_claim.refreshed_at_unix_ms,
+        "reopen should refresh the claim lease"
+    );
+
+    stop_claiming_daemon(&socket_a, handle_a).await;
+}
+
+/// Evicting the room via ShutdownNotebook releases both the cross-daemon
+/// claim and the on-disk autosave owner marker, so a second daemon can not
+/// only open the path but also save to it. A claim release without the
+/// marker release would advertise a handoff the successor cannot use: its
+/// first save would refuse against the first daemon's live-pid marker.
+#[tokio::test]
+async fn test_notebook_shutdown_releases_claim_for_other_daemons() {
+    let claims_root = TempDir::new().unwrap();
+    let claims_dir = claims_root.path().join("file-claims");
+    let (dir_a, socket_a, handle_a) = start_claiming_daemon(&claims_dir).await;
+    let (_dir_b, socket_b, handle_b) = start_claiming_daemon(&claims_dir).await;
+
+    let nb_path = dir_a.path().join("handed-off.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+    let canonical = std::fs::canonicalize(&nb_path).unwrap();
+    let marker_path = canonical.with_file_name("handed-off.ipynb.runtlock");
+
+    let opened = connect::connect_open(socket_a.clone(), nb_path.clone(), "owner")
+        .await
+        .expect("daemon A should open the notebook");
+    let notebook_id = opened.info.notebook_id.clone();
+
+    // An explicit save stamps the autosave owner marker next to the file
+    // with daemon A's identity, exactly like any autosave would.
+    let save = opened
+        .handle
+        .send_request(NotebookRequest::SaveNotebook {
+            format_cells: false,
+            path: None,
+        })
+        .await
+        .expect("save on the owning daemon should succeed");
+    assert!(
+        matches!(
+            save,
+            NotebookResponse::NotebookSaved { .. }
+                | NotebookResponse::NotebookAlreadyCurrent { .. }
+        ),
+        "unexpected save response: {save:?}"
+    );
+    assert!(
+        marker_path.exists(),
+        "save must stamp the autosave owner marker"
+    );
+    drop(opened);
+
+    let registry = runt_workspace::file_claims::FileClaimRegistry::at_dir(claims_dir.clone());
+    assert!(registry.read(&canonical).is_some());
+
+    // Close the room on daemon A; the claim and the marker must be
+    // released with it.
+    let pool_client_a = PoolClient::new(socket_a.clone());
+    assert!(pool_client_a
+        .shutdown_notebook(&notebook_id)
+        .await
+        .expect("shutdown_notebook request should succeed"));
+    assert!(
+        registry.read(&canonical).is_none(),
+        "room eviction must release the file claim"
+    );
+    assert!(
+        !marker_path.exists(),
+        "room eviction must release the autosave owner marker along with the claim"
+    );
+
+    // Daemon B can now open the path and save to it.
+    let successor = connect::connect_open(socket_b.clone(), nb_path.clone(), "successor")
+        .await
+        .expect("released claim should allow the other daemon to open");
+    assert_eq!(
+        registry.read(&canonical).unwrap().socket_path,
+        socket_b.to_string_lossy()
+    );
+    let successor_save = successor
+        .handle
+        .send_request(NotebookRequest::SaveNotebook {
+            format_cells: false,
+            path: None,
+        })
+        .await
+        .expect("successor daemon must be able to save after the handoff");
+    assert!(
+        matches!(
+            successor_save,
+            NotebookResponse::NotebookSaved { .. }
+                | NotebookResponse::NotebookAlreadyCurrent { .. }
+        ),
+        "unexpected successor save response: {successor_save:?}"
+    );
+    drop(successor);
+
+    stop_claiming_daemon(&socket_a, handle_a).await;
+    stop_claiming_daemon(&socket_b, handle_b).await;
+}
+
+/// The NotebookSync handshake with a path-shaped notebook_id passes the
+/// same claim gate as OpenNotebook: it acquires the claim when the path
+/// is free and is refused (without stealing) while a live foreign daemon
+/// claim holds it. Before the gate covered this entry, a path-shaped
+/// reconnect created a file-backed room around the guard, and the claim
+/// refresh then overwrote the foreign daemon's live claim.
+#[tokio::test]
+async fn test_notebook_sync_path_handshake_passes_claim_gate() {
+    let claims_root = TempDir::new().unwrap();
+    let claims_dir = claims_root.path().join("file-claims");
+    let (dir_a, socket_a, handle_a) = start_claiming_daemon(&claims_dir).await;
+    let (_dir_b, socket_b, handle_b) = start_claiming_daemon(&claims_dir).await;
+
+    let nb_path = dir_a.path().join("sync-attach.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+    let canonical = std::fs::canonicalize(&nb_path).unwrap();
+    let registry = runt_workspace::file_claims::FileClaimRegistry::at_dir(claims_dir.clone());
+
+    // Free path: the path-shaped NotebookSync attach takes the claim.
+    let attached = connect::connect(
+        socket_a.clone(),
+        canonical.to_string_lossy().into_owned(),
+        "sync-owner",
+    )
+    .await
+    .expect("path-shaped NotebookSync attach should succeed on a free path");
+    let claim = registry
+        .read(&canonical)
+        .expect("path-shaped NotebookSync attach must record a claim");
+    assert_eq!(claim.socket_path, socket_a.to_string_lossy());
+
+    // Claimed path: daemon B's path-shaped attach is refused with the
+    // structured error and leaves daemon A's claim intact.
+    let refused = connect::connect(
+        socket_b.clone(),
+        canonical.to_string_lossy().into_owned(),
+        "sync-intruder",
+    )
+    .await;
+    match refused {
+        Err(error) => assert!(
+            error.to_string().contains("file_active_elsewhere"),
+            "expected structured file_active_elsewhere refusal, got {error}"
+        ),
+        Ok(_) => panic!("expected refusal, but the attach succeeded"),
+    }
+    assert_eq!(
+        registry.read(&canonical).unwrap().socket_path,
+        socket_a.to_string_lossy()
+    );
+
+    drop(attached);
+    stop_claiming_daemon(&socket_a, handle_a).await;
+    stop_claiming_daemon(&socket_b, handle_b).await;
+}
+
+/// The claim reconciler renews only this daemon's own registry records.
+/// A live foreign claim that appears on a path this daemon actively
+/// serves is warned about, never overwritten.
+#[tokio::test]
+async fn test_claim_reconciler_never_overwrites_live_foreign_claim() {
+    let claims_root = TempDir::new().unwrap();
+    let claims_dir = claims_root.path().join("file-claims");
+    let (dir_a, socket_a, handle_a, daemon_a) =
+        start_claiming_daemon_with(&claims_dir, |_| {}).await;
+
+    let nb_path = dir_a.path().join("not-stolen.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+    let canonical = std::fs::canonicalize(&nb_path).unwrap();
+
+    // Keep the connection alive: the room has an active peer, so the
+    // reconciler definitely wants the claim.
+    let opened = connect::connect_open(socket_a.clone(), nb_path.clone(), "owner")
+        .await
+        .expect("daemon A should open the notebook");
+
+    // A foreign daemon's live record lands on the path (live pid: this
+    // test process). Whatever wrote it, the reconciler must treat the
+    // registry as fact and not clobber it.
+    let registry = runt_workspace::file_claims::FileClaimRegistry::at_dir(claims_dir.clone());
+    registry
+        .record(
+            &canonical,
+            &foreign_claim_owner("/tmp/foreign-live.sock", std::process::id()),
+            "room-foreign",
+        )
+        .unwrap();
+
+    for _ in 0..3 {
+        daemon_a.reconcile_file_claims_once().await;
+    }
+    assert_eq!(
+        registry.read(&canonical).unwrap().socket_path,
+        "/tmp/foreign-live.sock",
+        "reconciler must never overwrite a live foreign claim"
+    );
+
+    drop(opened);
+    stop_claiming_daemon(&socket_a, handle_a).await;
+}
+
+/// Claims follow activity, not room residency: a clean idle room
+/// releases its claim (and the autosave owner marker) after the grace
+/// window, another daemon can then take the path, and reconnecting
+/// through the first daemon's still-resident room is refused with the
+/// structured error while the foreign claim is live.
+#[tokio::test]
+async fn test_idle_clean_room_releases_claim_and_hands_off() {
+    let claims_root = TempDir::new().unwrap();
+    let claims_dir = claims_root.path().join("file-claims");
+    let (dir_a, socket_a, handle_a, daemon_a) = start_claiming_daemon_with(&claims_dir, |config| {
+        config.file_claim_release_grace_ms = Some(50);
+    })
+    .await;
+    let (_dir_b, socket_b, handle_b) = start_claiming_daemon(&claims_dir).await;
+
+    let nb_path = dir_a.path().join("idle-handoff.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+    let canonical = std::fs::canonicalize(&nb_path).unwrap();
+    let marker_path = canonical.with_file_name("idle-handoff.ipynb.runtlock");
+    let registry = runt_workspace::file_claims::FileClaimRegistry::at_dir(claims_dir.clone());
+
+    let opened = connect::connect_open(socket_a.clone(), nb_path.clone(), "owner")
+        .await
+        .expect("daemon A should open the notebook");
+    assert!(registry.read(&canonical).is_some());
+    drop(opened);
+
+    // Poll the reconciler until the claim releases. Peer-disconnect
+    // accounting, the disconnect teardown (which stamps the room as
+    // settled after its final save), and the idle grace are all
+    // asynchronous; each pass re-evaluates the room.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        daemon_a.reconcile_file_claims_once().await;
+        if registry.read(&canonical).is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "idle clean room must release its claim after the grace window"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !marker_path.exists(),
+        "idle release must drop the autosave owner marker with the claim"
+    );
+
+    // Daemon B takes the freed path.
+    let successor = connect::connect_open(socket_b.clone(), nb_path.clone(), "successor")
+        .await
+        .expect("released claim should allow the other daemon to open");
+    assert_eq!(
+        registry.read(&canonical).unwrap().socket_path,
+        socket_b.to_string_lossy()
+    );
+
+    // Daemon A's room is still resident, but residency no longer grants
+    // the path: reopening through A re-acquires via the gate and is
+    // refused while B's claim is live.
+    let refused = connect::connect_open(socket_a.clone(), nb_path.clone(), "stale-owner").await;
+    match refused {
+        Err(notebook_sync::error::SyncError::Protocol(message)) => assert!(
+            message.contains("file_active_elsewhere"),
+            "expected structured refusal, got {message}"
+        ),
+        Err(other) => panic!("expected file_active_elsewhere refusal, got {other:?}"),
+        Ok(_) => panic!("expected refusal, but the reopen succeeded"),
+    }
+    assert_eq!(
+        registry.read(&canonical).unwrap().socket_path,
+        socket_b.to_string_lossy(),
+        "refused reopen must not clobber the successor's claim"
+    );
+
+    drop(successor);
+    stop_claiming_daemon(&socket_a, handle_a).await;
+    stop_claiming_daemon(&socket_b, handle_b).await;
+}
+
+/// After an idle release, a reconnect through the same daemon re-acquires
+/// the claim (no foreign claim in the way), and a room with a connected
+/// peer never releases its claim no matter how many grace windows pass.
+#[tokio::test]
+async fn test_released_claim_reacquired_on_reconnect_and_held_under_peers() {
+    let claims_root = TempDir::new().unwrap();
+    let claims_dir = claims_root.path().join("file-claims");
+    let (dir_a, socket_a, handle_a, daemon_a) = start_claiming_daemon_with(&claims_dir, |config| {
+        config.file_claim_release_grace_ms = Some(50);
+    })
+    .await;
+
+    let nb_path = dir_a.path().join("rejoin.ipynb");
+    write_test_ipynb(&nb_path, &[("c1", "code", "x = 1", vec![])]);
+    let canonical = std::fs::canonicalize(&nb_path).unwrap();
+    let registry = runt_workspace::file_claims::FileClaimRegistry::at_dir(claims_dir.clone());
+
+    let opened = connect::connect_open(socket_a.clone(), nb_path.clone(), "owner")
+        .await
+        .expect("daemon A should open the notebook");
+    drop(opened);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        daemon_a.reconcile_file_claims_once().await;
+        if registry.read(&canonical).is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "idle clean room must release its claim after the grace window"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    // Reconnect through the same daemon: the gate re-acquires the claim
+    // for the still-resident room.
+    let rejoined = connect::connect_open(socket_a.clone(), nb_path.clone(), "rejoiner")
+        .await
+        .expect("reconnect must re-acquire a released claim");
+    let claim = registry
+        .read(&canonical)
+        .expect("reconnect must write the claim back");
+    assert_eq!(claim.socket_path, socket_a.to_string_lossy());
+
+    // With the peer connected, grace windows elapse without releasing.
+    for _ in 0..4 {
+        sleep(Duration::from_millis(60)).await;
+        daemon_a.reconcile_file_claims_once().await;
+        assert!(
+            registry.read(&canonical).is_some(),
+            "a room with connected peers must keep its claim"
+        );
+    }
+
+    drop(rejoined);
+    stop_claiming_daemon(&socket_a, handle_a).await;
 }

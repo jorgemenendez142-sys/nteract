@@ -376,6 +376,18 @@ async def async_create_cell_and_wait_for_sync(
     return cell_id
 
 
+async def async_cleanup_session(session):
+    """Release a native test session's kernel and peer connection."""
+    try:
+        await session.shutdown_kernel()
+    except Exception:
+        pass
+    try:
+        await session.close()
+    except Exception:
+        pass
+
+
 def assert_daemon_starter_cell(cells):
     """Fresh daemon-owned notebooks start with one empty code cell."""
     assert len(cells) == 1
@@ -2046,7 +2058,7 @@ class TestDocumentFirstExecution:
 
         # Create and queue execution
         cell_id = await async_create_cell_and_wait_for_sync(
-            session, "async_queued_var = 'async_queued'"
+            session, "async_queued_var = 'async_queued'\nprint(async_queued_var)"
         )
         execution_id = await session.queue_cell(cell_id)
 
@@ -2055,17 +2067,11 @@ class TestDocumentFirstExecution:
         assert len(execution_id) == 36, f"Expected UUID (36 chars), got {len(execution_id)!r}"
         assert execution_id.count("-") == 4, f"Expected UUID format, got {execution_id!r}"
 
-        # Poll until the queued cell has executed.
-        # We verify execution by checking that a follow-up cell can read the variable.
-        import asyncio
-
-        await asyncio.sleep(2.0)  # Give the queued cell time to execute
-
-        # Verify it ran by executing another cell that uses the variable
-        cell2 = await async_create_cell_and_wait_for_sync(session, "print(async_queued_var)")
-        result = await session.execute_cell(cell2)
+        result = await session.wait_for_execution(cell_id, execution_id, timeout_secs=30.0)
 
         assert result.success
+        assert result.cell_id == cell_id
+        assert result.execution_id == execution_id
         assert "async_queued" in result.stdout
 
     async def test_async_execution_error_captured(self, session):
@@ -2291,8 +2297,11 @@ class TestKernelLifecycle:
 
     async def test_async_shutdown_kernel(self, session):
         """Can shutdown the kernel."""
-        await async_start_kernel_with_retry(session)
-        assert await session.kernel_started()
+        await async_use_auto_kernel_or_start(
+            session,
+            description="shutdown-kernel auto-launched kernel",
+        )
+        assert runtime_kernel_is_running(session)
 
         await session.shutdown_kernel()
         assert not await session.kernel_started()
@@ -2303,7 +2312,7 @@ class TestWidgetRuntimeState:
 
     async def test_private_widget_snapshot_reads_runtime_state_comms(self, session):
         """ipywidgets comm_open state lands in RuntimeStateDoc for Python inspection."""
-        await async_start_kernel_with_retry(session)
+        await async_use_auto_kernel_or_start(session)
 
         cell_id = await session.create_cell(
             "from IPython.display import display\n"
@@ -2386,7 +2395,7 @@ class TestErrorHandling:
 
     async def test_async_syntax_error(self, session):
         """Syntax errors are captured."""
-        await async_start_kernel_with_retry(session)
+        await async_use_auto_kernel_or_start(session)
 
         warmup_cell = await async_create_cell_and_wait_for_sync(session, "warmup = 1")
         warmup_result = await session.execute_cell(warmup_cell, timeout_secs=120)
@@ -2782,20 +2791,22 @@ class TestOpenNotebook:
             )
         )
 
-        # Open via daemon
         session = await client.open_notebook(str(nb_path))
-        assert await session.is_connected()
+        try:
+            assert await session.is_connected()
 
-        # With UUID-first identity, notebook_id is a UUID, not a path
-        import uuid
+            # With UUID-first identity, notebook_id is a UUID, not a path
+            import uuid
 
-        uuid.UUID(session.notebook_id)  # validates it's a well-formed UUID
+            uuid.UUID(session.notebook_id)  # validates it's a well-formed UUID
 
-        # Verify cells loaded
-        cells = await session.get_cells()
-        assert len(cells) == 2
-        assert cells[0].source == "x = 1"
-        assert cells[1].cell_type == "markdown"
+            # Verify cells loaded
+            cells = await session.get_cells()
+            assert len(cells) == 2
+            assert cells[0].source == "x = 1"
+            assert cells[1].cell_type == "markdown"
+        finally:
+            await async_cleanup_session(session)
 
     async def test_open_notebook_returns_connection_info(self, client, tmp_path):
         """NotebookConnectionInfo includes cell_count.
@@ -2842,12 +2853,15 @@ class TestOpenNotebook:
         )
 
         session = await client.open_notebook(str(nb_path))
-        info = await session.connection_info()
-        assert info is not None
-        # Streaming load defers cell loading to the sync loop, so the
-        # handshake reports 0 cells. Cells arrive via sync messages.
-        assert info.cell_count == 0
-        assert info.notebook_id == session.notebook_id
+        try:
+            info = await session.connection_info()
+            assert info is not None
+            # Streaming load defers cell loading to the sync loop, so the
+            # handshake reports 0 cells. Cells arrive via sync messages.
+            assert info.cell_count == 0
+            assert info.notebook_id == session.notebook_id
+        finally:
+            await async_cleanup_session(session)
 
     async def test_open_nonexistent_file_creates_notebook(self, client, tmp_path):
         """Opening missing file creates a new notebook at that path."""
@@ -2861,7 +2875,7 @@ class TestOpenNotebook:
 
             uuid.UUID(info.notebook_id)  # validates it's a well-formed UUID
         finally:
-            await session.close()
+            await async_cleanup_session(session)
 
     async def test_open_nonexistent_file_auto_appends_ipynb(self, client, tmp_path):
         """Opening missing file without .ipynb extension auto-appends it."""
@@ -2875,7 +2889,7 @@ class TestOpenNotebook:
 
             uuid.UUID(info.notebook_id)  # validates it's a well-formed UUID
         finally:
-            await session.close()
+            await async_cleanup_session(session)
 
     @pytest.mark.skipif(
         os.environ.get("RUNTIMED_INTEGRATION_TEST") == "1",
@@ -2908,24 +2922,28 @@ class TestOpenNotebook:
         session1 = await client.open_notebook(str(nb_path))
         session2 = await client.open_notebook(str(nb_path))
 
-        # Both should have same notebook_id
-        assert session1.notebook_id == session2.notebook_id
+        try:
+            # Both should have same notebook_id
+            assert session1.notebook_id == session2.notebook_id
 
-        # Add cell in session1
-        cells1 = await session1.get_cells()
-        initial_count = len(cells1)
-        await session1.create_cell("y = 2", index=initial_count)
+            # Add cell in session1
+            cells1 = await session1.get_cells()
+            initial_count = len(cells1)
+            await session1.create_cell("y = 2", index=initial_count)
 
-        # Should sync to session2 (open_notebook sessions do full-peer sync
-        # which can be slower on loaded CI runners — use generous timeout)
-        async def cell_synced():
-            cells = await session2.get_cells()
-            return len(cells) > initial_count
+            # Should sync to session2 (open_notebook sessions do full-peer sync
+            # which can be slower on loaded CI runners — use generous timeout)
+            async def cell_synced():
+                cells = await session2.get_cells()
+                return len(cells) > initial_count
 
-        await async_wait_for_sync(cell_synced, timeout=15.0, description="cell sync")
+            await async_wait_for_sync(cell_synced, timeout=15.0, description="cell sync")
 
-        cells2 = await session2.get_cells()
-        assert len(cells2) > initial_count
+            cells2 = await session2.get_cells()
+            assert len(cells2) > initial_count
+        finally:
+            await async_cleanup_session(session2)
+            await async_cleanup_session(session1)
 
 
 class TestCreateNotebook:

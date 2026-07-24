@@ -38,6 +38,7 @@ impl PeerEgressLane {
             | NotebookFrameType::Response
             | NotebookFrameType::RuntimeStateSync
             | NotebookFrameType::CommsDocSync
+            | NotebookFrameType::CommentsDocSync
             | NotebookFrameType::PoolStateSync
             | NotebookFrameType::SessionControl
             | NotebookFrameType::PutBlob => Self::Reliable,
@@ -480,10 +481,12 @@ fn request_required_scope(
         | NotebookRequest::RunAllCells { .. }
         | NotebookRequest::RunAllCellsGuarded { .. }
         | NotebookRequest::SaveNotebook { .. }
+        | NotebookRequest::ReconcileNotebookSource { .. }
         | NotebookRequest::SyncEnvironment { .. }
         | NotebookRequest::ApproveTrust { .. }
         | NotebookRequest::ApproveProjectEnvironment { .. } => RequestRequiredScope::Owner,
         NotebookRequest::SendComm { .. }
+        | NotebookRequest::ApplyBokehSessionPatch { .. }
         | NotebookRequest::CloneAsEphemeral { .. }
         | NotebookRequest::GetDocBytes {} => RequestRequiredScope::NotebookWrite,
         NotebookRequest::CreateBlobUpload { .. }
@@ -510,19 +513,27 @@ pub(super) fn queue_request_error(
 
 pub(super) fn queue_session_status(
     writer: &PeerWriter,
-    notebook_doc: notebook_protocol::protocol::NotebookDocPhaseWire,
-    runtime_state: notebook_protocol::protocol::RuntimeStatePhaseWire,
-    initial_load: notebook_protocol::protocol::InitialLoadPhaseWire,
+    phases: &super::peer_session::HandshakePhases,
 ) -> anyhow::Result<()> {
     writer.send_json(
         NotebookFrameType::SessionControl,
         &notebook_protocol::protocol::SessionControlMessage::SyncStatus(
             notebook_protocol::protocol::SessionSyncStatusWire {
-                notebook_doc,
-                runtime_state,
-                initial_load,
+                notebook_doc: phases.notebook_doc,
+                runtime_state: phases.runtime_state,
+                initial_load: phases.initial_load.clone(),
             },
         ),
+    )
+}
+
+pub(super) fn queue_hosted_bridge_status(
+    writer: &PeerWriter,
+    status: notebook_protocol::protocol::HostedBridgeStatusWire,
+) -> anyhow::Result<()> {
+    writer.send_json(
+        NotebookFrameType::SessionControl,
+        &notebook_protocol::protocol::SessionControlMessage::HostedBridgeStatus { status },
     )
 }
 
@@ -566,6 +577,24 @@ mod tests {
             blob_store,
             true,
         ))
+    }
+
+    #[test]
+    fn source_reconciliation_is_owner_only() {
+        let request = NotebookRequest::ReconcileNotebookSource {
+            operation:
+                notebook_protocol::protocol::SourceReconciliation::KeepRecoveredAndOverwriteSource,
+        };
+
+        assert!(request_allowed_for_scope(&request, ConnectionScope::Owner));
+        assert!(!request_allowed_for_scope(
+            &request,
+            ConnectionScope::Editor
+        ));
+        assert!(!request_allowed_for_scope(
+            &request,
+            ConnectionScope::Viewer
+        ));
     }
 
     #[tokio::test]
@@ -646,6 +675,7 @@ mod tests {
                 &request_room,
                 "cell-1".to_string(),
                 None,
+                false,
                 Some("user:test/agent"),
             )
             .await
@@ -770,9 +800,11 @@ mod tests {
             .expect("runtime sync should enqueue");
         queue_session_status(
             &writer,
-            notebook_protocol::protocol::NotebookDocPhaseWire::Interactive,
-            notebook_protocol::protocol::RuntimeStatePhaseWire::Ready,
-            notebook_protocol::protocol::InitialLoadPhaseWire::Ready,
+            &crate::notebook_sync_server::peer_session::HandshakePhases {
+                notebook_doc: notebook_protocol::protocol::NotebookDocPhaseWire::Interactive,
+                runtime_state: notebook_protocol::protocol::RuntimeStatePhaseWire::Ready,
+                initial_load: notebook_protocol::protocol::InitialLoadPhaseWire::Ready,
+            },
         )
         .expect("session status should enqueue after runtime sync");
 

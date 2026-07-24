@@ -51,9 +51,8 @@ pub fn default_cache_dir_conda() -> PathBuf {
 /// Base package set every Conda kernel env is warmed with.
 ///
 /// Used by the daemon's Conda pool warmer (`conda_prewarmed_packages` in
-/// runtimed) and by the unified env design's capture step (`strip_base`) so
-/// the notebook's metadata records only user-level deps. Keep this in sync
-/// with the warmer.
+/// runtimed), kernel-env install paths, and the unified env design's capture
+/// step (`strip_base`) so the notebook's metadata records only user-level deps.
 pub const CONDA_BASE_PACKAGES: &[&str] = &[
     "ipykernel",
     "ipywidgets",
@@ -62,6 +61,18 @@ pub const CONDA_BASE_PACKAGES: &[&str] = &[
     "nbformat",
     "pyarrow>=14",
 ];
+
+/// Return [`CONDA_BASE_PACKAGES`] as owned package spec strings for install paths.
+pub fn conda_base_packages() -> Vec<String> {
+    CONDA_BASE_PACKAGES
+        .iter()
+        .map(|package| (*package).to_string())
+        .collect()
+}
+
+fn is_conda_base_package(dep: &str) -> bool {
+    CONDA_BASE_PACKAGES.contains(&dep)
+}
 
 const CONDA_GIL_SELECTOR: &str = "python-gil";
 
@@ -306,6 +317,42 @@ pub async fn prepare_environment_unified(
     cache_dir: &Path,
     handler: Arc<dyn ProgressHandler>,
 ) -> Result<CondaEnvironment> {
+    prepare_environment_unified_inner(deps, env_id, cache_dir, handler, false).await
+}
+
+/// Force-rebuild a notebook-captured Conda environment at its unified hash.
+///
+/// A matching lock sidecar is consumed before the existing environment is
+/// removed, preserving the normal lock-assisted rebuild path. The target path
+/// remains derived exclusively from the captured declaration and `env_id`.
+pub async fn rebuild_environment_unified(
+    deps: &CondaDependencies,
+    env_id: &str,
+    cache_dir: &Path,
+    handler: Arc<dyn ProgressHandler>,
+) -> Result<CondaEnvironment> {
+    prepare_environment_unified_inner(deps, env_id, cache_dir, handler, true).await
+}
+
+fn unified_cache_is_reusable(force_rebuild: bool, env_exists: bool, python_exists: bool) -> bool {
+    !force_rebuild && env_exists && python_exists
+}
+
+fn unified_lock_rebuild_is_applicable(
+    force_rebuild: bool,
+    env_exists: bool,
+    python_exists: bool,
+) -> bool {
+    env_exists && (force_rebuild || !python_exists)
+}
+
+async fn prepare_environment_unified_inner(
+    deps: &CondaDependencies,
+    env_id: &str,
+    cache_dir: &Path,
+    handler: Arc<dyn ProgressHandler>,
+    force_rebuild: bool,
+) -> Result<CondaEnvironment> {
     let hash = compute_unified_env_hash(deps, env_id);
     let env_path = cache_dir.join(&hash);
 
@@ -322,7 +369,7 @@ pub async fn prepare_environment_unified(
     let python_path = env_path.join("bin").join("python");
 
     // Cache hit
-    if env_path.exists() && python_path.exists() {
+    if unified_cache_is_reusable(force_rebuild, env_path.exists(), python_path.exists()) {
         info!("Using cached unified conda env at {:?}", env_path);
         crate::gc::touch_last_used(&env_path).await;
         crate::launcher::vendor_into_venv(&python_path)
@@ -351,8 +398,10 @@ pub async fn prepare_environment_unified(
 
     tokio::fs::create_dir_all(cache_dir).await?;
 
-    // Try lock-based rebuild before full re-creation
-    if env_path.exists() && !python_path.exists() {
+    // Try lock-based rebuild before full re-creation. A forced rebuild enters
+    // this path even when Python exists because the launch handshake already
+    // proved the otherwise-usable environment cannot start a kernel.
+    if unified_lock_rebuild_is_applicable(force_rebuild, env_path.exists(), python_path.exists()) {
         if let Some(lock) = crate::lock::LockFile::read_from(&env_path).await {
             let expected_specs = build_spec_strings(deps);
             let expected_channels = if deps.channels.is_empty() {
@@ -479,21 +528,12 @@ async fn install_conda_env(
         specs.push(MatchSpec::from_str(CONDA_GIL_SELECTOR, match_spec_options)?);
     }
 
-    specs.push(MatchSpec::from_str("ipykernel", match_spec_options)?);
-    specs.push(MatchSpec::from_str("ipywidgets", match_spec_options)?);
-    specs.push(MatchSpec::from_str("anywidget", match_spec_options)?);
-    specs.push(MatchSpec::from_str("pip", match_spec_options)?);
-    specs.push(MatchSpec::from_str("nbformat", match_spec_options)?);
-    specs.push(MatchSpec::from_str("pyarrow>=14", match_spec_options)?);
+    for package in CONDA_BASE_PACKAGES {
+        specs.push(MatchSpec::from_str(package, match_spec_options)?);
+    }
 
     for dep in &deps.dependencies {
-        if dep != "ipykernel"
-            && dep != "ipywidgets"
-            && dep != "anywidget"
-            && dep != "pip"
-            && dep != "nbformat"
-            && dep != "pyarrow>=14"
-        {
+        if !is_conda_base_package(dep) {
             specs.push(MatchSpec::from_str(dep, match_spec_options)?);
         }
     }
@@ -632,8 +672,8 @@ async fn install_conda_env(
     Ok(())
 }
 
-/// Create a prewarmed conda environment with ipykernel, ipywidgets,
-/// and any caller-supplied extra packages.
+/// Create a prewarmed conda environment with [`CONDA_BASE_PACKAGES`] and any
+/// caller-supplied extra packages.
 ///
 /// Returns an environment at `prewarm-{uuid}` that can later be claimed
 /// via [`claim_prewarmed_environment`].
@@ -665,11 +705,7 @@ pub async fn create_prewarmed_environment_in(
 
     tokio::fs::create_dir_all(cache_dir).await?;
 
-    let mut deps_list = vec![
-        "ipykernel".to_string(),
-        "ipywidgets".to_string(),
-        "pip".to_string(),
-    ];
+    let mut deps_list = conda_base_packages();
     if !extra_packages.is_empty() {
         info!("[prewarm] Including extra packages: {:?}", extra_packages);
         deps_list.extend(extra_packages.iter().cloned());
@@ -922,14 +958,10 @@ pub async fn sync_dependencies(
     // Always include base runtime packages — the solver only returns packages
     // needed to satisfy specs, and locked_packages are "preferred" not "required".
     // Without these, the Installer will remove ipykernel etc from the env.
-    let mut specs: Vec<MatchSpec> = vec![
-        MatchSpec::from_str("ipykernel", match_spec_options)?,
-        MatchSpec::from_str("ipywidgets", match_spec_options)?,
-        MatchSpec::from_str("anywidget", match_spec_options)?,
-        MatchSpec::from_str("pip", match_spec_options)?,
-        MatchSpec::from_str("nbformat", match_spec_options)?,
-        MatchSpec::from_str("pyarrow>=14", match_spec_options)?,
-    ];
+    let mut specs: Vec<MatchSpec> = CONDA_BASE_PACKAGES
+        .iter()
+        .map(|package| MatchSpec::from_str(package, match_spec_options))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if let Some(ref py_ver) = installed_python_version {
         info!("Pinning Python to installed version: {}", py_ver);
@@ -958,13 +990,7 @@ pub async fn sync_dependencies(
     }
 
     for dep in &deps.dependencies {
-        if dep != "ipykernel"
-            && dep != "ipywidgets"
-            && dep != "anywidget"
-            && dep != "pip"
-            && dep != "nbformat"
-            && dep != "pyarrow>=14"
-        {
+        if !is_conda_base_package(dep) {
             specs.push(MatchSpec::from_str(dep, match_spec_options)?);
         }
     }
@@ -1142,21 +1168,10 @@ fn build_spec_strings(deps: &CondaDependencies) -> Vec<String> {
         specs.push(CONDA_GIL_SELECTOR.to_string());
     }
 
-    specs.push("ipykernel".to_string());
-    specs.push("ipywidgets".to_string());
-    specs.push("anywidget".to_string());
-    specs.push("pip".to_string());
-    specs.push("nbformat".to_string());
-    specs.push("pyarrow>=14".to_string());
+    specs.extend(conda_base_packages());
 
     for dep in &deps.dependencies {
-        if dep != "ipykernel"
-            && dep != "ipywidgets"
-            && dep != "anywidget"
-            && dep != "pip"
-            && dep != "nbformat"
-            && dep != "pyarrow>=14"
-        {
+        if !is_conda_base_package(dep) {
             specs.push(dep.clone());
         }
     }
@@ -1517,6 +1532,15 @@ mod tests {
         let h1 = compute_unified_env_hash(&deps, "notebook-1");
         let h2 = compute_unified_env_hash(&deps, "notebook-2");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn forced_unified_rebuild_bypasses_cache_and_uses_lock_path_when_available() {
+        assert!(unified_cache_is_reusable(false, true, true));
+        assert!(!unified_cache_is_reusable(true, true, true));
+        assert!(unified_lock_rebuild_is_applicable(true, true, true));
+        assert!(!unified_lock_rebuild_is_applicable(true, false, true));
+        assert!(!unified_lock_rebuild_is_applicable(true, false, false));
     }
 
     #[test]

@@ -6,6 +6,8 @@ import {
   readOnlyNotebookShellCapabilities,
   resolveNotebookShellRuntimeTarget,
   stabilizeNotebookShellCapabilities,
+  workstationAttachmentCanExecute,
+  workstationAttachmentIsConnected,
   type NotebookShellAccessCapabilities,
   type NotebookShellAuthCapabilities,
   type NotebookShellRuntimeCapabilities,
@@ -367,6 +369,50 @@ describe("projectNotebookShellCapabilities", () => {
     expect(Object.isFrozen(first.runtime)).toBe(true);
     expect(Object.isFrozen(first.runtime.target)).toBe(true);
   });
+
+  it("preserves runtime session replacements in stabilized runtime targets", () => {
+    const interaction = projectNotebookRoomEditAccess({
+      accessLevel: "owner",
+      requestedScope: "editor",
+      selectedMode: "edit",
+      canAcceptDocumentMutations: true,
+      canRequestEdit: true,
+    });
+    const first = projectNotebookShellCapabilities({
+      interaction,
+      access: access({ level: "owner", source: "cloud" }),
+      runtime: runtime({
+        connected: true,
+        executionAvailable: true,
+        target: {
+          id: "attached-workstation",
+          runtimeSessionId: "job-123",
+          kind: "cloud_workstation",
+          status: "ready",
+          label: "Connected workstation",
+        },
+      }),
+    });
+    const second = projectNotebookShellCapabilities({
+      interaction,
+      access: access({ level: "owner", source: "cloud" }),
+      runtime: runtime({
+        connected: true,
+        executionAvailable: true,
+        target: {
+          id: "attached-workstation",
+          runtimeSessionId: "job-456",
+          kind: "cloud_workstation",
+          status: "ready",
+          label: "Connected workstation",
+        },
+      }),
+    });
+
+    expect(first.runtime.target).not.toBe(second.runtime.target);
+    expect(first.runtime.target?.runtimeSessionId).toBe("job-123");
+    expect(second.runtime.target?.runtimeSessionId).toBe("job-456");
+  });
 });
 
 describe("projectNotebookRuntimeTargetFromWorkstationAttachment", () => {
@@ -383,6 +429,16 @@ describe("projectNotebookRuntimeTargetFromWorkstationAttachment", () => {
       status_message: null,
       cpu_count: 8,
       memory_bytes: 32 * 1024 ** 3,
+      accelerators: [
+        {
+          kind: "gpu",
+          vendor: "NVIDIA",
+          model: "A100",
+          count: 1,
+          memory_bytes_per_device: 80 * 1024 ** 3,
+          readiness: "ready",
+        },
+      ],
       working_directory: "/home/ubuntu/notebooks",
       updated_at: "2026-06-07T21:00:00Z",
       runtime_session_id: "job-123",
@@ -407,6 +463,13 @@ describe("projectNotebookRuntimeTargetFromWorkstationAttachment", () => {
       runtimeSessionId: "job-123",
       cpuCount: 8,
       memoryBytes: 32 * 1024 ** 3,
+      accelerators: [
+        expect.objectContaining({
+          kind: "gpu",
+          model: "A100",
+          readiness: "ready",
+        }),
+      ],
       runtimePeerCount: 1,
       workingDirectoryLabel: "/home/ubuntu/notebooks",
     });
@@ -425,6 +488,43 @@ describe("projectNotebookRuntimeTargetFromWorkstationAttachment", () => {
     expect(second?.runtimeSessionId).toBe("job-456");
   });
 
+  it("uses accelerator facts in target projection identity", () => {
+    const first = projectNotebookRuntimeTargetFromWorkstationAttachment(attachment());
+    const second = projectNotebookRuntimeTargetFromWorkstationAttachment(
+      attachment({
+        accelerators: attachment().accelerators?.map((accelerator) => ({
+          ...accelerator,
+          readiness: "not_ready" as const,
+          diagnostic: "Driver unavailable",
+        })),
+      }),
+    );
+
+    const interaction = projectNotebookRoomEditAccess({
+      accessLevel: "owner",
+      requestedScope: "owner",
+      selectedMode: "edit",
+      canAcceptDocumentMutations: true,
+      canRequestEdit: false,
+    });
+    const firstCapabilities = projectNotebookShellCapabilities({
+      interaction,
+      access: access({ level: "owner" }),
+      runtime: runtime({ connected: true, executionAvailable: true, target: first }),
+    });
+    const secondCapabilities = projectNotebookShellCapabilities({
+      interaction,
+      access: access({ level: "owner" }),
+      runtime: runtime({ connected: true, executionAvailable: true, target: second }),
+    });
+
+    expect(firstCapabilities.runtime.target).not.toBe(secondCapabilities.runtime.target);
+    expect(secondCapabilities.runtime.target?.accelerators?.[0]).toMatchObject({
+      readiness: "not_ready",
+      diagnostic: "Driver unavailable",
+    });
+  });
+
   it("keeps connecting attachments connected but not executable", () => {
     const target = projectNotebookRuntimeTargetFromWorkstationAttachment(
       attachment({
@@ -437,6 +537,98 @@ describe("projectNotebookRuntimeTargetFromWorkstationAttachment", () => {
       status: "connecting",
       statusLabel: "Connecting",
       detail: "Waiting for runtime peer heartbeat",
+    });
+  });
+
+  it("can project stale ready hosted attachments as needing attention", () => {
+    const target = projectNotebookRuntimeTargetFromWorkstationAttachment(
+      attachment({
+        status_message: "stale ready status message",
+      }),
+      {
+        requireRuntimePeer: true,
+        runtimePeerCount: 0,
+      },
+    );
+
+    expect(target).toMatchObject({
+      id: "ws-lab2",
+      status: "attention",
+      statusLabel: "Needs attention",
+      detail: "Room link lost: no compute session is currently attached to the room.",
+      runtimePeerCount: null,
+      roomLink: {
+        status: "lost",
+        statusLabel: "Lost",
+        lastSeenAt: null,
+      },
+    });
+  });
+
+  it("projects disconnected attachments as offline while error attachments stay attention", () => {
+    const disconnected = projectNotebookRuntimeTargetFromWorkstationAttachment(
+      attachment({
+        status: "disconnected",
+        status_message: "compute disconnected: runtime peer left the room",
+      }),
+    );
+    const failed = projectNotebookRuntimeTargetFromWorkstationAttachment(
+      attachment({
+        status: "error",
+        status_message: "Failed to launch kernel: missing module",
+      }),
+    );
+
+    expect(disconnected).toMatchObject({
+      status: "offline",
+      statusLabel: "Offline",
+      detail: "compute disconnected: runtime peer left the room",
+    });
+    expect(failed).toMatchObject({
+      status: "attention",
+      statusLabel: "Needs attention",
+      detail: "Failed to launch kernel: missing module",
+    });
+  });
+
+  it("carries room-link last-seen state for stale hosted attachments", () => {
+    const target = projectNotebookRuntimeTargetFromWorkstationAttachment(attachment(), {
+      requireRuntimePeer: true,
+      runtimePeerCount: 0,
+      runtimeLastSeenAt: "2026-06-07T21:02:00Z",
+    });
+
+    expect(target).toMatchObject({
+      status: "attention",
+      roomLink: {
+        status: "lost",
+        statusLabel: "Lost",
+        lastSeenAt: "2026-06-07T21:02:00Z",
+      },
+    });
+  });
+
+  it("projects idle workstation attachments as attached wake targets without lost room chrome", () => {
+    const idleAttachment = attachment({
+      status: "idle",
+      status_message: null,
+    });
+    const target = projectNotebookRuntimeTargetFromWorkstationAttachment(idleAttachment, {
+      requireRuntimePeer: true,
+      runtimePeerCount: 0,
+      runtimeLastSeenAt: "2026-06-07T21:02:00Z",
+    });
+
+    expect(workstationAttachmentCanExecute(idleAttachment)).toBe(false);
+    expect(workstationAttachmentIsConnected(idleAttachment)).toBe(false);
+    expect(target).toMatchObject({
+      id: "ws-lab2",
+      status: "attached",
+      attachmentIdle: true,
+      statusLabel: "Idle",
+      detail: "Compute is attached and starts on the next run.",
+      runtimePeerCount: null,
+      roomLink: null,
     });
   });
 });

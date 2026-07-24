@@ -1,6 +1,6 @@
 {
   "name": "runtimed",
-  "version": "0.3.2",
+  "version": "0.4.3",
   "private": true,
   "type": "module",
   "main": "./src/index.ts",
@@ -8,6 +8,9 @@
   "exports": {
     ".": "./src/index.ts",
     "./src/*": "./src/*"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.test.json --noEmit"
   },
   "dependencies": {
     "rxjs": "^7.8.2"

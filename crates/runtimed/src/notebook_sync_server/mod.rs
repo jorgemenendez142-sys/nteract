@@ -50,11 +50,22 @@ use runtime_doc::RuntimeStateDoc;
 mod attachments;
 mod blob_upload;
 mod catalog;
+mod comments_store;
+// The coordinator is wired into room mutation paths after the standalone
+// journal and checkpoint primitives.
+#[allow(dead_code)]
+pub(crate) mod durability;
+// The checkpoint primitive intentionally lands before persistence integration.
+#[allow(dead_code)]
+pub(crate) mod file_checkpoint;
+mod hosted_bridge;
 mod identity;
+mod lifecycle;
 mod load;
 mod metadata;
 mod nbformat_convert;
 mod path_index;
+mod peer_comments_sync;
 mod peer_comms_sync;
 mod peer_connection;
 mod peer_eviction;
@@ -68,6 +79,10 @@ mod peer_session;
 mod peer_writer;
 mod persist;
 mod project_context;
+mod projection;
+// The journal primitive intentionally lands before room integration.
+#[allow(dead_code)]
+pub(crate) mod recovery;
 mod registry;
 mod room;
 mod runtime_bridge;
@@ -77,7 +92,10 @@ mod workstation_attachment;
 
 pub(crate) use attachments::*;
 pub(crate) use catalog::*;
+pub use hosted_bridge::HostedBridgeHandle;
+pub(crate) use hosted_bridge::*;
 pub(crate) use identity::*;
+pub(crate) use lifecycle::*;
 pub(crate) use load::*;
 pub(crate) use metadata::*;
 pub(crate) use nbformat_convert::*;
@@ -87,6 +105,7 @@ pub(crate) use peer_presence::sanitize_peer_label;
 pub(crate) use peer_runtime_agent::handle_runtime_agent_sync_connection;
 pub(crate) use peer_runtime_sync::notebook_execution_context_id;
 pub(crate) use persist::*;
+pub(crate) use projection::*;
 pub(crate) use registry::*;
 pub(crate) use room::*;
 pub(crate) use runtime_bridge::*;

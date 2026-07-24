@@ -10,11 +10,12 @@ import {
   NotebookDocumentRail,
   NotebookDocumentShell,
   NotebookPackageSummaryPanel,
+  CrdtBridgeProvider,
   type NotebookViewCell,
 } from "@/components/notebook";
 import type { NotebookRailPanelId } from "@/components/notebook-rail";
 import { cn } from "@/lib/utils";
-import { CrdtBridgeProvider, NotebookView } from "../../notebook/src/notebook-surface";
+import { NotebookView } from "../../notebook/src/notebook-surface";
 import {
   flushCellUIState,
   setFocusedCellId as setNotebookFocusedCellId,
@@ -37,7 +38,7 @@ import type {
   MarkdownProjectionBlock,
   MarkdownProjectionPlan,
   MarkdownProjectionRun,
-} from "../../notebook/src/lib/markdown-projection";
+} from "../../../src/lib/markdown-projection";
 import {
   getElementsNotebookScenario,
   type ElementsNotebookScenario,
@@ -246,16 +247,16 @@ function ScenarioNotice({
 }) {
   return (
     <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(280px,420px)]">
-      <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs leading-5 text-emerald-900 dark:text-emerald-300">
-        <div className="mb-1 flex items-center gap-2 font-semibold">
+      <section className="border-l border-fd-border py-1 pl-4 text-fd-muted-foreground">
+        <div className="mb-1 flex items-center gap-2 text-xs font-semibold leading-5">
           <ShieldCheck className="size-3.5" aria-hidden="true" />
           NotebookDocumentShell, NotebookRail, and NotebookView render from current sources.
         </div>
-        <p>
+        <p className="text-xs leading-5">
           The docs app owns only scenario facts: capabilities, fixture cells, package details,
           focused cell, active panel, and inert navigation callbacks.
         </p>
-      </div>
+      </section>
 
       <div className="rounded-lg border border-fd-border bg-fd-background p-3 text-xs leading-5 text-fd-muted-foreground">
         <div className="mb-2 flex flex-wrap gap-1.5">

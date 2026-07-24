@@ -172,11 +172,12 @@ not for the entire tool execution. `DocHandle` is cheaply cloneable
 | Notebook type | Identified by | Rejoin method | Eviction check |
 |--------------|---------------|---------------|----------------|
 | File-backed | Has file path | `connect_open(path)` | File exists on disk |
-| Ephemeral (untitled) | UUID only | `connect(uuid)` | `list_rooms` check |
+| Ephemeral (untitled) | UUID only | `connect(uuid)` | Daemon-authoritative refusal |
 
-**Ephemeral notebooks** get an explicit `list_rooms` check before rejoin.
-If the room was evicted during disconnect, we clear the session
-immediately instead of creating a phantom empty room.
+**Ephemeral notebooks** call `connect(uuid)` directly and trust the daemon's
+resident/recoverable-room handling. The daemon is authoritative about whether
+a notebook still exists — a refusal comes back as `NotebookUnavailable` and
+is handled as evicted with no retry. No pre-check `list_rooms` call.
 
 **File-backed notebooks** use `connect_open(path)` which lets the daemon
 reload from disk. The `.automerge` persist files for file-backed rooms
@@ -231,17 +232,6 @@ is closed. Use `connect_open(path)` to let the daemon reload from disk.
 
 If an ephemeral room was evicted, `connect(uuid)` creates a new empty room
 with no cells and no kernel. Check `list_rooms` first.
-
-## Key Source Files
-
-| File | What it owns |
-|------|-------------|
-| `crates/runt-mcp/src/daemon_watch.rs` | `classify()` pure function, `watch()` loop, `rejoin()` |
-| `crates/runt-mcp/src/session.rs` | `NotebookSession`, `SessionDropReason`, `SessionDropInfo` |
-| `crates/runt-mcp/src/lib.rs` | `NteractMcp` server, `require_handle!` pattern |
-| `crates/runt-mcp/src/tools/session.rs` | `connect_notebook`, `create_notebook`, `disconnect_previous_session` |
-| `crates/runt-mcp-proxy/src/proxy.rs` | `McpProxy`, `restart_child()`, `track_session()` |
-| `crates/runtimed/src/notebook_sync_server/` | Room lifecycle, peer counting, eviction |
 
 ## North Star: Concurrent MCP Clients
 

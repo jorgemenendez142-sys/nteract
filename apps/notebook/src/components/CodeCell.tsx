@@ -6,6 +6,7 @@ import { cellOutputInnerInset } from "@/components/cell/cell-layout";
 import { CompactExecutionButton } from "@/components/cell/CompactExecutionButton";
 import { CodeCellCurrentLine } from "@/components/cell/CodeCellCurrentLine";
 import { OutputArea } from "@/components/cell/OutputArea";
+import { CommentMarkIcon } from "@/components/comments/CommentMarkIcon";
 import { CodeMirrorEditor, type CodeMirrorEditorRef } from "@/components/editor/codemirror-editor";
 import { languageDisplayNames, type SupportedLanguage } from "@/components/editor/languages";
 import { remoteCursorsExtension } from "@/components/editor/remote-cursors";
@@ -14,7 +15,7 @@ import { textAttributionExtension } from "@/components/editor/text-attribution";
 import type { NteractEmbedHostContextPatch } from "@/components/isolated/host-context";
 import type { TracebackCellTarget } from "@/components/outputs/traceback-output";
 import { cn } from "@/lib/utils";
-import { usePresenceContext } from "../contexts/PresenceContext";
+import { usePresenceContext } from "@/components/notebook/presence-context";
 import { useCellKeyboardNavigation } from "../hooks/useCellKeyboardNavigation";
 import { useCrdtBridge } from "../hooks/useCrdtBridge";
 import {
@@ -41,9 +42,18 @@ import { logNotebookIsolatedDiagnostic } from "../lib/isolated-diagnostics";
 import { useCellOutputs } from "@/components/notebook/state/output-store";
 import { openUrl } from "../lib/open-url";
 import { presenceSenderExtension } from "../lib/presence-sender";
+import { commentHighlightExtension } from "../lib/comment-highlight-extension";
+import { refreshCellCommentHighlights } from "../lib/comment-highlights";
+import type {
+  OutputCommentAnchor,
+  SourceCommentSelectionRect,
+  SourceRangeCommentAnchor,
+} from "../lib/comment-source-anchor";
+import { sourceCommentExtension } from "../lib/source-comment-extension";
 import { tabCompletionKeymap } from "../lib/tab-completion";
 import type { CodeCell as CodeCellType, JupyterOutput } from "../types";
 import { CellPresenceIndicators } from "./cell/CellPresenceIndicators";
+import { EditorContextMenu } from "./EditorContextMenu";
 import { HistorySearchDialog } from "./HistorySearchDialog";
 
 const SIMPLE_OUTPUT_MAX_CHARS = 2000;
@@ -65,6 +75,7 @@ interface CodeCellProps {
   onFocusNext?: (cursorPosition: "start" | "end") => void;
   onNavigateToCell?: (target: TracebackCellTarget) => void;
   onInsertCellAfter?: () => void;
+  onChangeCellType?: (type: "code" | "markdown") => void;
   isLastCell?: boolean;
   /** Props for dnd-kit drag handle (applied to ribbon) */
   dragHandleProps?: Record<string, unknown>;
@@ -96,6 +107,13 @@ interface CodeCellProps {
   rightGutterContent?: ReactNode;
   readOnly?: boolean;
   canExecute?: boolean;
+  onCreateSourceComment?: (
+    anchor: SourceRangeCommentAnchor,
+    rect: SourceCommentSelectionRect | null,
+    quote?: string | null,
+  ) => void;
+  onCreateOutputComment?: (anchor: OutputCommentAnchor) => void;
+  onActivateCommentThread?: (threadId: string) => void;
   outputHostContext?: NteractEmbedHostContextPatch;
   deferOutputIsolatedFrameUntilVisible?: boolean;
   deferredOutputIsolatedFrameRootMargin?: string;
@@ -330,6 +348,7 @@ export const CodeCell = memo(function CodeCell({
   onFocusNext,
   onNavigateToCell,
   onInsertCellAfter,
+  onChangeCellType,
   isLastCell = false,
   dragHandleProps,
   isDragging,
@@ -347,6 +366,9 @@ export const CodeCell = memo(function CodeCell({
   rightGutterContent,
   readOnly = false,
   canExecute = !readOnly,
+  onCreateSourceComment,
+  onCreateOutputComment,
+  onActivateCommentThread,
   outputHostContext,
   deferOutputIsolatedFrameUntilVisible = false,
   deferredOutputIsolatedFrameRootMargin,
@@ -369,11 +391,11 @@ export const CodeCell = memo(function CodeCell({
   const kernelCompletionExt = useKernelCompletionExtension();
   // Subscribe to outputs via the per-execution / per-output stores rather
   // than `cell.outputs`. Content changes no longer invalidate the cell
-  // snapshot — CodeCell re-renders only when its chrome state changes.
+  // snapshot. CodeCell re-renders only when its chrome state changes.
   const outputs = useCellOutputs(cell.id);
   const executionId = useCellExecutionId(cell.id);
   const execution = useExecution(executionId);
-  const previousOutputCountRef = useRef(outputs.length);
+  const previousLatestOutputIdRef = useRef(outputs[outputs.length - 1]?.output_id);
   const executionCount = execution?.execution_count ?? null;
   const submittedByActorLabel = execution?.submitted_by_actor_label ?? null;
   const isExecutionErrored = execution?.success === false || execution?.status === "error";
@@ -420,17 +442,22 @@ export const CodeCell = memo(function CodeCell({
     }
   }, [isOutputsHidden, onOutputFocusChange, outputFocused, outputs.length, showOutputChrome]);
 
+  // Fires once per newly committed output identity. Output ids are
+  // daemon-stamped UUIDs, unique per run, so a warm re-run that replaces
+  // the previous output in a single commit (length 1 -> 1) still changes
+  // the latest output_id and emits the mark. Keying on array length would
+  // miss that coalesced replacement.
   useEffect(() => {
-    const previousOutputCount = previousOutputCountRef.current;
-    previousOutputCountRef.current = outputs.length;
-    if (outputs.length <= previousOutputCount) return;
-
     const latestOutput = outputs[outputs.length - 1];
+    const previousLatestOutputId = previousLatestOutputIdRef.current;
+    previousLatestOutputIdRef.current = latestOutput?.output_id;
+    if (!latestOutput?.output_id || latestOutput.output_id === previousLatestOutputId) return;
+
     markExecutionPerformance("react.outputs.committed", {
       cellId: cell.id,
       executionId: executionId ?? undefined,
       outputCount: outputs.length,
-      outputId: latestOutput?.output_id,
+      outputId: latestOutput.output_id,
     });
   }, [cell.id, executionId, outputs]);
 
@@ -445,6 +472,7 @@ export const CodeCell = memo(function CodeCell({
         registeredViewRef.current = view;
         registerCellEditor(cell.id, view);
         onEditorRegistered(cell.id);
+        refreshCellCommentHighlights(cell.id);
         return true;
       }
       return false;
@@ -586,13 +614,13 @@ export const CodeCell = memo(function CodeCell({
     [navigationKeyMap, historyKeyBinding],
   );
 
-  // Remote cursors extension (stable — no deps that change)
+  // Remote cursors extension, stable with no deps that change.
   const remoteCursorsExt = useMemo(() => remoteCursorsExtension(), []);
 
-  // Text attribution extension (stable — no deps that change)
+  // Text attribution extension, stable with no deps that change.
   const textAttributionExt = useMemo(() => textAttributionExtension(), []);
 
-  // Presence sender extension — broadcasts local cursor/selection to other peers
+  // Presence sender extension broadcasts local cursor/selection to other peers.
   const presenceSenderExt = useMemo(() => {
     if (!presence) return [];
     return [
@@ -603,7 +631,25 @@ export const CodeCell = memo(function CodeCell({
     ];
   }, [cell.id, presence]);
 
-  // CodeMirror extensions: CRDT bridge + kernel completion + tab completion + search highlighting + remote cursors + presence sender
+  const sourceCommentExt = useMemo(() => {
+    // The create affordance (selection tooltip + keymap) needs editor focus,
+    // which a read-only editor never takes, so offer it only on editable cells.
+    // Reading existing threads stays open to everyone via commentHighlightExt.
+    if (readOnly || !onCreateSourceComment) return [];
+    return [sourceCommentExtension(cell.id, onCreateSourceComment)];
+  }, [cell.id, onCreateSourceComment, readOnly]);
+
+  const commentHighlightExt = useMemo(() => {
+    if (!onActivateCommentThread) return [];
+    return [
+      commentHighlightExtension({
+        onActivate: onActivateCommentThread,
+        onReady: () => refreshCellCommentHighlights(cell.id),
+      }),
+    ];
+  }, [cell.id, onActivateCommentThread]);
+
+  // CodeMirror extensions: CRDT bridge, completion, search, presence, and comments.
   const editorExtensions = useMemo(
     () => [
       crdtBridgeExt,
@@ -613,6 +659,8 @@ export const CodeCell = memo(function CodeCell({
       ...remoteCursorsExt,
       ...textAttributionExt,
       ...presenceSenderExt,
+      ...sourceCommentExt,
+      ...commentHighlightExt,
     ],
     [
       crdtBridgeExt,
@@ -622,10 +670,20 @@ export const CodeCell = memo(function CodeCell({
       remoteCursorsExt,
       textAttributionExt,
       presenceSenderExt,
+      sourceCommentExt,
+      commentHighlightExt,
     ],
   );
 
   const handleLinkClick = useCallback((url: string) => openUrl(url), []);
+  const handleCreateOutputComment = useCallback(() => {
+    onCreateOutputComment?.({
+      kind: "output",
+      cell_id: cell.id,
+      execution_id: executionId ?? undefined,
+      output_id: undefined,
+    });
+  }, [cell.id, executionId, onCreateOutputComment]);
   const handleOutputMouseDown = useCallback(() => {
     editorRef.current?.getEditor()?.contentDOM.blur();
     onFocus();
@@ -649,6 +707,8 @@ export const CodeCell = memo(function CodeCell({
     isExecutionErrored ||
     submittedByActorLabel !== null;
   const showExecutionControl = canExecute || hasExecutionReadout;
+  const canCreateOutputComment =
+    outputs.length > 0 && !isOutputsHidden && !readOnly && Boolean(onCreateOutputComment);
   const hasCurrentLine =
     !isSourceEmpty ||
     visibleOutputCount > 0 ||
@@ -783,16 +843,24 @@ export const CodeCell = memo(function CodeCell({
               </>
             ) : (
               <>
-                <CodeMirrorEditor
-                  ref={editorRef}
-                  initialValue={cell.source}
-                  language={language}
-                  keyMap={keyMap}
-                  extensions={editorExtensions}
-                  placeholder="Enter code..."
-                  autoFocus={isFocused}
+                <EditorContextMenu
+                  cellId={cell.id}
+                  cellType="code"
                   readOnly={readOnly}
-                />
+                  onChangeCellType={onChangeCellType}
+                  onCreateSourceComment={onCreateSourceComment}
+                >
+                  <CodeMirrorEditor
+                    ref={editorRef}
+                    initialValue={cell.source}
+                    language={language}
+                    keyMap={keyMap}
+                    extensions={editorExtensions}
+                    placeholder="Enter code..."
+                    autoFocus={isFocused}
+                    readOnly={readOnly}
+                  />
+                </EditorContextMenu>
                 {currentLine}
               </>
             )}
@@ -834,16 +902,35 @@ export const CodeCell = memo(function CodeCell({
           )
         }
         outputRightGutterContent={
-          outputs.length > 0 && !isOutputsHidden && onToggleOutputsHidden && !readOnly ? (
-            <button
-              type="button"
-              tabIndex={-1}
-              onClick={() => onToggleOutputsHidden(true)}
-              className="flex items-center justify-center rounded p-1 text-muted-foreground/40 transition-colors hover:text-foreground"
-              title="Hide outputs"
-            >
-              <EyeOff className="h-3.5 w-3.5" />
-            </button>
+          outputs.length > 0 &&
+          !isOutputsHidden &&
+          !readOnly &&
+          (canCreateOutputComment || onToggleOutputsHidden) ? (
+            <>
+              {canCreateOutputComment ? (
+                <button
+                  type="button"
+                  onClick={handleCreateOutputComment}
+                  className="flex items-center justify-center rounded p-1 text-muted-foreground/40 transition-colors hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 focus-visible:text-foreground"
+                  title="Comment on outputs"
+                  aria-label="Comment on outputs"
+                >
+                  <CommentMarkIcon className="size-3.5" aria-hidden="true" />
+                </button>
+              ) : null}
+              {onToggleOutputsHidden ? (
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  onClick={() => onToggleOutputsHidden(true)}
+                  className="flex items-center justify-center rounded p-1 text-muted-foreground/40 transition-colors hover:text-foreground"
+                  title="Hide outputs"
+                  aria-label="Hide outputs"
+                >
+                  <EyeOff className="size-3.5" />
+                </button>
+              ) : null}
+            </>
           ) : undefined
         }
         hideOutput={outputs.length === 0 || bothHidden || (readOnly && isOutputsHidden)}

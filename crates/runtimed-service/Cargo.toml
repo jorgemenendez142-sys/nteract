@@ -1,6 +1,6 @@
 [package]
 name = "runtimed-service"
-version = "2.5.2"
+version = "2.6.3"
 edition.workspace = true
 description = "Cross-platform service management for the runtimed daemon"
 repository.workspace = true
@@ -11,9 +11,12 @@ workspace = true
 
 [dependencies]
 runt-workspace = { path = "../runt-workspace" }
-dirs = "6"
-log = "0.4"
+dirs = { workspace = true }
+log = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 smappservice-rs = "0.1"

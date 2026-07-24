@@ -1,6 +1,6 @@
 [package]
 name = "runtimed-py"
-version = "2.5.2"
+version = "2.6.3"
 edition = "2021"
 description = "Python bindings for runtimed daemon client"
 repository.workspace = true
@@ -26,10 +26,10 @@ runtime-doc = { path = "../runtime-doc" }
 notebook-protocol = { path = "../notebook-protocol" }
 kernel-env = { path = "../kernel-env" }
 notebook-sync = { path = "../notebook-sync" }
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-log = "0.4"
+log = { workspace = true }
 runt-workspace = { path = "../runt-workspace" }
 
 [lints]

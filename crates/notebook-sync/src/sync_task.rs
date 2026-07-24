@@ -44,6 +44,12 @@ const CONFIRM_SYNC_RETRY: Duration = Duration::from_millis(200);
 const STATE_SYNC_QUIET_TIMEOUT: Duration = Duration::from_millis(200);
 const STATE_SYNC_MAX_TIMEOUT: Duration = Duration::from_secs(2);
 const MAINTENANCE_TICK: Duration = Duration::from_millis(50);
+/// Explicit harness-only fault used to prove that room projections remain
+/// useful while this peer's NotebookDoc replica cannot converge. The sync
+/// reactor continues processing control, runtime, command, and heartbeat
+/// frames; only NotebookDoc Automerge frames are withheld.
+const NOTEBOOK_SYNC_FAULT_ENV: &str = "NTERACT_NOTEBOOK_SYNC_FAULT";
+const STALL_NOTEBOOK_CONVERGENCE_FAULT: &str = "stall-notebook-convergence";
 /// Idle presence heartbeat sent by full-peer clients (runt-mcp, runtimed-py,
 /// integration tests) so the daemon's idle-peer timeout never fires on a
 /// quiet but live session. Matches `presence::DEFAULT_HEARTBEAT_MS`.
@@ -166,6 +172,7 @@ struct ReactorState {
     next_confirm_sync_attempt: Instant,
     sync_generation: u64,
     acked_sync_generation: u64,
+    stall_notebook_convergence: bool,
 }
 
 impl ReactorState {
@@ -179,6 +186,12 @@ impl ReactorState {
             next_confirm_sync_attempt: Instant::now(),
             sync_generation: 0,
             acked_sync_generation: 0,
+            // The fault switch is harness-only: release builds never read the
+            // env var, so a stray NTERACT_NOTEBOOK_SYNC_FAULT in a user
+            // environment cannot stall convergence.
+            stall_notebook_convergence: cfg!(any(test, debug_assertions))
+                && std::env::var(NOTEBOOK_SYNC_FAULT_ENV)
+                    .is_ok_and(|value| value == STALL_NOTEBOOK_CONVERGENCE_FAULT),
         }
     }
 }
@@ -415,6 +428,15 @@ impl SyncReactor {
         writer: &mut W,
     ) -> Result<(), SyncError> {
         self.note_frame_activity();
+        if self.state.stall_notebook_convergence
+            && frame.frame_type == NotebookFrameType::AutomergeSync
+        {
+            debug!(
+                "[notebook-sync] Harness fault withheld NotebookDoc sync frame for {}",
+                self.io.notebook_id
+            );
+            return Ok(());
+        }
         self.handle_task_frame(frame, writer).await?;
         if frame.frame_type == NotebookFrameType::AutomergeSync {
             self.state.acked_sync_generation = self.state.sync_generation;
@@ -429,6 +451,8 @@ impl SyncReactor {
         if let Some(generation) = self.send_doc_sync_round(writer).await? {
             mark_unsent_confirm_waiters(&mut self.state.confirm_waiters, generation);
         }
+        // Also send CommentsDoc changes
+        send_comments_sync_message(&self.io.doc, writer).await?;
         self.resolve_confirm_waiters();
         Ok(())
     }
@@ -474,6 +498,8 @@ impl SyncReactor {
                 if let Err(e) = send_state_sync_message(&self.io.doc, writer).await {
                     let _ = reply.send(Err(e));
                 } else if let Err(e) = send_comms_sync_message(&self.io.doc, writer).await {
+                    let _ = reply.send(Err(e));
+                } else if let Err(e) = send_comments_sync_message(&self.io.doc, writer).await {
                     let _ = reply.send(Err(e));
                 } else {
                     let now = Instant::now();
@@ -854,6 +880,70 @@ impl SyncReactor {
                 Ok(())
             }
 
+            NotebookFrameType::CommentsDocSync => {
+                let msg = match sync::Message::decode(&frame.payload) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        warn!(
+                            "[notebook-sync] Failed to decode CommentsDocSync for {}: {}",
+                            self.io.notebook_id, e
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let reply_bytes = {
+                    let mut state = self.io.doc.lock().unwrap_or_else(|e| e.into_inner());
+                    match state
+                        .receive_comments_sync_message_recovering(msg, "comments-doc-sync-receive")
+                    {
+                        Ok(()) => {}
+                        Err(e @ AutomergeOperationError::Panic(_))
+                        | Err(e @ AutomergeOperationError::RebuildFailed { .. }) => {
+                            warn!(
+                                "[notebook-sync] CommentsDocSync failure for {} (comments degrade alone): {}",
+                                self.io.notebook_id, e
+                            );
+                            state.comments_peer_state = sync::State::new();
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[notebook-sync] Failed to apply CommentsDocSync for {} (comments degrade alone): {}",
+                                self.io.notebook_id, e
+                            );
+                            state.comments_peer_state = sync::State::new();
+                            return Ok(());
+                        }
+                    };
+                    match state.generate_comments_sync_message_recovering("comments-doc-sync-reply")
+                    {
+                        Ok(message) => message.map(|msg| msg.encode()),
+                        Err(e) => {
+                            warn!(
+                                "[notebook-sync] Failed to generate CommentsDocSync reply for {}: {}",
+                                self.io.notebook_id, e
+                            );
+                            state.comments_peer_state = sync::State::new();
+                            return Ok(());
+                        }
+                    }
+                };
+
+                if let Some(bytes) = reply_bytes {
+                    if let Err(e) = writer
+                        .send_frame(NotebookFrameType::CommentsDocSync, &bytes)
+                        .await
+                    {
+                        warn!(
+                            "[notebook-sync] Failed to send CommentsDocSync reply for {}: {}",
+                            self.io.notebook_id, e
+                        );
+                    }
+                }
+                Ok(())
+            }
+
             NotebookFrameType::SessionControl => {
                 let message = match serde_json::from_slice::<SessionControlMessage>(&frame.payload)
                 {
@@ -877,6 +967,11 @@ impl SyncReactor {
                             &mut state.saw_session_status,
                             status,
                         );
+                    }
+                    SessionControlMessage::HostedBridgeStatus { .. } => {
+                        // Python/Rust notebook clients do not render desktop
+                        // bridge health. Keep the additive control message
+                        // forward-compatible without changing readiness.
                     }
                 }
                 Ok(())
@@ -1177,6 +1272,28 @@ async fn send_comms_sync_message<W: FrameSink>(
     if let Some(bytes) = msg_bytes {
         writer
             .send_frame(NotebookFrameType::CommsDocSync, &bytes)
+            .await
+            .map_err(SyncError::Io)?;
+    }
+
+    Ok(())
+}
+
+async fn send_comments_sync_message<W: FrameSink>(
+    doc: &Arc<Mutex<SharedDocState>>,
+    writer: &mut W,
+) -> Result<(), SyncError> {
+    let msg_bytes = {
+        let mut state = doc.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .generate_comments_sync_message_recovering("comments-doc-sync-outbound")
+            .map_err(|e| SyncError::Protocol(e.to_string()))?
+            .map(|msg| msg.encode())
+    };
+
+    if let Some(bytes) = msg_bytes {
+        writer
+            .send_frame(NotebookFrameType::CommentsDocSync, &bytes)
             .await
             .map_err(SyncError::Io)?;
     }

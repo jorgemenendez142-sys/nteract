@@ -38,10 +38,11 @@ use notebook_doc::presence::PresenceState;
 use notebook_protocol::connection::{
     FrameSink, FrameSource, FrameTransport, NotebookFrameType, PackageManager, UdsFrameTransport,
 };
-use notebook_protocol::protocol::{RuntimeAgentRequest, RuntimeAgentResponse};
+use notebook_protocol::protocol::{NotebookBroadcast, RuntimeAgentRequest, RuntimeAgentResponse};
 use runtime_doc::{CommsDoc, CommsDocHandle, ExecutionState, RuntimeLifecycle, RuntimeStateDoc};
 use runtime_doc::{KernelActivity, RuntimeStateHandle};
 use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use crate::blob_store::BlobStore;
@@ -49,11 +50,28 @@ use crate::kernel_connection::{KernelConnection, KernelLaunchConfig, KernelShare
 use crate::kernel_dispatch::Kernel;
 use crate::kernel_state::KernelState;
 use crate::output_blob_publisher::OutputBlobPublisher;
-use crate::output_prep::{LifecycleSignal, QueueCommandReceivers, WorkCommand};
+use crate::output_prep::{
+    LifecycleSignal, QueueCommandReceivers, VisualizationStateCommand, WorkCommand,
+};
 use crate::protocol::QueueEntry;
 
 mod echo_suppression;
 use echo_suppression::EchoSuppressor;
+
+fn runtime_agent_response_error(response: &RuntimeAgentResponse) -> Option<&str> {
+    match response {
+        RuntimeAgentResponse::Error { error }
+        | RuntimeAgentResponse::KernelLaunchFailed { error, .. } => Some(error.as_str()),
+        _ => None,
+    }
+}
+
+fn should_clear_pending_initial_launch_after_rpc(
+    is_launch_or_restart: bool,
+    response: &RuntimeAgentResponse,
+) -> bool {
+    is_launch_or_restart && runtime_agent_response_error(response).is_none()
+}
 
 /// Minimum interval between reconnect cycles on a recoverable transport,
 /// covering *both* recoverable-failure arms: a clean EOF and a stream framing
@@ -66,6 +84,32 @@ use echo_suppression::EchoSuppressor;
 /// transport (which tears down on clean EOF, and whose framing-error reconnect
 /// is gated out of the floor by `clean_eof_is_recoverable() == false`).
 const RECOVERABLE_RECONNECT_FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Cloud runtime peers stamp their room-link heartbeat into RuntimeStateDoc.
+/// The UDS path is local daemon transport and stays out of this hosted-room
+/// signal.
+const RUNTIME_ROOM_LINK_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchTrigger {
+    OnAttach,
+    OnFirstExecution,
+}
+
+impl LaunchTrigger {
+    fn label(self) -> &'static str {
+        match self {
+            LaunchTrigger::OnAttach => "launch-on-attach",
+            LaunchTrigger::OnFirstExecution => "launch-on-execute",
+        }
+    }
+}
+
+/// Runtime-agent-local buffer for live kernel broadcasts. These carry
+/// ephemeral custom widget events such as ipympl PNG frames. Match the
+/// coordinator room broadcast capacity so the runtime-agent bridge can absorb
+/// the same burst size before reporting lag.
+const RUNTIME_AGENT_KERNEL_BROADCAST_CAPACITY: usize = 256;
 
 /// How long to sleep before a reconnect to enforce [`RECOVERABLE_RECONNECT_FLOOR`].
 ///
@@ -85,6 +129,13 @@ fn reconnect_floor_delay(
     match since_last_reconnect {
         Some(since) if since < floor => Some(floor - since),
         _ => None,
+    }
+}
+
+fn record_runtime_room_link_seen(state: &RuntimeStateHandle) {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = state.with_doc(|sd| sd.set_last_seen(Some(&timestamp))) {
+        warn!("[runtime-agent] Failed to stamp runtime room link heartbeat: {error}");
     }
 }
 
@@ -140,7 +191,7 @@ struct RuntimeAgentContext {
     comms: CommsDocHandle,
     blob_store: Arc<BlobStore>,
     output_blob_publisher: OutputBlobPublisher,
-    broadcast_tx: broadcast::Sender<notebook_protocol::protocol::NotebookBroadcast>,
+    broadcast_tx: broadcast::Sender<NotebookBroadcast>,
     presence: Arc<RwLock<PresenceState>>,
     presence_tx: broadcast::Sender<(String, Vec<u8>)>,
     runtime_agent_id: String,
@@ -203,12 +254,13 @@ pub async fn run_runtime_agent(
 ///   hazard the `runt-cloud-peer` spike documented.
 ///
 /// `initial_launch`, when `Some`, is a [`RuntimeAgentRequest::LaunchKernel`] the
-/// agent applies *once* after the initial RuntimeStateDoc sync, so the
-/// workstation endpoint can *start* a runtime in env X without waiting for an
-/// inbound `LaunchKernel` RPC. Waiting for the RuntimeStateDoc sync keeps the
-/// launch lifecycle write causally after the room checkpoint instead of racing
-/// stale published lifecycle state. `None` keeps the historical attach-only
-/// behavior. Build it with [`crate::workstation::build_current_python_launch`].
+/// agent applies once according to its [`LaunchTrigger`], so the workstation
+/// endpoint can either start a runtime eagerly on attach or lazily after synced
+/// execution intent appears without waiting for an inbound `LaunchKernel` RPC.
+/// Waiting for the RuntimeStateDoc sync keeps the launch lifecycle write
+/// causally after the room checkpoint instead of racing stale published
+/// lifecycle state. `None` keeps the historical attach-only behavior. Build it
+/// with [`crate::workstation::build_current_python_launch`].
 ///
 /// CODE-ONLY (Phase 3c/3b): this builds and unit-tests the spawn path behind the
 /// transport gate; the live cross-machine re-proof (a preview room + the
@@ -218,15 +270,15 @@ pub async fn run_cloud_runtime_agent(
     config: notebook_cloud_transport::CloudWsConfig,
     operator: String,
     blob_root: PathBuf,
-    initial_launch: Option<RuntimeAgentRequest>,
+    initial_launch: Option<(LaunchTrigger, RuntimeAgentRequest)>,
 ) -> anyhow::Result<()> {
     let notebook_id = config.notebook_id.clone();
     info!(
-        "[runtime-agent] Starting cloud runtime_agent notebook_id={} url={} scope={} launch_on_attach={}",
+        "[runtime-agent] Starting cloud runtime_agent notebook_id={} url={} scope={} initial_launch={:?}",
         notebook_id,
         notebook_cloud_transport::build_ws_url(&config.cloud_url, &notebook_id),
         config.scope,
-        initial_launch.is_some(),
+        initial_launch.as_ref().map(|(trigger, _)| *trigger),
     );
 
     let output_blob_publisher = OutputBlobPublisher::cloud(&config);
@@ -324,6 +376,15 @@ fn record_kernel_launching_state(
     })
 }
 
+/// Record a terminal kernel-launch failure into the RuntimeStateDoc.
+///
+/// A launch that fails terminally (see [`kernel_launch_failure::uses_fresh_port_retry`])
+/// leaves the doc's queued executions with no kernel that will ever run them. So
+/// alongside the errored kernel lifecycle, resolve those inflight executions in
+/// the same change: "queued" → "cancelled", any stray "running" → "error". This
+/// mirrors the defensive sweep on restart and is what stops the cells spinning
+/// on "queued" while the kernel banner reports the failure. Without it the launch
+/// error is invisible to the UI and the notebook looks stuck.
 fn record_kernel_launch_failed_state(
     ctx: &RuntimeAgentContext,
     kernel_type: &str,
@@ -334,6 +395,7 @@ fn record_kernel_launch_failed_state(
         sd.set_lifecycle_with_error_details(&RuntimeLifecycle::Error, None, Some(details))?;
         sd.set_kernel_info(kernel_type, kernel_type, env_source)?;
         sd.set_runtime_agent_id(&ctx.runtime_agent_id)?;
+        sd.abort_inflight_executions()?;
         Ok(())
     })
 }
@@ -371,6 +433,94 @@ fn reassert_live_kernel_projection_if_needed<K: KernelConnection>(
     Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamErrorDisposition {
+    Recoverable,
+    TerminalFailed,
+    TerminalGraceful,
+}
+
+fn classify_stream_error<T: FrameTransport>(
+    transport: &T,
+    error: &std::io::Error,
+) -> StreamErrorDisposition {
+    if transport.stream_error_is_recoverable(error) {
+        StreamErrorDisposition::Recoverable
+    } else if transport.stream_error_is_graceful_shutdown(error) {
+        StreamErrorDisposition::TerminalGraceful
+    } else {
+        StreamErrorDisposition::TerminalFailed
+    }
+}
+
+/// Kernel-session slots owned by the runtime agent's `select!` loop.
+///
+/// Groups the kernel slot with everything the launch paths must install or
+/// consult together: the local queue view (`kernel_state`), the dedupe set for
+/// CRDT-synced executions (`seen_execution_ids`), the control/work channel
+/// receivers, and the out-of-band interrupt handle.
+///
+/// `kernel_state` and `seen_execution_ids` outlive any single kernel process:
+/// both survive transport reconnects and kernel death, and
+/// `seen_execution_ids` clears only in the RestartKernel arm. They live in the
+/// session anyway because every consumer — the RPC dispatcher, sync-driven
+/// queueing, and queue release on launch — threads them together with the
+/// kernel slot; grouping them removes the parallel parameter lists without
+/// implying they share a kernel's lifetime.
+///
+/// After construction, the channel slots (`lifecycle_rx`, `work_rx`,
+/// `interrupt_handle`) are written only through
+/// [`KernelSession::install_kernel_channels`], so a launched kernel cannot be
+/// observed with a partially installed channel set.
+struct KernelSession {
+    kernel: Option<Kernel>,
+    kernel_state: KernelState,
+    /// Execution IDs already handed to `KernelState::queue_cell`, so repeated
+    /// RuntimeStateDoc syncs do not re-queue the same entry.
+    seen_execution_ids: HashSet<String>,
+    lifecycle_rx: Option<mpsc::UnboundedReceiver<LifecycleSignal>>,
+    visualization_rx: Option<mpsc::Receiver<VisualizationStateCommand>>,
+    visualization_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    work_rx: Option<mpsc::Receiver<WorkCommand>>,
+    interrupt_handle: Option<crate::jupyter_kernel::InterruptHandle>,
+}
+
+impl KernelSession {
+    fn new(kernel_state: KernelState) -> Self {
+        Self {
+            kernel: None,
+            kernel_state,
+            seen_execution_ids: HashSet::new(),
+            lifecycle_rx: None,
+            visualization_rx: None,
+            visualization_tasks: HashMap::new(),
+            work_rx: None,
+            interrupt_handle: None,
+        }
+    }
+
+    /// Adopt the outcome of a request that may have launched, restarted, or
+    /// shut down the kernel. A successful launch/restart hands back
+    /// [`QueueCommandReceivers`]; the set is indivisible, so all receivers
+    /// install in one step, and the interrupt handle re-derives from the
+    /// current kernel slot in the same call. Runs after *every*
+    /// `handle_runtime_agent_request`, so the handle also clears when a
+    /// request tears the kernel down. `None` receivers leave the previous
+    /// channels in place: buffered signals from a torn-down kernel still
+    /// drain through them.
+    fn install_kernel_channels(&mut self, receivers: Option<QueueCommandReceivers>) {
+        if let Some(rx) = receivers {
+            for (_, task) in self.visualization_tasks.drain() {
+                task.abort();
+            }
+            self.lifecycle_rx = Some(rx.lifecycle_rx);
+            self.visualization_rx = Some(rx.visualization_rx);
+            self.work_rx = Some(rx.work_rx);
+        }
+        self.interrupt_handle = self.kernel.as_ref().and_then(|k| k.interrupt_handle());
+    }
+}
+
 /// Run the runtime agent over an arbitrary [`FrameTransport`].
 ///
 /// The desktop/daemon path ([`run_runtime_agent`]) and the cloud path
@@ -394,7 +544,7 @@ async fn run_runtime_agent_on_transport<T, F>(
     blob_root: PathBuf,
     resolve_actor: F,
     output_blob_publisher: OutputBlobPublisher,
-    initial_launch: Option<RuntimeAgentRequest>,
+    initial_launch: Option<(LaunchTrigger, RuntimeAgentRequest)>,
 ) -> anyhow::Result<()>
 where
     T: FrameTransport,
@@ -450,8 +600,8 @@ where
     // -- 3. Create local infrastructure -------------------------------------
 
     let blob_store = Arc::new(BlobStore::new(blob_root.clone()));
-    let (broadcast_tx, _broadcast_rx) =
-        broadcast::channel::<notebook_protocol::protocol::NotebookBroadcast>(16);
+    let (broadcast_tx, mut broadcast_rx) =
+        broadcast::channel::<NotebookBroadcast>(RUNTIME_AGENT_KERNEL_BROADCAST_CAPACITY);
     let presence = Arc::new(RwLock::new(PresenceState::new()));
     let (presence_tx, _presence_rx) = broadcast::channel::<(String, Vec<u8>)>(16);
 
@@ -469,10 +619,7 @@ where
 
     // -- Local variables owned by the select! loop (no mutex) ---------------
 
-    let mut kernel: Option<Kernel> = None;
-    let mut interrupt_handle: Option<crate::jupyter_kernel::InterruptHandle> = None;
-    let mut kernel_state = KernelState::new(state.clone());
-    let mut seen_execution_ids = HashSet::new();
+    let mut session = KernelSession::new(KernelState::new(state.clone()));
     let mut echo_suppressor = EchoSuppressor::default();
     // Timestamp of the last recoverable reconnect (clean EOF *or* framing
     // error), used to enforce a floor between reconnect cycles on a recoverable
@@ -481,8 +628,6 @@ where
     // whose framing-error reconnect is gated out of the floor and which never
     // reconnects on clean EOF.
     let mut last_recoverable_reconnect: Option<tokio::time::Instant> = None;
-    let mut lifecycle_rx: Option<mpsc::UnboundedReceiver<LifecycleSignal>> = None;
-    let mut work_rx: Option<mpsc::Receiver<WorkCommand>> = None;
     let mut terminal_error: Option<anyhow::Error> = None;
 
     // Async responses from spawned tasks (currently: SyncEnvironment).
@@ -508,32 +653,53 @@ where
     let mut orphan_comm_candidates: HashSet<String> = HashSet::new();
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<&'static str>();
     install_runtime_agent_shutdown_signal_handlers(shutdown_tx);
+    let runtime_room_link_heartbeat_enabled = transport.clean_eof_is_recoverable();
+    let mut runtime_room_link_heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + RUNTIME_ROOM_LINK_HEARTBEAT,
+        RUNTIME_ROOM_LINK_HEARTBEAT,
+    );
+    runtime_room_link_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    if runtime_room_link_heartbeat_enabled {
+        record_runtime_room_link_seen(&state);
+    }
 
-    // -- 3b. Launch-on-attach gate (cloud only) -----------------------------
+    // -- 3b. Initial launch gate (cloud only) -------------------------------
     //
     // The workstation endpoint can hand the agent an initial `LaunchKernel` to
-    // apply after the first RuntimeStateDoc sync, so it *starts* a runtime in env
-    // X without waiting for an inbound RPC. The RuntimeStateDoc sync is
-    // load-bearing: the room may bootstrap from a published checkpoint whose
-    // lifecycle still says AwaitingTrust/Error. If the runtime peer writes
-    // Running before receiving that checkpoint, the writes are concurrent and
-    // Automerge can keep projecting the stale checkpoint value even though the
-    // kernel launched. Gated on `clean_eof_is_recoverable()`, the
-    // recoverable/cloud-transport discriminant: the daemon/UDS path drives launch
-    // via its own RPC and must never launch on attach, so even a (never-passed)
-    // `Some` here is ignored on UDS. The launch runs through the *same*
-    // `handle_runtime_agent_request` path an inbound RPC would, so the kernel
-    // drive, queue release, and command-receiver install are identical — only the
-    // trigger differs.
+    // apply after RuntimeStateDoc sync. `OnAttach` applies after the first sync,
+    // preserving today's eager user-attach behavior. `OnFirstExecution` applies
+    // only after a later sync observes queued execution intent while no kernel
+    // exists. The RuntimeStateDoc sync is load-bearing: the room may bootstrap
+    // from a published checkpoint whose lifecycle still says AwaitingTrust/Error.
+    // If the runtime peer writes Running before receiving that checkpoint, the
+    // writes are concurrent and Automerge can keep projecting the stale checkpoint
+    // value even though the kernel launched. Gated on `clean_eof_is_recoverable()`,
+    // the recoverable/cloud-transport discriminant: the daemon/UDS path drives
+    // launch via its own RPC and must never launch from this template, so even a
+    // (never-passed) `Some` here is ignored on UDS. The launch runs through the
+    // *same* `handle_runtime_agent_request` path an inbound RPC would, so the
+    // kernel drive, queue release, and command-receiver install are identical —
+    // only the trigger differs.
     let mut pending_initial_launch = match initial_launch {
-        Some(launch) if transport.clean_eof_is_recoverable() => {
-            info!("[runtime-agent] Deferring launch-on-attach until initial RuntimeStateDoc sync");
+        Some((trigger, launch)) if transport.clean_eof_is_recoverable() => {
+            match trigger {
+                LaunchTrigger::OnAttach => {
+                    info!(
+                        "[runtime-agent] Deferring launch-on-attach until initial RuntimeStateDoc sync"
+                    );
+                }
+                LaunchTrigger::OnFirstExecution => {
+                    info!(
+                        "[runtime-agent] Deferring launch-on-execute until RuntimeStateDoc sync observes queued execution"
+                    );
+                }
+            }
             let _ = state_kick_tx.send(());
-            Some(launch)
+            Some((trigger, launch))
         }
         Some(_) => {
             warn!(
-                "[runtime-agent] Ignoring launch-on-attach on a non-recoverable transport \
+                "[runtime-agent] Ignoring initial launch on a non-recoverable transport \
                  (daemon-driven launch only)"
             );
             None
@@ -567,14 +733,14 @@ where
                                 if let Ok(envelope) = serde_json::from_slice::<
                                     notebook_protocol::protocol::RuntimeAgentRequestEnvelope,
                                 >(&typed_frame.payload) {
-                                    // Jupyter interrupts bypass &mut kernel via InterruptHandle.
-                                    // Kernels without an out-of-band handle fall through to the
-                                    // generic request handler below.
+                                    // Jupyter interrupts bypass the &mut kernel slot via
+                                    // InterruptHandle. Kernels without an out-of-band handle
+                                    // fall through to the generic request handler below.
                                     if matches!(envelope.request, RuntimeAgentRequest::InterruptExecution)
                                         && interrupt_via_handle_if_available(
-                                            interrupt_handle.as_ref(),
+                                            session.interrupt_handle.as_ref(),
                                             &state,
-                                            &mut kernel_state,
+                                            &mut session.kernel_state,
                                         )
                                     {
                                         continue;
@@ -616,7 +782,7 @@ where
                                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                                             .wrapping_add(1);
 
-                                        let snapshot = kernel.as_ref().map(|k| {
+                                        let snapshot = session.kernel.as_ref().map(|k| {
                                             (k.env_source().to_string(), k.launched_config().clone())
                                         });
                                         let env_kind = env_kind.clone();
@@ -701,17 +867,18 @@ where
                                     let (response, new_cmd_rx) = handle_runtime_agent_request(
                                         envelope.request,
                                         &ctx,
-                                        &mut kernel,
-                                        &mut kernel_state,
-                                        &mut seen_execution_ids,
+                                        &mut session.kernel,
+                                        &mut session.kernel_state,
+                                        &mut session.seen_execution_ids,
                                     ).await;
 
-                                    if let Some(rx) = new_cmd_rx {
-                                        lifecycle_rx = Some(rx.lifecycle_rx);
-                                        work_rx = Some(rx.work_rx);
+                                    session.install_kernel_channels(new_cmd_rx);
+                                    if should_clear_pending_initial_launch_after_rpc(
+                                        is_launch_or_restart,
+                                        &response,
+                                    ) {
+                                        pending_initial_launch = None;
                                     }
-                                    // Update interrupt handle after any request that may change kernel state
-                                    interrupt_handle = kernel.as_ref().and_then(|k| k.interrupt_handle());
 
                                     // Only send response for queries (not commands)
                                     if !is_command {
@@ -725,6 +892,7 @@ where
                                 let sync_started = std::time::Instant::now();
                                 let mut inbound_queued_count = 0usize;
                                 let mut accepted_queued_count = 0usize;
+                                let mut queued_nonempty = false;
                                 if let Ok(msg) = automerge::sync::Message::decode(&typed_frame.payload) {
                                     let sync_result = ctx.state.with_doc(|sd| {
                                         match sd.receive_sync_message_with_changes_recovering(
@@ -751,11 +919,12 @@ where
                                         Ok(Some(queued)) => {
                                             runtime_state_doc_seen = true;
                                             inbound_queued_count = queued.len();
+                                            queued_nonempty = !queued.is_empty();
                                             accepted_queued_count = queue_synced_executions(
                                                 queued,
-                                                &mut seen_execution_ids,
-                                                &mut kernel_state,
-                                                kernel.as_mut(),
+                                                &mut session.seen_execution_ids,
+                                                &mut session.kernel_state,
+                                                session.kernel.as_mut(),
                                             )
                                             .await;
                                         }
@@ -785,46 +954,38 @@ where
                                                 sync_started.elapsed().as_millis()
                                             );
                                         }
-                                        if let Some(launch) = pending_initial_launch.take() {
-                                            info!(
-                                                "[runtime-agent] Applying launch-on-attach LaunchKernel after RuntimeStateDoc sync startup_elapsed_ms={}",
-                                                agent_started.elapsed().as_millis()
-                                            );
-                                            let launch_apply_started = std::time::Instant::now();
-                                            let (response, new_cmd_rx) =
-                                                handle_runtime_agent_request(
-                                                    launch,
-                                                    &ctx,
-                                                    &mut kernel,
-                                                    &mut kernel_state,
-                                                    &mut seen_execution_ids,
+                                        let should_apply_launch = pending_initial_launch
+                                            .as_ref()
+                                            .map(|(trigger, _)| {
+                                                should_apply_initial_launch(
+                                                    *trigger,
+                                                    runtime_state_doc_seen,
+                                                    session.kernel.is_some(),
+                                                    queued_nonempty,
                                                 )
-                                                .await;
-                                            if let Some(rx) = new_cmd_rx {
-                                                lifecycle_rx = Some(rx.lifecycle_rx);
-                                                work_rx = Some(rx.work_rx);
-                                            }
-                                            interrupt_handle = kernel
-                                                .as_ref()
-                                                .and_then(|k| k.interrupt_handle());
-                                            if let RuntimeAgentResponse::Error { error } = response
-                                            {
-                                                warn!(
-                                                    "[runtime-agent] Launch-on-attach failed: {}",
-                                                    error
-                                                );
-                                            } else {
-                                                info!(
-                                                    "[runtime-agent-timing] launch-on-attach completed elapsed_ms={} startup_elapsed_ms={}",
-                                                    launch_apply_started.elapsed().as_millis(),
-                                                    agent_started.elapsed().as_millis()
-                                                );
-                                            }
+                                            })
+                                            .unwrap_or(false);
+                                        if should_apply_launch {
+                                            let Some((trigger, launch)) =
+                                                pending_initial_launch.take()
+                                            else {
+                                                unreachable!(
+                                                    "checked pending_initial_launch above"
+                                                )
+                                            };
+                                            apply_initial_launch(
+                                                trigger,
+                                                launch,
+                                                &ctx,
+                                                &mut session,
+                                                agent_started,
+                                            )
+                                            .await;
                                         }
 
                                         match reassert_live_kernel_projection_if_needed(
                                             &ctx,
-                                            kernel.as_ref(),
+                                            session.kernel.as_ref(),
                                         ) {
                                             Ok(true) => {
                                                 info!(
@@ -951,7 +1112,7 @@ where
                                     match sync_result {
                                         Ok(Some((comm_updates, superseded_hashes_by_comm))) => {
                                             if !comm_updates.is_empty() {
-                                                if let Some(ref mut k) = kernel {
+                                                if let Some(ref mut k) = session.kernel {
                                                     for (comm_id, delta) in &comm_updates {
                                                         let superseded_hashes =
                                                             superseded_hashes_by_comm
@@ -1074,16 +1235,25 @@ where
                         }
                     }
                     Some(Err(e)) => {
-                        if !transport.stream_error_is_recoverable(&e) {
-                            error!(
-                                "[runtime-agent] Non-recoverable sync stream error: {}; \
-                                 shutting down instead of reconnecting",
-                                e
-                            );
-                            terminal_error = Some(anyhow::anyhow!(
-                                "runtime agent sync stream rejected by room: {e}"
-                            ));
-                            break;
+                        match classify_stream_error(&transport, &e) {
+                            StreamErrorDisposition::TerminalGraceful => {
+                                info!(
+                                    "[runtime-agent] Sync stream closed gracefully by transport; shutting down cleanly"
+                                );
+                                break;
+                            }
+                            StreamErrorDisposition::TerminalFailed => {
+                                error!(
+                                    "[runtime-agent] Non-recoverable sync stream error: {}; \
+                                     shutting down instead of reconnecting",
+                                    e
+                                );
+                                terminal_error = Some(anyhow::anyhow!(
+                                    "runtime agent sync stream rejected by room: {e}"
+                                ));
+                                break;
+                            }
+                            StreamErrorDisposition::Recoverable => {}
                         }
                         // A framing error here means one of two things:
                         //   - the daemon half-closed the sync stream (clean),
@@ -1207,6 +1377,10 @@ where
                 }
             }
 
+            _ = runtime_room_link_heartbeat.tick(), if runtime_room_link_heartbeat_enabled => {
+                record_runtime_room_link_seen(&ctx.state);
+            }
+
             // Process-level shutdown from the workstation agent or host. This
             // must exit through the normal cleanup section below so the kernel
             // receives a Jupyter shutdown request instead of being orphaned.
@@ -1219,7 +1393,7 @@ where
             // control-plane signals and intentionally do not share the
             // bounded output/work queue.
             Some(signal) = async {
-                match lifecycle_rx.as_mut() {
+                match session.lifecycle_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
@@ -1227,16 +1401,44 @@ where
                 if let Err(e) = handle_lifecycle_signal(
                     signal,
                     &ctx,
-                    &mut kernel,
-                    &mut kernel_state,
+                    &mut session.kernel,
+                    &mut session.kernel_state,
                 ).await {
                     warn!("[runtime-agent] Error handling lifecycle signal: {}", e);
                 }
             }
 
+            // Bounded Bokeh checkpoint work has its own lane. Drain reliable
+            // lifecycle signals before awaiting a kernel snapshot.
+            Some(command) = async {
+                match session.visualization_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(rx) = session.lifecycle_rx.as_mut() {
+                    if let Err(error) = drain_lifecycle_commands(
+                        rx,
+                        &ctx,
+                        &mut session.kernel,
+                        &mut session.kernel_state,
+                    ).await {
+                        warn!("[runtime-agent] Error draining lifecycle commands: {error}");
+                    }
+                }
+                if let Err(error) = start_visualization_state_command(
+                    command,
+                    &ctx,
+                    session.kernel.as_ref(),
+                    &mut session.visualization_tasks,
+                ) {
+                    warn!("[runtime-agent] Error handling visualization state: {error}");
+                }
+            }
+
             // Process bounded output/work commands from kernel tasks.
             Some(command) = async {
-                match work_rx.as_mut() {
+                match session.work_rx.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
@@ -1244,18 +1446,89 @@ where
                 // If output work was selected while lifecycle signals were
                 // also pending, drain lifecycle first so output transport
                 // cannot sit ahead of idle/done/error/death processing.
-                if let Some(rx) = lifecycle_rx.as_mut() {
+                if let Some(rx) = session.lifecycle_rx.as_mut() {
                     if let Err(e) = drain_lifecycle_commands(
                         rx,
                         &ctx,
-                        &mut kernel,
-                        &mut kernel_state,
+                        &mut session.kernel,
+                        &mut session.kernel_state,
                     ).await {
                         warn!("[runtime-agent] Error draining lifecycle commands: {}", e);
                     }
                 }
-                if let Err(e) = handle_work_command(command, &mut kernel).await {
+                if let Err(e) = handle_work_command(command, &mut session.kernel).await {
                     warn!("[runtime-agent] Error handling work command: {}", e);
+                }
+            }
+
+            // Forward ephemeral kernel comm events to the coordinator. Durable
+            // widget state still syncs through CommsDoc; this path is for live
+            // custom messages such as ipympl draw/binary events.
+            result = broadcast_rx.recv() => {
+                match result {
+                    Ok(broadcast) => {
+                        let json = match serde_json::to_vec(&broadcast) {
+                            Ok(json) => json,
+                            Err(e) => {
+                                warn!(
+                                    "[runtime-agent] Failed to serialize kernel broadcast: {}",
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = frame_sink.send_frame(
+                            NotebookFrameType::Broadcast,
+                            &json,
+                        ).await {
+                            if !transport.clean_eof_is_recoverable() {
+                                warn!(
+                                    "[runtime-agent] Closing after Broadcast send failure: {}",
+                                    e
+                                );
+                                break;
+                            }
+                            warn!(
+                                "[runtime-agent] Broadcast send failed: {} — reconnecting \
+                                 (kernel stays running)",
+                                e
+                            );
+                            drop(frame_source);
+                            match reconnect_after_writer_error(
+                                &transport,
+                                &mut last_recoverable_reconnect,
+                            ).await {
+                                Ok((new_source, new_sink)) => {
+                                    frame_source = new_source;
+                                    frame_sink = new_sink;
+                                    coordinator_sync_state = automerge::sync::State::new();
+                                    comms_sync_state = automerge::sync::State::new();
+                                    let _ = state_kick_tx.send(());
+                                    let _ = comms_kick_tx.send(());
+                                    info!("[runtime-agent] Reconnected after Broadcast send failure");
+                                    continue;
+                                }
+                                Err(reconnect_err) => {
+                                    error!(
+                                        "[runtime-agent] Reconnect failed after retries: {}",
+                                        reconnect_err
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(
+                            "[runtime-agent] Dropped {} kernel broadcasts before forwarding",
+                            n
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        warn!("[runtime-agent] Kernel broadcast channel closed");
+                        break;
+                    }
                 }
             }
 
@@ -1443,7 +1716,10 @@ where
     // -- 5. Cleanup ---------------------------------------------------------
 
     info!("[runtime-agent] Shutting down");
-    if let Some(ref mut k) = kernel {
+    for (_, task) in session.visualization_tasks.drain() {
+        task.abort();
+    }
+    if let Some(ref mut k) = session.kernel {
         k.shutdown().await.ok();
     }
 
@@ -1576,6 +1852,56 @@ async fn queue_synced_executions<K: KernelConnection>(
     queued_count
 }
 
+fn should_apply_initial_launch(
+    trigger: LaunchTrigger,
+    runtime_state_doc_seen: bool,
+    kernel_exists: bool,
+    queued_nonempty: bool,
+) -> bool {
+    if !runtime_state_doc_seen {
+        return false;
+    }
+
+    match trigger {
+        LaunchTrigger::OnAttach => true,
+        LaunchTrigger::OnFirstExecution => !kernel_exists && queued_nonempty,
+    }
+}
+
+async fn apply_initial_launch(
+    trigger: LaunchTrigger,
+    launch: RuntimeAgentRequest,
+    ctx: &RuntimeAgentContext,
+    session: &mut KernelSession,
+    agent_started: std::time::Instant,
+) {
+    info!(
+        "[runtime-agent] Applying {} LaunchKernel after RuntimeStateDoc sync startup_elapsed_ms={}",
+        trigger.label(),
+        agent_started.elapsed().as_millis()
+    );
+    let launch_apply_started = std::time::Instant::now();
+    let (response, new_cmd_rx) = handle_runtime_agent_request(
+        launch,
+        ctx,
+        &mut session.kernel,
+        &mut session.kernel_state,
+        &mut session.seen_execution_ids,
+    )
+    .await;
+    session.install_kernel_channels(new_cmd_rx);
+    if let Some(error) = runtime_agent_response_error(&response) {
+        warn!("[runtime-agent] {} failed: {}", trigger.label(), error);
+    } else {
+        info!(
+            "[runtime-agent-timing] {} completed elapsed_ms={} startup_elapsed_ms={}",
+            trigger.label(),
+            launch_apply_started.elapsed().as_millis(),
+            agent_started.elapsed().as_millis()
+        );
+    }
+}
+
 /// Handle a `RuntimeAgentRequest` and return a `RuntimeAgentResponse`.
 ///
 /// Also returns optional command receivers when a kernel is launched/restarted
@@ -1687,23 +2013,30 @@ async fn handle_runtime_agent_request(
                     )
                 }
                 Err(e) => {
+                    let kind = crate::kernel_launch_failure::classify(&e);
                     warn!(
-                        "[runtime-agent] LaunchKernel failed: type={} source={} elapsed_ms={} error={}",
+                        "[runtime-agent] LaunchKernel failed: type={} source={} elapsed_ms={} kind={:?} error={}",
                         launch_kernel_type,
                         launch_env_source,
                         launch_started.elapsed().as_millis(),
+                        kind,
                         e
                     );
                     let error = format!("Failed to launch kernel: {e}");
-                    if let Err(write_error) = record_kernel_launch_failed_state(
-                        ctx,
-                        &launch_kernel_type,
-                        &launch_env_source,
-                        &error,
-                    ) {
-                        warn!("[runtime-state] {}", write_error);
+                    if !crate::kernel_launch_failure::coordinator_may_retry(kind) {
+                        if let Err(write_error) = record_kernel_launch_failed_state(
+                            ctx,
+                            &launch_kernel_type,
+                            &launch_env_source,
+                            &error,
+                        ) {
+                            warn!("[runtime-state] {}", write_error);
+                        }
                     }
-                    (RuntimeAgentResponse::Error { error }, None)
+                    (
+                        RuntimeAgentResponse::KernelLaunchFailed { kind, error },
+                        None,
+                    )
                 }
             }
         }
@@ -1730,6 +2063,7 @@ async fn handle_runtime_agent_request(
                 .iter()
                 .map(|e| e.execution_id.clone())
                 .collect();
+            let restarting_kernel_id = kernel.as_ref().map(|kernel| kernel.kernel_id().to_string());
 
             // Shut down existing kernel
             if let Some(ref mut k) = kernel {
@@ -1812,6 +2146,9 @@ async fn handle_runtime_agent_request(
                     _ => {}
                 }
                 sd.set_queue(None, &[])?;
+                if let Some(kernel_id) = restarting_kernel_id.as_deref() {
+                    sd.disconnect_bokeh_sessions_for_kernel(kernel_id)?;
+                }
                 Ok(())
             }) {
                 warn!("[runtime-state] {}", e);
@@ -1847,23 +2184,30 @@ async fn handle_runtime_agent_request(
                     )
                 }
                 Err(e) => {
+                    let kind = crate::kernel_launch_failure::classify(&e);
                     warn!(
-                        "[runtime-agent] RestartKernel failed: type={} source={} elapsed_ms={} error={}",
+                        "[runtime-agent] RestartKernel failed: type={} source={} elapsed_ms={} kind={:?} error={}",
                         launch_kernel_type,
                         launch_env_source,
                         launch_started.elapsed().as_millis(),
+                        kind,
                         e
                     );
                     let error = format!("Failed to restart kernel: {e}");
-                    if let Err(write_error) = record_kernel_launch_failed_state(
-                        ctx,
-                        &launch_kernel_type,
-                        &launch_env_source,
-                        &error,
-                    ) {
-                        warn!("[runtime-state] {}", write_error);
+                    if !crate::kernel_launch_failure::coordinator_may_retry(kind) {
+                        if let Err(write_error) = record_kernel_launch_failed_state(
+                            ctx,
+                            &launch_kernel_type,
+                            &launch_env_source,
+                            &error,
+                        ) {
+                            warn!("[runtime-state] {}", write_error);
+                        }
                     }
-                    (RuntimeAgentResponse::Error { error }, None)
+                    (
+                        RuntimeAgentResponse::KernelLaunchFailed { kind, error },
+                        None,
+                    )
                 }
             }
         }
@@ -1899,10 +2243,19 @@ async fn handle_runtime_agent_request(
         }
 
         RuntimeAgentRequest::ShutdownKernel => {
+            let shutdown_kernel_id = kernel.as_ref().map(|kernel| kernel.kernel_id().to_string());
             if let Some(ref mut k) = kernel {
                 k.shutdown().await.ok();
             }
             *kernel = None;
+            if let Some(kernel_id) = shutdown_kernel_id {
+                if let Err(error) = ctx.state.with_doc(|state_doc| {
+                    state_doc.disconnect_bokeh_sessions_for_kernel(&kernel_id)?;
+                    Ok(())
+                }) {
+                    warn!("[runtime-state] Failed to disconnect Bokeh sessions: {error}");
+                }
+            }
             (RuntimeAgentResponse::Ok, None)
         }
 
@@ -1913,6 +2266,82 @@ async fn handle_runtime_agent_request(
                     Err(e) => (
                         RuntimeAgentResponse::Error {
                             error: format!("Failed to send comm: {}", e),
+                        },
+                        None,
+                    ),
+                }
+            } else {
+                (
+                    RuntimeAgentResponse::Error {
+                        error: "No kernel running".to_string(),
+                    },
+                    None,
+                )
+            }
+        }
+
+        RuntimeAgentRequest::ApplyBokehSessionPatch { request } => {
+            if let Some(ref mut kernel) = kernel {
+                let owns_session = ctx
+                    .state
+                    .read(|state_doc| {
+                        state_doc
+                            .get_bokeh_session(&request.session_id)
+                            .is_some_and(|session| {
+                                session.kernel_id == kernel.kernel_id()
+                                    && session.status == runtime_doc::BokehSessionStatus::Connected
+                            })
+                    })
+                    .unwrap_or(false);
+                if !owns_session {
+                    return (
+                        RuntimeAgentResponse::Error {
+                            error: format!(
+                                "Bokeh session {} is not owned by the active kernel",
+                                request.session_id
+                            ),
+                        },
+                        None,
+                    );
+                }
+
+                match kernel.apply_bokeh_session_patch(*request).await {
+                    Ok(response) => {
+                        let session_id = match &response.reply {
+                            notebook_protocol::protocol::BokehSessionPatchReply::Accepted {
+                                session_id,
+                                ..
+                            }
+                            | notebook_protocol::protocol::BokehSessionPatchReply::Stale {
+                                session_id,
+                                ..
+                            }
+                            | notebook_protocol::protocol::BokehSessionPatchReply::Error {
+                                session_id,
+                                ..
+                            } => session_id.clone(),
+                        };
+                        if let Err(error) = crate::bokeh_session::append_callback_outputs(
+                            &session_id,
+                            &response,
+                            &ctx.state,
+                            &ctx.blob_store,
+                            &ctx.output_blob_publisher,
+                        )
+                        .await
+                        {
+                            warn!("[bokeh-session] Failed to append callback output: {error}");
+                        }
+                        (
+                            RuntimeAgentResponse::BokehSessionPatch {
+                                reply: response.reply,
+                            },
+                            None,
+                        )
+                    }
+                    Err(error) => (
+                        RuntimeAgentResponse::Error {
+                            error: format!("Failed to apply Bokeh patch: {error}"),
                         },
                         None,
                     ),
@@ -2204,6 +2633,7 @@ async fn handle_lifecycle_signal(
 
         LifecycleSignal::KernelDied => {
             warn!("[runtime-agent] Kernel died");
+            let dead_kernel_id = kernel.as_ref().map(|kernel| kernel.kernel_id().to_string());
             if let Some(ref mut k) = kernel {
                 k.shutdown().await.ok();
             }
@@ -2224,6 +2654,9 @@ async fn handle_lifecycle_signal(
                 // missing_ipykernel incident.
                 sd.set_lifecycle_with_error(&RuntimeLifecycle::Error, None)?;
                 sd.set_queue(None, &[])?;
+                if let Some(kernel_id) = dead_kernel_id.as_deref() {
+                    sd.disconnect_bokeh_sessions_for_kernel(kernel_id)?;
+                }
                 Ok(())
             }) {
                 warn!("[runtime-state] {}", e);
@@ -2231,6 +2664,95 @@ async fn handle_lifecycle_signal(
         }
     }
 
+    Ok(())
+}
+
+fn start_visualization_state_command(
+    command: VisualizationStateCommand,
+    ctx: &RuntimeAgentContext,
+    kernel: Option<&Kernel>,
+    tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    let VisualizationStateCommand::CheckpointBokehSession { session_id, force } = command;
+    let Some(kernel) = kernel else {
+        return Ok(());
+    };
+    if tasks
+        .get(&session_id)
+        .is_some_and(|task| !task.is_finished())
+    {
+        return Ok(());
+    }
+    tasks.remove(&session_id);
+
+    let should_checkpoint = ctx
+        .state
+        .read(|state_doc| {
+            state_doc
+                .get_bokeh_session(&session_id)
+                .is_some_and(|session| {
+                    session.kernel_id == kernel.kernel_id()
+                        && session.status == runtime_doc::BokehSessionStatus::Connected
+                        && (force
+                            || session.patch_tail.len()
+                                >= crate::bokeh_session::BOKEH_PATCH_CHECKPOINT_THRESHOLD)
+                })
+        })
+        .unwrap_or(false);
+    if !should_checkpoint {
+        return Ok(());
+    }
+
+    let Some(checkpoint_request) = kernel.bokeh_session_checkpoint_request(session_id.clone())
+    else {
+        return Ok(());
+    };
+    let expected_kernel_id = kernel.kernel_id().to_string();
+    let state = ctx.state.clone();
+    let blob_store = ctx.blob_store.clone();
+    let blob_publisher = ctx.output_blob_publisher.clone();
+    let task_session_id = session_id.clone();
+    let task = crate::task_supervisor::spawn_best_effort("bokeh-checkpoint-persist", async move {
+        let result = async {
+            let checkpoint = checkpoint_request.await?;
+            if !force {
+                for _ in 0..40 {
+                    let caught_up = state
+                        .read(|state_doc| {
+                            state_doc
+                                .get_bokeh_session(&task_session_id)
+                                .is_some_and(|session| session.head_revision >= checkpoint.revision)
+                        })
+                        .unwrap_or(false);
+                    if caught_up {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }
+            // If the catch-up wait expires, persist_checkpoint rejects a
+            // still-ahead revision after publishing its content-addressed
+            // artifact. It remains unreferenced and the normal blob GC grace
+            // reclaims it while the prior checkpoint stays canonical.
+            crate::bokeh_session::persist_checkpoint(
+                &checkpoint,
+                &expected_kernel_id,
+                force,
+                &state,
+                &blob_store,
+                &blob_publisher,
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = result {
+            warn!(
+                "[bokeh-session] Failed to checkpoint session {}: {error}",
+                task_session_id
+            );
+        }
+    });
+    tasks.insert(session_id, task);
     Ok(())
 }
 
@@ -2343,6 +2865,11 @@ fn diff_comm_state(
             {
                 let mut delta = serde_json::Map::new();
                 for (key, after_val) in after_obj {
+                    // `_nteract_mpl_canvas` is daemon-authored checkpoint state for
+                    // late viewers and agents. It is never a kernel traitlet update.
+                    if key == crate::matplotlib_widget::MPL_CANVAS_CHECKPOINT_KEY {
+                        continue;
+                    }
                     match before_obj.get(key) {
                         Some(before_val) if before_val == after_val => {}
                         _ => {
@@ -2684,6 +3211,40 @@ mod tests {
     }
 
     #[test]
+    fn diff_comm_state_filters_matplotlib_checkpoint_key() {
+        let mut active = HashSet::new();
+        active.insert("mpl-comm".to_string());
+
+        let before = HashMap::from([(
+            "mpl-comm".to_string(),
+            serde_json::json!({
+                "value": 1,
+            }),
+        )]);
+        let after = HashMap::from([(
+            "mpl-comm".to_string(),
+            serde_json::json!({
+                "value": 2,
+                "_nteract_mpl_canvas": {
+                    "version": 1,
+                    "frame": {
+                        "blob": "hash",
+                        "size": 10,
+                        "media_type": "image/png"
+                    }
+                }
+            }),
+        )]);
+
+        let updates = diff_comm_state(&before, &after, &active);
+
+        assert_eq!(
+            updates,
+            vec![("mpl-comm".to_string(), serde_json::json!({"value": 2}))]
+        );
+    }
+
+    #[test]
     fn floor_does_not_delay_once_floor_has_elapsed() {
         // Last reconnect comfortably older than the floor -> reconnect now.
         assert_eq!(
@@ -2739,6 +3300,93 @@ mod tests {
         async fn send_frame(&mut self, _: NotebookFrameType, _: &[u8]) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    struct ClassifyingTransport {
+        recoverable: bool,
+        graceful: bool,
+    }
+
+    impl FrameTransport for ClassifyingTransport {
+        type Source = NullSource;
+        type Sink = NullSink;
+
+        async fn connect(&self) -> std::io::Result<(Self::Source, Self::Sink)> {
+            Ok((NullSource, NullSink))
+        }
+
+        fn stream_error_is_recoverable(&self, _: &std::io::Error) -> bool {
+            self.recoverable
+        }
+
+        fn stream_error_is_graceful_shutdown(&self, _: &std::io::Error) -> bool {
+            self.graceful
+        }
+    }
+
+    #[test]
+    fn stream_error_classification_has_terminal_graceful_split() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "mock");
+
+        assert_eq!(
+            classify_stream_error(
+                &ClassifyingTransport {
+                    recoverable: true,
+                    graceful: false,
+                },
+                &error
+            ),
+            StreamErrorDisposition::Recoverable
+        );
+        assert_eq!(
+            classify_stream_error(
+                &ClassifyingTransport {
+                    recoverable: false,
+                    graceful: false,
+                },
+                &error
+            ),
+            StreamErrorDisposition::TerminalFailed
+        );
+        assert_eq!(
+            classify_stream_error(
+                &ClassifyingTransport {
+                    recoverable: false,
+                    graceful: true,
+                },
+                &error
+            ),
+            StreamErrorDisposition::TerminalGraceful
+        );
+    }
+
+    #[test]
+    fn successful_inbound_launch_or_restart_clears_pending_initial_launch() {
+        let launched = RuntimeAgentResponse::KernelLaunched {
+            env_source: notebook_protocol::connection::EnvSource::Unknown("test".to_string()),
+        };
+        assert!(should_clear_pending_initial_launch_after_rpc(
+            true, &launched
+        ));
+
+        let restarted = RuntimeAgentResponse::KernelRestarted {
+            env_source: notebook_protocol::connection::EnvSource::Unknown("test".to_string()),
+        };
+        assert!(should_clear_pending_initial_launch_after_rpc(
+            true, &restarted
+        ));
+
+        let failed = RuntimeAgentResponse::KernelLaunchFailed {
+            kind: notebook_protocol::protocol::KernelLaunchFailureKind::PortBind,
+            error: "port busy".to_string(),
+        };
+        assert!(!should_clear_pending_initial_launch_after_rpc(
+            true, &failed
+        ));
+        assert!(!should_clear_pending_initial_launch_after_rpc(
+            false,
+            &RuntimeAgentResponse::Ok
+        ));
     }
 
     /// A `FrameTransport` whose `connect` fails the first `fail_before` calls
@@ -2890,6 +3538,60 @@ mod tests {
             !uds_like.clean_eof_is_recoverable(),
             "a non-recoverable (UDS) transport ignores launch-on-attach"
         );
+    }
+
+    #[test]
+    fn initial_launch_trigger_waits_for_runtime_state_doc_sync() {
+        assert!(!should_apply_initial_launch(
+            LaunchTrigger::OnAttach,
+            false,
+            false,
+            true
+        ));
+        assert!(!should_apply_initial_launch(
+            LaunchTrigger::OnFirstExecution,
+            false,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn launch_on_first_execution_requires_no_kernel_and_queued_work() {
+        assert!(should_apply_initial_launch(
+            LaunchTrigger::OnFirstExecution,
+            true,
+            false,
+            true
+        ));
+        assert!(!should_apply_initial_launch(
+            LaunchTrigger::OnFirstExecution,
+            true,
+            true,
+            true
+        ));
+        assert!(!should_apply_initial_launch(
+            LaunchTrigger::OnFirstExecution,
+            true,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn launch_on_attach_is_ready_after_runtime_state_doc_sync_only() {
+        assert!(should_apply_initial_launch(
+            LaunchTrigger::OnAttach,
+            true,
+            false,
+            false
+        ));
+        assert!(should_apply_initial_launch(
+            LaunchTrigger::OnAttach,
+            true,
+            true,
+            true
+        ));
     }
 
     // -- cloud doc-actor label (Phase 3c) ---------------------------------
@@ -3230,6 +3932,53 @@ mod tests {
     }
 
     #[test]
+    fn launch_failure_resolves_queued_executions_so_cells_stop_spinning() {
+        let (ctx, _state, handle) = test_fixtures();
+
+        // Cells were queued against the runtime before the launch was attempted.
+        // This is the launch-on-attach case: executions arrive via CRDT sync
+        // while the kernel is still starting, then the launch fails.
+        handle
+            .with_doc(|sd| {
+                sd.create_execution("exec-queued-1")?;
+                sd.create_execution("exec-queued-2")?;
+                Ok(())
+            })
+            .expect("seed queued executions");
+
+        record_kernel_launching_state(&ctx, "python", "uv:current_python")
+            .expect("record kernel launching");
+        record_kernel_launch_failed_state(
+            &ctx,
+            "python",
+            "uv:current_python",
+            "Failed to launch kernel: missing ipykernel",
+        )
+        .expect("record kernel launch failure");
+
+        let runtime_state = handle.read(|sd| sd.read_state()).unwrap();
+        assert_eq!(runtime_state.kernel.lifecycle, RuntimeLifecycle::Error);
+
+        // The queued cells can never run now, so none may remain "queued":
+        // they must reach a terminal status instead of hanging on the spinner.
+        let still_queued = handle.read(|sd| sd.get_queued_executions()).unwrap();
+        assert!(
+            still_queued.is_empty(),
+            "no executions should remain queued after a terminal launch failure"
+        );
+        let e1 = handle
+            .read(|sd| sd.get_execution("exec-queued-1"))
+            .unwrap()
+            .expect("exec-queued-1 exists");
+        let e2 = handle
+            .read(|sd| sd.get_execution("exec-queued-2"))
+            .unwrap()
+            .expect("exec-queued-2 exists");
+        assert_eq!(e1.status, "cancelled");
+        assert_eq!(e2.status, "cancelled");
+    }
+
+    #[test]
     fn live_kernel_reasserts_after_stale_not_started_projection() {
         let (ctx, _state, handle) = test_fixtures();
         handle
@@ -3456,7 +4205,7 @@ mod tests {
     async fn lifecycle_drain_runs_before_queued_work() {
         let (ctx, mut state, handle) = test_fixtures();
         state.set_idle();
-        let (lifecycle_tx, work_tx, mut receivers) = queue_command_channels(1);
+        let (lifecycle_tx, _visualization_tx, work_tx, mut receivers) = queue_command_channels(1);
 
         work_tx
             .try_send(WorkCommand::SendCommUpdate {

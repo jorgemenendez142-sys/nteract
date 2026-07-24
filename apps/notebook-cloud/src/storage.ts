@@ -14,6 +14,11 @@ export interface NotebookRow {
   created_at: string;
   updated_at: string;
   latest_revision_id: string | null;
+  cell_composition: string | null;
+  preview_cells: string | null;
+  cover_blob_hash?: string | null;
+  cover_mime?: string | null;
+  language: string | null;
 }
 
 export interface RevisionRow {
@@ -23,9 +28,13 @@ export interface RevisionRow {
   notebook_heads_hash: string;
   runtime_heads_hash: string | null;
   comms_heads_hash: string | null;
+  comments_heads_hash: string | null;
   snapshot_key: string;
   runtime_snapshot_key: string | null;
   comms_snapshot_key: string | null;
+  comments_snapshot_key: string | null;
+  cover_blob_hash: string | null;
+  cover_mime: string | null;
   actor_label: string;
   created_at: string;
 }
@@ -51,6 +60,25 @@ export interface NotebookAclRow {
 
 export interface ListedNotebookRow extends NotebookRow {
   scope: NotebookAclRow["scope"];
+}
+
+export interface ListedNotebookPage {
+  notebooks: ListedNotebookRow[];
+  totalCount: number;
+}
+
+export interface NotebookRoomSummaryOccupant {
+  participant_key: string;
+  actor_label: string;
+  display_name?: string;
+  connection_scope: AuthenticatedConnection["scope"];
+}
+
+export interface NotebookRoomSummary {
+  version: 1;
+  notebook_id: string;
+  occupants: NotebookRoomSummaryOccupant[];
+  updated_at: string;
 }
 
 export interface NotebookAclInput {
@@ -87,6 +115,24 @@ export interface PrincipalAccountLinkRow {
 
 export type WorkstationStatus = "online" | "offline" | "connecting" | "attention" | "unknown";
 
+export type WorkstationAcceleratorReadiness = "ready" | "not_ready" | "unknown";
+
+/**
+ * Host-owned accelerator capability reported by a workstation heartbeat.
+ *
+ * `ready` means the workstation runtime detected and can use the devices; it
+ * does not claim that any device is currently idle, free, or schedulable.
+ */
+export interface WorkstationAccelerator {
+  kind: string;
+  vendor: string | null;
+  model: string | null;
+  count: number;
+  memory_bytes_per_device: number | null;
+  readiness: WorkstationAcceleratorReadiness;
+  diagnostic: string | null;
+}
+
 export type WorkstationAttachJobStatus =
   | "pending"
   | "accepted"
@@ -95,7 +141,12 @@ export type WorkstationAttachJobStatus =
   | "completed"
   | "cancelled";
 
+export type WorkstationAttachJobTrigger = "user_attach" | "resume";
+
 export const WORKSTATION_ATTACH_JOB_STALE_MS = 2 * 60_000;
+// Pending jobs cover host cold start before the agent accepts the request; give
+// a slow host one extra minute beyond the accepted/running heartbeat timeout.
+export const WORKSTATION_ATTACH_PENDING_STALE_MS = 3 * 60_000;
 
 export interface WorkstationRow {
   owner_principal: string;
@@ -107,9 +158,12 @@ export interface WorkstationRow {
   status_message: string | null;
   default_environment_label: string | null;
   environment_policy: string | null;
+  installed_build: string | null;
+  channel: string | null;
   working_directory: string | null;
   cpu_count: number | null;
   memory_bytes: number | null;
+  accelerators_json: string | null;
   environments_json: string | null;
   created_at: string;
   updated_at: string;
@@ -124,9 +178,12 @@ export interface WorkstationRegistrationInput {
   statusMessage?: string | null;
   defaultEnvironmentLabel?: string | null;
   environmentPolicy?: string | null;
+  installedBuild?: string | null;
+  channel?: string | null;
   workingDirectory?: string | null;
   cpuCount?: number | null;
   memoryBytes?: number | null;
+  acceleratorsJson?: string | null;
   environmentsJson?: string | null;
 }
 
@@ -136,6 +193,7 @@ export interface WorkstationAttachJobRow {
   owner_principal: string;
   workstation_id: string;
   status: WorkstationAttachJobStatus;
+  trigger: WorkstationAttachJobTrigger;
   requested_by_actor_label: string;
   requested_at: string;
   updated_at: string;
@@ -144,6 +202,42 @@ export interface WorkstationAttachJobRow {
   error_message: string | null;
 }
 
+export interface CreateWorkstationAttachJobResult {
+  job: WorkstationAttachJobRow;
+  cancelledActiveJob: WorkstationAttachJobRow | null;
+}
+
+export interface ListActiveWorkstationAttachJobsResult {
+  jobs: WorkstationAttachJobRow[];
+  expiredPendingJobs: WorkstationAttachJobRow[];
+}
+
+const WORKSTATION_ATTACH_JOBS_DROP_LEGACY_ACTIVE_UNIQUE_INDEX = `DROP INDEX IF EXISTS workstation_attach_jobs_active_unique_idx`;
+
+const WORKSTATION_ATTACH_JOBS_DEDUPE_ACTIVE_OWNER = `UPDATE workstation_attach_jobs
+   SET status = 'cancelled',
+       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+       finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+       error_message = 'cancelled by active workstation attach job uniqueness migration'
+ WHERE status IN ('pending', 'accepted', 'running')
+   AND id IN (
+     SELECT id
+       FROM (
+         SELECT id,
+                ROW_NUMBER() OVER (
+                  PARTITION BY notebook_id, owner_principal
+                  ORDER BY requested_at DESC, updated_at DESC, id DESC
+                ) AS active_rank
+           FROM workstation_attach_jobs
+          WHERE status IN ('pending', 'accepted', 'running')
+       )
+      WHERE active_rank > 1
+   );`;
+
+const WORKSTATION_ATTACH_JOBS_ACTIVE_UNIQUE_INDEX = `CREATE UNIQUE INDEX IF NOT EXISTS workstation_attach_jobs_active_owner_unique_idx
+    ON workstation_attach_jobs(notebook_id, owner_principal)
+    WHERE status IN ('pending', 'accepted', 'running')`;
+
 const SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS notebooks (
     id TEXT PRIMARY KEY,
@@ -151,7 +245,10 @@ const SCHEMA_STATEMENTS = [
     title TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    latest_revision_id TEXT
+    latest_revision_id TEXT,
+    cell_composition TEXT,
+    preview_cells TEXT,
+    language TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS notebook_revisions (
     id TEXT PRIMARY KEY,
@@ -160,9 +257,13 @@ const SCHEMA_STATEMENTS = [
     notebook_heads_hash TEXT NOT NULL,
     runtime_heads_hash TEXT,
     comms_heads_hash TEXT,
+    comments_heads_hash TEXT,
     snapshot_key TEXT NOT NULL,
     runtime_snapshot_key TEXT,
     comms_snapshot_key TEXT,
+    comments_snapshot_key TEXT,
+    cover_blob_hash TEXT,
+    cover_mime TEXT,
     actor_label TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     FOREIGN KEY (notebook_id) REFERENCES notebooks(id)
@@ -273,9 +374,12 @@ const SCHEMA_STATEMENTS = [
     status_message TEXT,
     default_environment_label TEXT,
     environment_policy TEXT,
+    installed_build TEXT,
+    channel TEXT,
     working_directory TEXT,
     cpu_count INTEGER,
     memory_bytes INTEGER,
+    accelerators_json TEXT,
     environments_json TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -295,6 +399,7 @@ const SCHEMA_STATEMENTS = [
     owner_principal TEXT NOT NULL,
     workstation_id TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'running', 'failed', 'completed', 'cancelled')),
+    trigger TEXT NOT NULL DEFAULT 'user_attach',
     requested_by_actor_label TEXT NOT NULL,
     requested_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -303,9 +408,9 @@ const SCHEMA_STATEMENTS = [
     error_message TEXT,
     FOREIGN KEY (notebook_id) REFERENCES notebooks(id)
   )`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS workstation_attach_jobs_active_unique_idx
-    ON workstation_attach_jobs(notebook_id, owner_principal, workstation_id)
-    WHERE status IN ('pending', 'accepted', 'running')`,
+  WORKSTATION_ATTACH_JOBS_DEDUPE_ACTIVE_OWNER,
+  WORKSTATION_ATTACH_JOBS_DROP_LEGACY_ACTIVE_UNIQUE_INDEX,
+  WORKSTATION_ATTACH_JOBS_ACTIVE_UNIQUE_INDEX,
   `CREATE INDEX IF NOT EXISTS workstation_attach_jobs_poll_idx
     ON workstation_attach_jobs(owner_principal, workstation_id, status, requested_at)`,
   `CREATE TABLE IF NOT EXISTS workstation_pairing_codes (
@@ -357,6 +462,61 @@ const SCHEMA_MIGRATIONS = [
     column: "comms_snapshot_key",
     statement: `ALTER TABLE notebook_revisions ADD COLUMN comms_snapshot_key TEXT`,
   },
+  {
+    table: "notebook_revisions",
+    column: "comments_heads_hash",
+    statement: `ALTER TABLE notebook_revisions ADD COLUMN comments_heads_hash TEXT`,
+  },
+  {
+    table: "notebook_revisions",
+    column: "comments_snapshot_key",
+    statement: `ALTER TABLE notebook_revisions ADD COLUMN comments_snapshot_key TEXT`,
+  },
+  {
+    table: "notebook_revisions",
+    column: "cover_blob_hash",
+    statement: `ALTER TABLE notebook_revisions ADD COLUMN cover_blob_hash TEXT`,
+  },
+  {
+    table: "notebook_revisions",
+    column: "cover_mime",
+    statement: `ALTER TABLE notebook_revisions ADD COLUMN cover_mime TEXT`,
+  },
+  {
+    table: "workstation_attach_jobs",
+    column: "trigger",
+    statement: `ALTER TABLE workstation_attach_jobs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'user_attach'`,
+  },
+  {
+    table: "workstations",
+    column: "installed_build",
+    statement: `ALTER TABLE workstations ADD COLUMN installed_build TEXT`,
+  },
+  {
+    table: "workstations",
+    column: "channel",
+    statement: `ALTER TABLE workstations ADD COLUMN channel TEXT`,
+  },
+  {
+    table: "workstations",
+    column: "accelerators_json",
+    statement: `ALTER TABLE workstations ADD COLUMN accelerators_json TEXT`,
+  },
+  {
+    table: "notebooks",
+    column: "cell_composition",
+    statement: `ALTER TABLE notebooks ADD COLUMN cell_composition TEXT`,
+  },
+  {
+    table: "notebooks",
+    column: "preview_cells",
+    statement: `ALTER TABLE notebooks ADD COLUMN preview_cells TEXT`,
+  },
+  {
+    table: "notebooks",
+    column: "language",
+    statement: `ALTER TABLE notebooks ADD COLUMN language TEXT`,
+  },
 ];
 
 // Prototype-local schema memo. The Worker binds every room to the same D1
@@ -383,6 +543,10 @@ export function blobKey(notebookId: string, hash: string): string {
   return `n/${encodePathComponent(notebookId)}/blobs/${encodePathComponent(hash)}`;
 }
 
+export function roomSummaryKey(notebookId: string): string {
+  return `n/${encodePathComponent(notebookId)}/room-summary.json`;
+}
+
 export async function ensureCatalogSchema(env: Env): Promise<void> {
   if (!env.DB) {
     return;
@@ -399,12 +563,14 @@ export async function ensureCatalogSchema(env: Env): Promise<void> {
 }
 
 async function initializeCatalogSchema(env: Env): Promise<void> {
-  await Promise.all(SCHEMA_STATEMENTS.map((statement) => env.DB!.prepare(statement).run()));
+  for (const statement of SCHEMA_STATEMENTS) {
+    await env.DB!.prepare(statement).run();
+  }
   await runCatalogMigrations(env);
   await backfillNotebookAcl(env);
 }
 
-async function runCatalogMigrations(env: Env): Promise<void> {
+export async function runCatalogMigrations(env: Env): Promise<void> {
   for (const migration of SCHEMA_MIGRATIONS) {
     if (await tableHasColumn(env, migration.table, migration.column)) {
       continue;
@@ -472,7 +638,15 @@ export async function getNotebookRow(env: Env, notebookId: string): Promise<Note
 
   await ensureCatalogSchema(env);
   return await env.DB.prepare(
-    `SELECT id, owner_principal, title, created_at, updated_at, latest_revision_id
+    `SELECT id,
+            owner_principal,
+            title,
+            created_at,
+            updated_at,
+            latest_revision_id,
+            cell_composition,
+            preview_cells,
+            language
        FROM notebooks
        WHERE id = ?`,
   )
@@ -495,7 +669,10 @@ export async function getPublicPublishedNotebookRow(
             n.title,
             n.created_at,
             n.updated_at,
-            n.latest_revision_id
+            n.latest_revision_id,
+            n.cell_composition,
+            n.preview_cells,
+            n.language
        FROM notebooks n
        JOIN notebook_acl a
          ON a.notebook_id = n.id
@@ -533,6 +710,95 @@ export async function updateNotebookTitle(
     return null;
   }
   return await getNotebookRow(env, notebookId);
+}
+
+export async function updateNotebookSnapshotSummary(
+  env: Env,
+  notebookId: string,
+  summary: {
+    cellComposition: {
+      code: number;
+      markdown: number;
+      raw: number;
+    };
+    language: string | null;
+    previewCells: Array<{ kind: "markdown" | "code"; text: string; execution_count?: number }>;
+  },
+): Promise<void> {
+  if (!env.DB) {
+    return;
+  }
+
+  await ensureCatalogSchema(env);
+  await env.DB.prepare(
+    `UPDATE notebooks
+        SET cell_composition = ?,
+            preview_cells = ?,
+            language = ?
+      WHERE id = ?`,
+  )
+    .bind(
+      JSON.stringify(summary.cellComposition),
+      JSON.stringify(summary.previewCells),
+      summary.language,
+      notebookId,
+    )
+    .run();
+}
+
+export async function updateNotebookRevisionCover(
+  env: Env,
+  revisionId: string,
+  cover: { blobHash: string; mime: string },
+): Promise<void> {
+  if (!env.DB) {
+    return;
+  }
+
+  await ensureCatalogSchema(env);
+  await env.DB.prepare(
+    `UPDATE notebook_revisions
+        SET cover_blob_hash = ?,
+            cover_mime = ?
+      WHERE id = ?`,
+  )
+    .bind(cover.blobHash, cover.mime, revisionId)
+    .run();
+}
+
+export async function getNotebookRevisionRow(
+  env: Env,
+  notebookId: string,
+  revisionId: string,
+): Promise<RevisionRow | null> {
+  if (!env.DB) {
+    return null;
+  }
+
+  await ensureCatalogSchema(env);
+  return await env.DB.prepare(
+    `SELECT id,
+            notebook_id,
+            runtime_state_doc_id,
+            notebook_heads_hash,
+            runtime_heads_hash,
+            comms_heads_hash,
+            comments_heads_hash,
+            snapshot_key,
+            runtime_snapshot_key,
+            comms_snapshot_key,
+            comments_snapshot_key,
+            cover_blob_hash,
+            cover_mime,
+            actor_label,
+            created_at
+       FROM notebook_revisions
+       WHERE notebook_id = ?
+         AND id = ?
+       LIMIT 1`,
+  )
+    .bind(notebookId, revisionId)
+    .first<RevisionRow>();
 }
 
 export async function getNotebookAclRowsForPrincipal(
@@ -575,12 +841,13 @@ export async function listNotebooksForPrincipal(
   env: Env,
   principal: string,
   limit: number,
-): Promise<ListedNotebookRow[]> {
+): Promise<ListedNotebookPage> {
   if (!env.DB) {
-    return [];
+    return { notebooks: [], totalCount: 0 };
   }
 
   await ensureCatalogSchema(env);
+  const visibility = notebookPrincipalVisibilityPredicate(principal);
   const rows = await env.DB.prepare(
     `SELECT n.id,
             n.owner_principal,
@@ -588,6 +855,11 @@ export async function listNotebooksForPrincipal(
             n.created_at,
             n.updated_at,
             n.latest_revision_id,
+            n.cell_composition,
+            n.preview_cells,
+            r.cover_blob_hash,
+            r.cover_mime,
+            n.language,
             CASE MAX(
               CASE a.scope
                 WHEN 'owner' THEN 4
@@ -605,7 +877,52 @@ export async function listNotebooksForPrincipal(
        FROM notebooks n
        JOIN notebook_acl a
          ON a.notebook_id = n.id
-      WHERE a.subject_kind = 'principal'
+       LEFT JOIN notebook_revisions r
+         ON r.id = n.latest_revision_id
+      WHERE ${visibility.sql}
+      GROUP BY n.id,
+               n.owner_principal,
+               n.title,
+               n.created_at,
+               n.updated_at,
+               n.latest_revision_id,
+               n.cell_composition,
+               n.preview_cells,
+               r.cover_blob_hash,
+               r.cover_mime,
+               n.language
+      ORDER BY n.updated_at DESC, n.created_at DESC, n.id DESC
+      LIMIT ?`,
+  )
+    .bind(...visibility.bindings, limit)
+    .all<ListedNotebookRow>();
+  const count = await env.DB.prepare(
+    `SELECT COUNT(*) AS total_count
+       FROM (
+         SELECT n.id
+           FROM notebooks n
+           JOIN notebook_acl a
+             ON a.notebook_id = n.id
+          WHERE ${visibility.sql}
+          GROUP BY n.id
+       ) visible_notebooks`,
+  )
+    .bind(...visibility.bindings)
+    .first<{ total_count: number }>();
+  const totalCount = Number(count?.total_count ?? rows.results?.length ?? 0);
+  return {
+    notebooks: rows.results ?? [],
+    totalCount: Number.isFinite(totalCount) ? totalCount : (rows.results ?? []).length,
+  };
+}
+
+function notebookPrincipalVisibilityPredicate(principal: string): {
+  bindings: [string, string];
+  sql: string;
+} {
+  return {
+    bindings: [principal, principal],
+    sql: `a.subject_kind = 'principal'
         AND (
           a.subject = ?
           OR a.subject IN (
@@ -613,19 +930,8 @@ export async function listNotebooksForPrincipal(
               FROM principal_account_links
              WHERE transport_principal = ?
           )
-        )
-      GROUP BY n.id,
-               n.owner_principal,
-               n.title,
-               n.created_at,
-               n.updated_at,
-               n.latest_revision_id
-      ORDER BY n.updated_at DESC, n.created_at DESC, n.id DESC
-      LIMIT ?`,
-  )
-    .bind(principal, principal, limit)
-    .all<ListedNotebookRow>();
-  return rows.results ?? [];
+        )`,
+  };
 }
 
 export async function getPublicNotebookAclRows(
@@ -750,14 +1056,17 @@ export async function registerWorkstation(
        status_message,
        default_environment_label,
        environment_policy,
+       installed_build,
+       channel,
        working_directory,
        cpu_count,
        memory_bytes,
+       accelerators_json,
        environments_json,
        created_at,
        updated_at,
        last_seen_at
-     ) VALUES (?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ) VALUES (?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(owner_principal, workstation_id) DO UPDATE SET
        display_name = excluded.display_name,
        provider = excluded.provider,
@@ -766,9 +1075,12 @@ export async function registerWorkstation(
        status_message = excluded.status_message,
        default_environment_label = excluded.default_environment_label,
        environment_policy = excluded.environment_policy,
+       installed_build = excluded.installed_build,
+       channel = excluded.channel,
        working_directory = excluded.working_directory,
        cpu_count = excluded.cpu_count,
        memory_bytes = excluded.memory_bytes,
+       accelerators_json = excluded.accelerators_json,
        environments_json = excluded.environments_json,
        updated_at = excluded.updated_at,
        last_seen_at = excluded.last_seen_at`,
@@ -782,9 +1094,12 @@ export async function registerWorkstation(
       input.statusMessage ?? null,
       input.defaultEnvironmentLabel ?? null,
       input.environmentPolicy ?? null,
+      input.installedBuild ?? null,
+      input.channel ?? null,
       input.workingDirectory ?? null,
       input.cpuCount ?? null,
       input.memoryBytes ?? null,
+      input.acceleratorsJson ?? null,
       input.environmentsJson ?? null,
       now,
       now,
@@ -814,9 +1129,12 @@ export async function getWorkstationRow(
             status_message,
             default_environment_label,
             environment_policy,
+            installed_build,
+            channel,
             working_directory,
             cpu_count,
             memory_bytes,
+            accelerators_json,
             environments_json,
             created_at,
             updated_at,
@@ -848,16 +1166,19 @@ export async function listWorkstationsForPrincipal(
             status_message,
             default_environment_label,
             environment_policy,
+            installed_build,
+            channel,
             working_directory,
             cpu_count,
             memory_bytes,
+            accelerators_json,
             environments_json,
             created_at,
             updated_at,
             last_seen_at
-       FROM workstations
+      FROM workstations
       WHERE owner_principal = ?
-      ORDER BY last_seen_at DESC, updated_at DESC, workstation_id`,
+      ORDER BY workstation_id`,
   )
     .bind(ownerPrincipal)
     .all<WorkstationRow>();
@@ -917,10 +1238,11 @@ export async function createWorkstationAttachJob(
     notebookId: string;
     ownerPrincipal: string;
     replaceActive?: boolean;
+    trigger?: WorkstationAttachJobTrigger;
     workstationId: string;
     actorLabel: string;
   },
-): Promise<WorkstationAttachJobRow | null> {
+): Promise<CreateWorkstationAttachJobResult | null> {
   if (!env.DB) {
     return null;
   }
@@ -929,49 +1251,106 @@ export async function createWorkstationAttachJob(
   const now = new Date();
   const nowIso = now.toISOString();
   const staleBefore = new Date(now.getTime() - WORKSTATION_ATTACH_JOB_STALE_MS).toISOString();
-  await expireStaleWorkstationAttachJobs(env, input, { now: nowIso, staleBefore });
-  if (input.replaceActive === true) {
-    await cancelActiveWorkstationAttachJobs(env, input, {
-      now: nowIso,
-      errorMessage: "replaced by a newer workstation attach request",
-    });
+  const pendingStaleBefore = new Date(
+    now.getTime() - WORKSTATION_ATTACH_PENDING_STALE_MS,
+  ).toISOString();
+  const trigger = input.trigger ?? "user_attach";
+  if (!isWorkstationAttachJobTrigger(trigger)) {
+    throw new Error(`invalid workstation attach job trigger: ${trigger}`);
   }
-  const existing = await getActiveWorkstationAttachJob(env, input, staleBefore);
+  await expireStaleWorkstationAttachJobs(
+    env,
+    { notebookId: input.notebookId, ownerPrincipal: input.ownerPrincipal },
+    {
+      now: nowIso,
+      pendingStaleBefore,
+      staleBefore,
+    },
+  );
+  let cancelledActiveJob: WorkstationAttachJobRow | null = null;
+  let activeJobToCancel: WorkstationAttachJobRow | null = null;
+
+  const existing = await getActiveWorkstationAttachJob(env, input, {
+    pendingStaleBefore,
+    staleBefore,
+  });
   if (existing) {
-    return existing;
+    if (input.replaceActive !== true && existing.workstation_id === input.workstationId) {
+      const job = await upgradeDedupedAttachJobTriggerToUserAttach(env, existing, trigger, nowIso);
+      return { job, cancelledActiveJob: null };
+    }
+    cancelledActiveJob = existing;
+    activeJobToCancel = existing;
   }
 
-  const jobId = crypto.randomUUID();
-  const insert = env.DB.prepare(
-    `INSERT INTO workstation_attach_jobs (
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const jobId = crypto.randomUUID();
+    const insert = env.DB.prepare(
+      `INSERT INTO workstation_attach_jobs (
        id,
        notebook_id,
        owner_principal,
        workstation_id,
        status,
+       trigger,
        requested_by_actor_label,
        requested_at,
        updated_at
-     ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
-  ).bind(
-    jobId,
-    input.notebookId,
-    input.ownerPrincipal,
-    input.workstationId,
-    input.actorLabel,
-    nowIso,
-    nowIso,
-  );
-  try {
-    await insert.run();
-  } catch (error) {
-    const racedExisting = await getActiveWorkstationAttachJob(env, input, staleBefore);
-    if (racedExisting) {
-      return racedExisting;
+     ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+    ).bind(
+      jobId,
+      input.notebookId,
+      input.ownerPrincipal,
+      input.workstationId,
+      trigger,
+      input.actorLabel,
+      nowIso,
+      nowIso,
+    );
+    try {
+      if (activeJobToCancel) {
+        await env.DB.batch([
+          cancelActiveWorkstationAttachJobsStatement(env, input, {
+            now: nowIso,
+            errorMessage: "replaced by a newer workstation attach request",
+          }),
+          insert,
+        ]);
+      } else {
+        await insert.run();
+      }
+      const job = await getWorkstationAttachJob(
+        env,
+        input.ownerPrincipal,
+        input.workstationId,
+        jobId,
+      );
+      if (!job) {
+        throw new Error("workstation attach job insert did not return a row");
+      }
+      return { job, cancelledActiveJob };
+    } catch (error) {
+      const racedExisting = await getActiveWorkstationAttachJob(env, input, {
+        pendingStaleBefore,
+        staleBefore,
+      });
+      if (!racedExisting || attempt > 0) {
+        throw error;
+      }
+      if (input.replaceActive !== true && racedExisting.workstation_id === input.workstationId) {
+        const job = await upgradeDedupedAttachJobTriggerToUserAttach(
+          env,
+          racedExisting,
+          trigger,
+          nowIso,
+        );
+        return { job, cancelledActiveJob };
+      }
+      cancelledActiveJob ??= racedExisting;
+      activeJobToCancel = racedExisting;
     }
-    throw error;
   }
-  return getWorkstationAttachJob(env, input.ownerPrincipal, input.workstationId, jobId);
+  throw new Error("workstation attach job was not created");
 }
 
 export async function listActiveWorkstationAttachJobs(
@@ -979,19 +1358,30 @@ export async function listActiveWorkstationAttachJobs(
   ownerPrincipal: string,
   workstationId: string,
   limit = 10,
-): Promise<WorkstationAttachJobRow[]> {
+): Promise<ListActiveWorkstationAttachJobsResult> {
   if (!env.DB) {
-    return [];
+    return { jobs: [], expiredPendingJobs: [] };
   }
 
   await ensureCatalogSchema(env);
-  const staleBefore = new Date(Date.now() - WORKSTATION_ATTACH_JOB_STALE_MS).toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const staleBefore = new Date(now.getTime() - WORKSTATION_ATTACH_JOB_STALE_MS).toISOString();
+  const pendingStaleBefore = new Date(
+    now.getTime() - WORKSTATION_ATTACH_PENDING_STALE_MS,
+  ).toISOString();
+  const expiredPendingJobs = await expireStaleWorkstationAttachJobs(
+    env,
+    { ownerPrincipal, workstationId },
+    { now: nowIso, pendingStaleBefore, staleBefore },
+  );
   const rows = await env.DB.prepare(
     `SELECT id,
             notebook_id,
             owner_principal,
             workstation_id,
             status,
+            trigger,
             requested_by_actor_label,
             requested_at,
             updated_at,
@@ -1002,15 +1392,18 @@ export async function listActiveWorkstationAttachJobs(
       WHERE owner_principal = ?
         AND workstation_id = ?
         AND (
-          status = 'pending'
+          (status = 'pending' AND requested_at >= ?)
           OR (status IN ('accepted', 'running') AND updated_at >= ?)
         )
       ORDER BY requested_at ASC
       LIMIT ?`,
   )
-    .bind(ownerPrincipal, workstationId, staleBefore, limit)
+    .bind(ownerPrincipal, workstationId, pendingStaleBefore, staleBefore, limit)
     .all<WorkstationAttachJobRow>();
-  return rows.results ?? [];
+  return {
+    jobs: rows.results ?? [],
+    expiredPendingJobs,
+  };
 }
 
 export async function updateWorkstationAttachJobStatus(
@@ -1045,7 +1438,13 @@ export async function updateWorkstationAttachJobStatus(
       WHERE id = ?
         AND owner_principal = ?
         AND workstation_id = ?
-        AND status IN ('pending', 'accepted', 'running')`,
+        AND status IN ('pending', 'accepted', 'running')
+        AND CASE status
+              WHEN 'pending' THEN 0
+              WHEN 'accepted' THEN 1
+              WHEN 'running' THEN 2
+              ELSE 3
+            END <= ?`,
   )
     .bind(
       input.status,
@@ -1058,9 +1457,67 @@ export async function updateWorkstationAttachJobStatus(
       input.jobId,
       input.ownerPrincipal,
       input.workstationId,
+      workstationAttachJobStatusRank(input.status),
     )
     .run();
   return getWorkstationAttachJob(env, input.ownerPrincipal, input.workstationId, input.jobId);
+}
+
+export async function failActiveWorkstationAttachJobsForWorkstation(
+  env: Env,
+  input: {
+    ownerPrincipal: string;
+    workstationId: string;
+    errorMessage: string;
+    now?: string;
+  },
+): Promise<WorkstationAttachJobRow[]> {
+  if (!env.DB) {
+    return [];
+  }
+
+  await ensureCatalogSchema(env);
+  const now = input.now ?? new Date().toISOString();
+  const failed = await env.DB.prepare(
+    `UPDATE workstation_attach_jobs
+        SET status = 'failed',
+            updated_at = ?,
+            finished_at = ?,
+            error_message = ?
+      WHERE owner_principal = ?
+        AND workstation_id = ?
+        AND status IN ('pending', 'accepted', 'running')
+      RETURNING id,
+                notebook_id,
+                owner_principal,
+                workstation_id,
+                status,
+                trigger,
+                requested_by_actor_label,
+                requested_at,
+                updated_at,
+                accepted_at,
+                finished_at,
+                error_message`,
+  )
+    .bind(now, now, input.errorMessage, input.ownerPrincipal, input.workstationId)
+    .all<WorkstationAttachJobRow>();
+  return failed.results ?? [];
+}
+
+function workstationAttachJobStatusRank(status: WorkstationAttachJobStatus): number {
+  switch (status) {
+    case "pending":
+      return 0;
+    case "accepted":
+      return 1;
+    case "running":
+      return 2;
+    case "failed":
+    case "completed":
+    case "cancelled":
+      return 3;
+  }
 }
 
 async function getActiveWorkstationAttachJob(
@@ -1068,9 +1525,14 @@ async function getActiveWorkstationAttachJob(
   input: {
     notebookId: string;
     ownerPrincipal: string;
-    workstationId: string;
   },
-  staleBefore: string,
+  {
+    pendingStaleBefore,
+    staleBefore,
+  }: {
+    pendingStaleBefore: string;
+    staleBefore: string;
+  },
 ): Promise<WorkstationAttachJobRow | null> {
   const row = await env
     .DB!.prepare(
@@ -1079,6 +1541,7 @@ async function getActiveWorkstationAttachJob(
             owner_principal,
             workstation_id,
             status,
+            trigger,
             requested_by_actor_label,
             requested_at,
             updated_at,
@@ -1088,34 +1551,62 @@ async function getActiveWorkstationAttachJob(
        FROM workstation_attach_jobs
       WHERE notebook_id = ?
         AND owner_principal = ?
-        AND workstation_id = ?
         AND (
-          status = 'pending'
+          (status = 'pending' AND requested_at >= ?)
           OR (status IN ('accepted', 'running') AND updated_at >= ?)
         )
       ORDER BY requested_at DESC
       LIMIT 1`,
     )
-    .bind(input.notebookId, input.ownerPrincipal, input.workstationId, staleBefore)
+    .bind(input.notebookId, input.ownerPrincipal, pendingStaleBefore, staleBefore)
     .first<WorkstationAttachJobRow>();
   return row;
+}
+
+async function upgradeDedupedAttachJobTriggerToUserAttach(
+  env: Env,
+  job: WorkstationAttachJobRow,
+  requestedTrigger: WorkstationAttachJobTrigger,
+  now: string,
+): Promise<WorkstationAttachJobRow> {
+  if (requestedTrigger !== "user_attach" || job.trigger === "user_attach") {
+    return job;
+  }
+  await env
+    .DB!.prepare(
+      `UPDATE workstation_attach_jobs
+          SET trigger = 'user_attach',
+              updated_at = ?
+        WHERE id = ?
+          AND owner_principal = ?
+          AND workstation_id = ?
+          AND trigger = 'resume'
+          AND status IN ('pending', 'accepted', 'running')`,
+    )
+    .bind(now, job.id, job.owner_principal, job.workstation_id)
+    .run();
+  return (
+    (await getWorkstationAttachJob(env, job.owner_principal, job.workstation_id, job.id)) ?? job
+  );
 }
 
 async function expireStaleWorkstationAttachJobs(
   env: Env,
   input: {
-    notebookId: string;
+    notebookId?: string;
     ownerPrincipal: string;
-    workstationId: string;
+    workstationId?: string;
   },
   {
     now,
+    pendingStaleBefore,
     staleBefore,
   }: {
     now: string;
+    pendingStaleBefore: string;
     staleBefore: string;
   },
-): Promise<void> {
+): Promise<WorkstationAttachJobRow[]> {
   await env
     .DB!.prepare(
       `UPDATE workstation_attach_jobs
@@ -1123,22 +1614,67 @@ async function expireStaleWorkstationAttachJobs(
               updated_at = ?,
               finished_at = ?,
               error_message = 'stale workstation attach job expired after heartbeat timeout'
-        WHERE notebook_id = ?
+        WHERE (? IS NULL OR notebook_id = ?)
           AND owner_principal = ?
-          AND workstation_id = ?
+          AND (? IS NULL OR workstation_id = ?)
           AND status IN ('accepted', 'running')
           AND updated_at < ?`,
     )
-    .bind(now, now, input.notebookId, input.ownerPrincipal, input.workstationId, staleBefore)
+    .bind(
+      now,
+      now,
+      input.notebookId ?? null,
+      input.notebookId ?? null,
+      input.ownerPrincipal,
+      input.workstationId ?? null,
+      input.workstationId ?? null,
+      staleBefore,
+    )
     .run();
+  const expiredPending = await env
+    .DB!.prepare(
+      `UPDATE workstation_attach_jobs
+          SET status = 'failed',
+              updated_at = ?,
+              finished_at = ?,
+              error_message = 'stale workstation attach job expired before host accepted the request'
+        WHERE (? IS NULL OR notebook_id = ?)
+          AND owner_principal = ?
+          AND (? IS NULL OR workstation_id = ?)
+          AND status = 'pending'
+          AND requested_at < ?
+        RETURNING id,
+                  notebook_id,
+                  owner_principal,
+                  workstation_id,
+                  status,
+                  trigger,
+                  requested_by_actor_label,
+                  requested_at,
+                  updated_at,
+                  accepted_at,
+                  finished_at,
+                  error_message`,
+    )
+    .bind(
+      now,
+      now,
+      input.notebookId ?? null,
+      input.notebookId ?? null,
+      input.ownerPrincipal,
+      input.workstationId ?? null,
+      input.workstationId ?? null,
+      pendingStaleBefore,
+    )
+    .all<WorkstationAttachJobRow>();
+  return expiredPending.results ?? [];
 }
 
-async function cancelActiveWorkstationAttachJobs(
+function cancelActiveWorkstationAttachJobsStatement(
   env: Env,
   input: {
     notebookId: string;
     ownerPrincipal: string;
-    workstationId: string;
   },
   {
     now,
@@ -1147,8 +1683,8 @@ async function cancelActiveWorkstationAttachJobs(
     now: string;
     errorMessage: string;
   },
-): Promise<void> {
-  await env
+): D1PreparedStatement {
+  return env
     .DB!.prepare(
       `UPDATE workstation_attach_jobs
           SET status = 'cancelled',
@@ -1157,11 +1693,9 @@ async function cancelActiveWorkstationAttachJobs(
               error_message = ?
         WHERE notebook_id = ?
           AND owner_principal = ?
-          AND workstation_id = ?
           AND status IN ('pending', 'accepted', 'running')`,
     )
-    .bind(now, now, errorMessage, input.notebookId, input.ownerPrincipal, input.workstationId)
-    .run();
+    .bind(now, now, errorMessage, input.notebookId, input.ownerPrincipal);
 }
 
 async function getWorkstationAttachJob(
@@ -1177,6 +1711,7 @@ async function getWorkstationAttachJob(
             owner_principal,
             workstation_id,
             status,
+            trigger,
             requested_by_actor_label,
             requested_at,
             updated_at,
@@ -1191,6 +1726,10 @@ async function getWorkstationAttachJob(
     .bind(jobId, ownerPrincipal, workstationId)
     .first<WorkstationAttachJobRow>();
   return row;
+}
+
+function isWorkstationAttachJobTrigger(value: string): value is WorkstationAttachJobTrigger {
+  return value === "user_attach" || value === "resume";
 }
 
 export interface CreateNotebookWithOwnerAclResult {
@@ -1453,9 +1992,11 @@ export async function recordRevision(
     notebookHeadsHash: string;
     runtimeHeadsHash: string | null;
     commsHeadsHash: string | null;
+    commentsHeadsHash?: string | null;
     snapshotKey: string;
     runtimeSnapshotKey: string | null;
     commsSnapshotKey: string | null;
+    commentsSnapshotKey?: string | null;
     actorLabel: string;
     publishPublic?: boolean;
   },
@@ -1476,11 +2017,13 @@ export async function recordRevision(
        notebook_heads_hash,
        runtime_heads_hash,
        comms_heads_hash,
+       comments_heads_hash,
        snapshot_key,
        runtime_snapshot_key,
        comms_snapshot_key,
+       comments_snapshot_key,
        actor_label
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       revisionId,
       revision.notebookId,
@@ -1488,9 +2031,11 @@ export async function recordRevision(
       revision.notebookHeadsHash,
       revision.runtimeHeadsHash,
       revision.commsHeadsHash,
+      revision.commentsHeadsHash ?? null,
       revision.snapshotKey,
       revision.runtimeSnapshotKey,
       revision.commsSnapshotKey,
+      revision.commentsSnapshotKey ?? null,
       revision.actorLabel,
     ),
     env.DB.prepare(
@@ -1555,7 +2100,15 @@ export async function getNotebookCatalog(
 
   await ensureCatalogSchema(env);
   const notebook = await env.DB.prepare(
-    `SELECT id, owner_principal, title, created_at, updated_at, latest_revision_id
+    `SELECT id,
+            owner_principal,
+            title,
+            created_at,
+            updated_at,
+            latest_revision_id,
+            cell_composition,
+            preview_cells,
+            language
        FROM notebooks
        WHERE id = ?`,
   )
@@ -1573,9 +2126,13 @@ export async function getNotebookCatalog(
             notebook_heads_hash,
             runtime_heads_hash,
             comms_heads_hash,
+            comments_heads_hash,
             snapshot_key,
             runtime_snapshot_key,
             comms_snapshot_key,
+            comments_snapshot_key,
+            cover_blob_hash,
+            cover_mime,
             actor_label,
             created_at
        FROM notebook_revisions

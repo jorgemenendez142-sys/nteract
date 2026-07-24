@@ -30,6 +30,12 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
+        pnpm_11 = pkgs.callPackage (nixpkgs + "/pkgs/development/tools/pnpm/generic.nix") {
+          nodejs = pkgs.nodejs_22;
+          version = "11.9.0";
+          hash = "sha256-gQJom+z/5gKXGxKgBos/4yHGyPXDnHx+yxhhYAgvAh0=";
+        };
+
         # Shared dependency lists
 
         tauriLibs = with pkgs; [
@@ -97,7 +103,7 @@
           src = filteredSrc;
           fetcherVersion = 2;
           # Update with: nix build .#pnpmDeps 2>&1 | grep 'got:'
-          hash = "sha256-go4sdKs4x+gVK6RJSh0ySO4Fy3pDsT/HdQmL3tyzqjQ=";
+          hash = "sha256-gQJom+z/5gKXGxKgBos/4yHGyPXDnHx+yxhhYAgvAh0=";
         };
 
         jsBuild = pkgs.stdenv.mkDerivation {
@@ -105,7 +111,7 @@
           inherit version;
           src = filteredSrc;
 
-          nativeBuildInputs = with pkgs; [ nodejs_20 pnpm_10 pnpmConfigHook ];
+          nativeBuildInputs = [ pkgs.nodejs_22 pnpm_11 pkgs.pnpmConfigHook ];
 
           inherit pnpmDeps;
           HOME = "$TMPDIR/build-home";
@@ -319,8 +325,8 @@ DESKTOP
             cargo-watch
             cargo-expand
 
-            nodejs_20
-            pnpm_10
+            nodejs_22
+            pnpm_11
 
             python3
             python3Packages.setuptools

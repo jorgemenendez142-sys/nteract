@@ -31,6 +31,7 @@ export interface NotebookQueueProjectionSnapshot {
 }
 
 const _executionMap: Map<string, ExecutionSnapshot> = new Map();
+const _runtimeOwnedExecutionIds = new Set<string>();
 
 /** Per-cell reverse index: cell_id -> latest execution_id. */
 const _cellToExecution: Map<string, string> = new Map();
@@ -43,6 +44,8 @@ let _notebookQueueProjection: NotebookQueueProjectionSnapshot = {
 const _subscribers = new Map<string, Set<() => void>>();
 const _cellExecutionSubscribers = new Map<string, Set<() => void>>();
 const _queueProjectionSubscribers = new Set<() => void>();
+let _executionStructureVersion = 0;
+const _executionStructureVersionSubscribers = new Set<() => void>();
 
 function emitExecutionChange(execution_id: string): void {
   const subs = _subscribers.get(execution_id);
@@ -74,6 +77,15 @@ function emitQueueProjectionChange(): void {
   }
 }
 
+function emitExecutionStructureChange(): void {
+  _executionStructureVersion = (_executionStructureVersion + 1) | 0;
+  for (const cb of _executionStructureVersionSubscribers) {
+    try {
+      cb();
+    } catch {}
+  }
+}
+
 function snapshotsEqual(a: ExecutionSnapshot, b: ExecutionSnapshot): boolean {
   if (a === b) return true;
   if (
@@ -89,6 +101,12 @@ function snapshotsEqual(a: ExecutionSnapshot, b: ExecutionSnapshot): boolean {
     if (a.output_ids[i] !== b.output_ids[i]) return false;
   }
   return true;
+}
+
+function executionStructureEqual(a: ExecutionSnapshot | undefined, b: ExecutionSnapshot): boolean {
+  if (!a) return false;
+  if (a.execution_count !== b.execution_count) return false;
+  return stringArraysEqual(a.output_ids, b.output_ids);
 }
 
 // ── Hooks ───────────────────────────────────────────────────────────────
@@ -116,6 +134,18 @@ export function useCellExecutionId(cell_id: string): string | null {
 
 export function useNotebookQueueProjection(): NotebookQueueProjectionSnapshot {
   return useSyncExternalStore(subscribeNotebookQueueProjection, getNotebookQueueProjection);
+}
+
+/**
+ * Subscribe to execution facts that cross-cell derived views consume:
+ * execution counts, cell execution pointers, and output-id membership.
+ * Status-only changes stay on the per-execution path.
+ */
+export function useExecutionStructureVersion(): number {
+  return useSyncExternalStore(
+    subscribeExecutionStructureVersion,
+    getExecutionStructureVersionSnapshot,
+  );
 }
 
 // ── Subscription helpers ────────────────────────────────────────────────
@@ -171,6 +201,17 @@ export function getNotebookQueueProjection(): NotebookQueueProjectionSnapshot {
   return _notebookQueueProjection;
 }
 
+function subscribeExecutionStructureVersion(callback: () => void): () => void {
+  _executionStructureVersionSubscribers.add(callback);
+  return () => {
+    _executionStructureVersionSubscribers.delete(callback);
+  };
+}
+
+function getExecutionStructureVersionSnapshot(): number {
+  return _executionStructureVersion;
+}
+
 // ── Write operations ────────────────────────────────────────────────────
 
 /**
@@ -187,6 +228,26 @@ export function setExecution(execution_id: string, snap: ExecutionSnapshot): voi
   if (prev && snapshotsEqual(prev, snap)) return;
   _executionMap.set(execution_id, snap);
   emitExecutionChange(execution_id);
+  if (!executionStructureEqual(prev, snap)) {
+    emitExecutionStructureChange();
+  }
+}
+
+/**
+ * Mark execution snapshots whose authoritative source is RuntimeStateDoc.
+ *
+ * Projection placeholders can seed the same execution id before runtime sync
+ * catches up. Runtime upserts call this even when the snapshot is unchanged so
+ * projector cleanup can release ownership without deleting the runtime record.
+ */
+export function markExecutionsRuntimeOwned(execution_ids: Iterable<string>): void {
+  for (const execution_id of execution_ids) {
+    _runtimeOwnedExecutionIds.add(execution_id);
+  }
+}
+
+export function isExecutionRuntimeOwned(execution_id: string): boolean {
+  return _runtimeOwnedExecutionIds.has(execution_id);
 }
 
 /**
@@ -207,6 +268,7 @@ export function setCellExecutionPointer(cell_id: string, execution_id: string | 
     _executionToCell.set(execution_id, cell_id);
   }
   emitCellExecutionPointerChange(cell_id);
+  emitExecutionStructureChange();
 }
 
 export function setNotebookQueueProjection(projection: NotebookQueueProjectionSnapshot): void {
@@ -233,7 +295,9 @@ export function setNotebookQueueProjection(projection: NotebookQueueProjectionSn
  */
 export function deleteExecutions(execution_ids: Iterable<string>): void {
   for (const eid of execution_ids) {
-    if (!_executionMap.delete(eid)) continue;
+    const existed = _executionMap.delete(eid);
+    _runtimeOwnedExecutionIds.delete(eid);
+    if (!existed) continue;
     emitExecutionChange(eid);
     const cellId = _executionToCell.get(eid);
     _executionToCell.delete(eid);
@@ -241,6 +305,7 @@ export function deleteExecutions(execution_ids: Iterable<string>): void {
       _cellToExecution.delete(cellId);
       emitCellExecutionPointerChange(cellId);
     }
+    emitExecutionStructureChange();
   }
 }
 
@@ -264,6 +329,7 @@ export function resetNotebookExecutions(): void {
   const eids = [..._executionMap.keys()];
   const cells = [..._cellToExecution.keys()];
   _executionMap.clear();
+  _runtimeOwnedExecutionIds.clear();
   _cellToExecution.clear();
   _executionToCell.clear();
   _notebookQueueProjection = {
@@ -273,6 +339,9 @@ export function resetNotebookExecutions(): void {
   for (const eid of eids) emitExecutionChange(eid);
   for (const cid of cells) emitCellExecutionPointerChange(cid);
   emitQueueProjectionChange();
+  if (eids.length > 0 || cells.length > 0) {
+    emitExecutionStructureChange();
+  }
 }
 
 function stringArraysEqual(a: readonly string[], b: readonly string[]): boolean {

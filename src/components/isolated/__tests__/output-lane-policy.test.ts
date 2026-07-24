@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { JupyterOutput } from "@/components/cell/jupyter-output";
 import {
+  BOKEHJS_EXEC_MIME_TYPE,
+  BOKEHJS_LOAD_MIME_TYPE,
+  NTERACT_BOKEH_SESSION_MIME_TYPE,
+} from "@/components/outputs/bokeh-mime";
+import { PANEL_EXEC_MIME_TYPE, PANEL_LOAD_MIME_TYPE } from "@/components/outputs/panel-mime";
+import {
   MARKDOWN_PROJECTION_MIME_TYPE,
   setMarkdownProjectionProjector,
 } from "@/lib/markdown-projection";
@@ -9,6 +15,8 @@ import {
   hasWidgetOutputs,
   outputAllowsScrollPassthrough,
   outputSegmentLane,
+  outputUsesBokeh,
+  outputUsesPanel,
   outputUsesPlotly,
   outputUsesSift,
   outputUsesVega,
@@ -180,6 +188,133 @@ describe("output lane policy", () => {
     expect(outputSegmentLane(output)).toBe("vega-frame");
   });
 
+  it("keeps Bokeh's HTML and JavaScript display outputs in one document lane", () => {
+    const outputs = [
+      displayOutput("bokeh-loading-html", {
+        "text/html": '<span id="bokeh-loading">Loading BokehJS ...</span>',
+      }),
+      displayOutput("bokeh-load-js", {
+        "application/javascript": 'document.getElementById("bokeh-loading").textContent = "ok";',
+        [BOKEHJS_LOAD_MIME_TYPE]: "",
+      }),
+      displayOutput("bokeh-root-html", {
+        "text/html": '<div id="bokeh-root"></div>',
+      }),
+      displayOutput("bokeh-exec-js", {
+        "application/javascript": 'document.getElementById("bokeh-root").textContent = "plot";',
+        [BOKEHJS_EXEC_MIME_TYPE]: "",
+      }),
+    ];
+
+    const segments = splitOutputSegments(outputs);
+
+    expect(outputs.map((output) => selectedOutputMimeType(output))).toEqual([
+      "text/html",
+      BOKEHJS_LOAD_MIME_TYPE,
+      "text/html",
+      BOKEHJS_EXEC_MIME_TYPE,
+    ]);
+    expect(outputUsesBokeh(outputs[1])).toBe(true);
+    expect(outputUsesBokeh(outputs[3])).toBe(true);
+    expect(outputUsesWheelOwningFrame(outputs[3])).toBe(true);
+    expect(outputs.map((output) => outputAllowsScrollPassthrough(output))).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
+    expect(segments.map((segment) => segment.lane)).toEqual(["static-frame"]);
+    expect(segments[0].outputs.map((output) => output.output_id)).toEqual([
+      "bokeh-loading-html",
+      "bokeh-load-js",
+      "bokeh-root-html",
+      "bokeh-exec-js",
+    ]);
+  });
+
+  it("keeps show(p) root HTML and Bokeh exec output in one document lane", () => {
+    const outputs = [
+      displayOutput("bokeh-root-html", {
+        "text/html": '<div id="bokeh-root"></div>',
+      }),
+      displayOutput("bokeh-exec-js", {
+        "application/javascript": 'document.getElementById("bokeh-root").textContent = "plot";',
+        [BOKEHJS_EXEC_MIME_TYPE]: "",
+      }),
+    ];
+
+    const segments = splitOutputSegments(outputs);
+
+    expect(segments.map((segment) => segment.lane)).toEqual(["static-frame"]);
+    expect(segments[0].outputs.map((output) => output.output_id)).toEqual([
+      "bokeh-root-html",
+      "bokeh-exec-js",
+    ]);
+  });
+
+  it("routes native Bokeh sessions through a click-to-engage document frame", () => {
+    const output = displayOutput("bokeh-session", {
+      [NTERACT_BOKEH_SESSION_MIME_TYPE]: { schema_version: 1 },
+      "text/plain": "fallback",
+    });
+
+    expect(selectedOutputMimeType(output)).toBe(NTERACT_BOKEH_SESSION_MIME_TYPE);
+    expect(outputUsesBokeh(output)).toBe(true);
+    expect(outputUsesWheelOwningFrame(output)).toBe(true);
+    expect(outputAllowsScrollPassthrough(output)).toBe(true);
+    expect(outputSegmentLane(output)).toBe("static-frame");
+  });
+
+  it("keeps Panel's HTML and JavaScript display outputs in one document lane", () => {
+    const outputs = [
+      displayOutput("panel-loading-html", {
+        "text/html": '<span id="panel-loading">Loading Panel ...</span>',
+      }),
+      displayOutput("panel-load-js", {
+        "application/javascript": 'document.getElementById("panel-loading").textContent = "ok";',
+        [PANEL_LOAD_MIME_TYPE]: "",
+      }),
+      displayOutput("panel-empty-placeholder", {}),
+      displayOutput("panel-root-html", {
+        "text/html": '<div id="panel-root"></div>',
+      }),
+      displayOutput("panel-exec-html", {
+        "text/html": '<div id="panel-widget"></div><script>window.__panelHtmlRan = true;</script>',
+        "application/javascript": 'document.getElementById("panel-root").textContent = "widget";',
+        [PANEL_EXEC_MIME_TYPE]: "",
+      }),
+    ];
+
+    const segments = splitOutputSegments(outputs);
+
+    expect(outputs.map((output) => selectedOutputMimeType(output))).toEqual([
+      "text/html",
+      PANEL_LOAD_MIME_TYPE,
+      null,
+      "text/html",
+      PANEL_EXEC_MIME_TYPE,
+    ]);
+    expect(outputUsesPanel(outputs[1])).toBe(true);
+    expect(outputUsesPanel(outputs[4])).toBe(true);
+    expect(hasWidgetOutputs(outputs)).toBe(false);
+    expect(outputUsesWheelOwningFrame(outputs[4])).toBe(true);
+    expect(outputs.map((output) => outputAllowsScrollPassthrough(output))).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+    ]);
+    expect(segments.map((segment) => segment.lane)).toEqual(["static-frame"]);
+    expect(segments[0].outputs.map((output) => output.output_id)).toEqual([
+      "panel-loading-html",
+      "panel-load-js",
+      "panel-empty-placeholder",
+      "panel-root-html",
+      "panel-exec-html",
+    ]);
+  });
+
   it("keeps pan/zoom charts standalone instead of coalescing with sibling document outputs", () => {
     withMarkdownProjection("isolated");
     const markdown = displayOutput("markdown-1", { "text/markdown": "# heading" });
@@ -220,13 +355,13 @@ describe("output lane policy", () => {
     expect(anyOutputNeedsIsolation(outputs)).toBe(false);
   });
 
-  it("does not mark display outputs without a selected MIME as scroll passthrough", () => {
+  it("treats display outputs without a selected MIME as transparent", () => {
     const output = displayOutput("empty-display", {
       "text/plain": null,
     });
 
     expect(selectedOutputMimeType(output)).toBeNull();
-    expect(outputAllowsScrollPassthrough(output)).toBe(false);
+    expect(outputAllowsScrollPassthrough(output)).toBe(true);
     expect(outputSegmentLane(output)).toBe("dom");
   });
 

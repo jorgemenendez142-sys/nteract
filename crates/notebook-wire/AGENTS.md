@@ -9,7 +9,7 @@ Scope: `crates/notebook-wire/`, `crates/notebook-doc/`, `crates/notebook-protoco
 - `notebook-wire` — frame bytes, preamble constants, frame caps, typed-frame enum, session-control status shapes.
 - `notebook-protocol` — handshakes and JSON wire types: `NotebookRequest`, `NotebookResponse`, `NotebookBroadcast`, runtime-agent envelopes.
 - `notebook-doc` — `NotebookDoc` Automerge schema. `SCHEMA_VERSION` bumps only with a migration that preserves real user data.
-- `runtime-doc` — `RuntimeStateDoc` and `CommsDoc` schemas. RuntimeStateDoc is daemon/runtime-agent authored for kernel lifecycle, queue, outputs, env, trust, project, path, save state, and comm topology. CommsDoc carries mutable widget state written by the daemon/runtime agent and the approved frontend comm CRDT writer.
+- `runtime-doc` — `RuntimeStateDoc` and `CommsDoc` schemas. RuntimeStateDoc is read-only to regular clients; the local daemon / room host own coordinator facts, and runtime peers may write policy-allowed lifecycle, progress, output, and comm topology for accepted work. CommsDoc carries mutable widget state written by editor/owner clients and runtime peers.
 
 ## Versioning
 
@@ -37,7 +37,7 @@ The frontend talks to the Tauri relay through `invoke()` calls, a generation-sco
    { "channel": "notebook_sync", "notebook_id": "/path/to/notebook.ipynb", "protocol": "v4" }
    ```
 
-   `Handshake` uses `#[serde(tag = "channel", rename_all = "snake_case")]`, so the wire form is flat. Optional fields (`working_dir`, `initial_metadata`) omit when `None`. Other variants: `Pool`, `SettingsSync`, `OpenNotebook { path }`, `CreateNotebook { runtime, … }`, `RuntimeAgent { … }`. `OpenNotebook` / `CreateNotebook` are the desktop paths; `NotebookSync` is used by programmatic clients (Python bindings). Blob uploads ride the `NotebookSync` channel as `PUT_BLOB` (`0x08`) frames; the localhost blob HTTP port is a separate server on a different socket, not a handshake channel.
+   `Handshake` uses `#[serde(tag = "channel", rename_all = "snake_case")]`, so the wire form is flat. Optional fields (`working_dir`, `initial_metadata`) omit when `None`. Other variants: `Pool`, `SettingsSync`, `OpenNotebook { path }`, `CreateNotebook { runtime, … }`, `OpenHostedNotebook { url, … }`, `RuntimeAgent { … }`. `OpenNotebook` / `CreateNotebook` are the desktop paths; `NotebookSync` is used by programmatic clients (Python bindings); `OpenHostedNotebook` is used by daemon-mediated hosted cloud notebook bridges. Blob uploads ride the `NotebookSync` channel as `PUT_BLOB` (`0x08`) frames; the localhost blob HTTP port is a separate server on a different socket, not a handshake channel.
 
    The daemon responds with `NotebookConnectionInfo`:
 
@@ -61,6 +61,7 @@ The runtimed socket is **same-UID trusted**, not app-private. Unix permissions p
 | `NotebookSync` | Peer access to a notebook room and its runtime-state sync |
 | `OpenNotebook` | Load or create a file-backed notebook from a path |
 | `CreateNotebook` | Create an untitled or ephemeral notebook room |
+| `OpenHostedNotebook` | Daemon-mediated bridge to a hosted cloud notebook room; delegates authority to the cloud room host |
 | `RuntimeAgent` | Attach a runtime-agent peer to a notebook room |
 
 A new handshake variant inherits this model. For tighter authority on a channel, design an explicit capability or guard instead of assuming "only the desktop app can reach it."
@@ -99,12 +100,14 @@ After the handshake, frames carry a leading type byte:
 | `0x07` | SessionControl | JSON (`SessionControlMessage`, daemon-originated readiness/status) |
 | `0x08` | PutBlob | Framed binary blob upload (`PutBlobHeader` + bytes) |
 | `0x09` | CommsDocSync | Binary (per-notebook `CommsDoc` Automerge sync) |
+| `0x0a` | CommentsDocSync | Binary (per-notebook `CommentsDoc` Automerge sync) |
 
 | Sender | Valid types |
 |--------|-------------|
-| Frontend / Tauri relay | `0x00`, `0x01`, `0x04`, `0x05`, `0x06`, `0x08`, `0x09` |
-| Daemon notebook peer | `0x00`, `0x02`, `0x03`, `0x04`, `0x05`, `0x06`, `0x07`, `0x09` |
+| Frontend / Tauri relay | `0x00`, `0x01`, `0x04`, `0x05`, `0x06`, `0x08`, `0x09`, `0x0a` |
+| Daemon notebook peer | `0x00`, `0x02`, `0x03`, `0x04`, `0x05`, `0x06`, `0x07`, `0x09`, `0x0a` |
 | Runtime agent peer | `0x00`, `0x01` (RuntimeAgentRequest/Envelope), `0x02` (RuntimeAgentResponse/Envelope), `0x05`, `0x09` |
+| Cloud viewer bridge | `0x00`, `0x04`, `0x05`, `0x09`, `0x0a` |
 
 `NotebookRequest` / `NotebookResponse` payloads travel in flattened `NotebookRequestEnvelope` / `NotebookResponseEnvelope`. Concurrent requests carry an `id`; clients route responses by id because broadcasts, state sync, and out-of-order responses interleave freely.
 
@@ -249,7 +252,7 @@ Kernel produces output
 | `daemon:ready` event | Relay → Frontend | `DaemonReadyPayload` | Connection established, ready to bootstrap |
 | `daemon:disconnected` event | Relay → Frontend | — | Connection lost |
 
-Outgoing frames use `sendFrame(frameType, payload)` where `payload` is `Uint8Array` via `tauri::ipc::Request`. Relay accepts frontend-originated `0x00`, `0x01`, `0x04`, `0x05`, `0x06`; `0x02`, `0x03`, `0x07` are daemon-originated.
+Outgoing frames use `sendFrame(frameType, payload)` where `payload` is `Uint8Array` via `tauri::ipc::Request`. Relay accepts frontend-originated `0x00`, `0x01`, `0x04`, `0x05`, `0x06`, `0x08`, `0x09`, `0x0a`; `0x02`, `0x03`, `0x07` are daemon-originated.
 
 ### In-memory frame bus
 
@@ -289,11 +292,15 @@ Stream outputs (stdout/stderr) are special: text is fed through a terminal emula
 
 ### RuntimeStateDoc
 
-State-carrying broadcasts (kernel status, env sync diff, queue) were replaced because they suffered from silent drops, no initial state for late joiners, and ordering races between windows. `RuntimeStateDoc` is a daemon-authoritative per-notebook Automerge document synced via frame `0x05` on the existing notebook connection.
+State-carrying broadcasts (kernel status, env sync diff, queue) were replaced because they suffered from silent drops, no initial state for late joiners, and ordering races between windows. `RuntimeStateDoc` is a runtime-authoritative per-notebook Automerge document synced via frame `0x05` on the existing notebook connection.
 
-The daemon writes kernel status, execution queue, environment progress, project context, trust state, path/save state, outputs, and comm topology. Clients receive those fields via normal Automerge sync, with unexpected client changes stripped. Mutable widget comm state lives in CommsDoc so RuntimeStateDoc remains daemon-owned. The frontend reads runtime state via `useRuntimeState()` and the project runtime stores.
-
-**Key files:** `crates/runtime-doc/src/doc.rs` (schema + setters), `crates/runtime-doc/src/handle.rs` (handle), `apps/notebook/src/lib/runtime-state.ts` (frontend store + hook).
+Regular clients receive RuntimeStateDoc fields via normal Automerge sync, with
+unexpected client changes stripped. The local daemon and hosted room host own
+environment, trust, project, path/save, workstation, and schema/root facts.
+Runtime peers may write policy-allowed kernel lifecycle, queue/progress,
+outputs, and comm topology for accepted work. Mutable widget comm state lives in
+CommsDoc. The frontend reads runtime state via `useRuntimeState()` and the
+project runtime stores.
 
 ### Widget comm state
 
@@ -322,30 +329,3 @@ Because the daemon socket is same-UID trusted, treat the runtime-agent handshake
 - Runtime state, outputs, queue, kernel lifecycle, trust, env drift, env progress snapshots, path, save state, and widget topology belong in `RuntimeStateDoc`; widget values belong in `CommsDoc`. Broadcasts are for ephemeral comm messages and high-frequency env progress events.
 - Steady-state frame readers must keep draining. Register waiters/pending requests instead of blocking inside command paths.
 - The runtimed socket is same-UID trusted, not app-private. New handshake variants must account for any same-user process holding the socket path.
-
-## Key source files
-
-| File | Role |
-|------|------|
-| `crates/notebook-wire/src/lib.rs` | Wire constants, preamble bytes, frame caps, typed-frame enum, session-control status |
-| `crates/notebook-protocol/src/connection.rs` | Public connection API facade and compatibility re-exports |
-| `crates/notebook-protocol/src/connection/framing.rs` | Preamble validation and length-prefixed typed-frame send/receive |
-| `crates/notebook-protocol/src/connection/handshake.rs` | Protocol version, handshake, capabilities, connection info |
-| `crates/notebook-protocol/src/connection/env.rs` | Launch spec, package manager, environment source wire types |
-| `crates/notebook-protocol/src/protocol.rs` | Canonical wire types: `NotebookRequest`, `NotebookResponse`, `NotebookBroadcast` |
-| `packages/runtimed/src/request-types.ts` | Generated TS request/response protocol unions |
-| `packages/runtimed/src/protocol-contract.ts` | Generated TS discriminant lists for drift tests |
-| `packages/runtimed/src/transport.ts` | TS `FrameType` constants and transport boundary |
-| `crates/runtimed-client/src/protocol.rs` | Daemon-internal `Request` / `Response`, re-exports from `notebook-protocol` |
-| `crates/notebook-sync/src/{relay,connect,handle}.rs` | Relay handle, connection setup, `DocHandle` |
-| `crates/runtimed/src/notebook_sync_server/` | Notebook sync server: catalog, room, peer connection/loop/session, writer, metadata |
-| `crates/runtimed/src/requests/` | Notebook request routing handlers |
-| `crates/runtimed/src/output_prep.rs` | IOPub → nbformat conversion, widget buffers, blob offload |
-| `crates/runtimed/src/runtime_agent.rs` | Runtime-agent peer loop, kernel lifecycle, comm-state diff forwarding, RuntimeStateDoc writes |
-| `crates/runtimed/src/{output_store,blob_store}.rs` | Output manifest creation + blob inlining threshold; content-addressed blob storage |
-| `crates/runtimed-wasm/src/lib.rs` | WASM bindings: cell mutations, sync, per-cell accessors, `CellChangeset` |
-| `crates/notebook-doc/src/{lib,diff}.rs` | `NotebookDoc` schema + per-cell accessors; `CellChangeset` structural diff |
-| `crates/runtime-doc/src/doc.rs` | `RuntimeStateDoc` schema — daemon-authoritative per-notebook state |
-| `apps/notebook/src/lib/{frame-pipeline,notebook-frame-bus,runtime-state,materialize-cells,notebook-cells}.ts` | App-side frame processing, in-memory bus, runtime store, materialization, split cell store |
-| `apps/notebook/src/hooks/{useAutomergeNotebook,useDaemonKernel}.ts` | WASM handle owner + kernel execution/broadcast handling |
-| `crates/notebook/src/lib.rs` | Tauri commands and relay tasks (transparent byte pipe) |

@@ -1,20 +1,25 @@
 import { before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { initializeRuntimedWasm, RuntimeStatePeerHandle } from "../src/runtimed-wasm.ts";
-import { materializeSnapshotPairRender } from "../src/snapshot-render.ts";
+import { RuntimeStatePeerHandle } from "../src/runtimed-wasm.ts";
+import {
+  countCellComposition,
+  deriveNotebookPreviewCells,
+  detectRuntimeFromMetadata,
+  materializeSnapshotPairRender,
+  selectNotebookCoverFromCells,
+  SNAPSHOT_PREVIEW_TEXT_MAX_LENGTH,
+} from "../src/snapshot-render.ts";
 import {
   createNotebookCloudBlobResolver,
   notebookCloudBlobBasePath,
 } from "../src/blob-resolver.ts";
+import { initializeTestRuntimedWasm } from "./runtimed-wasm-test-loader.ts";
 
-const wasmBytes = await readFile(
-  new URL("../../notebook/src/wasm/runtimed-wasm/runtimed_wasm_bg.wasm", import.meta.url),
-);
 const ARROW_STREAM_MANIFEST_MIME = "application/vnd.nteract.arrow-stream-manifest+json";
 
 before(async () => {
-  await initializeRuntimedWasm(wasmBytes);
+  await initializeTestRuntimedWasm();
 });
 
 describe("snapshot pair render materialization", () => {
@@ -301,3 +306,186 @@ describe("snapshot pair render materialization", () => {
 async function readJson(url: URL): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(url, "utf8")) as Record<string, unknown>;
 }
+
+describe("snapshot summary derivation helpers", () => {
+  it("selects the last image output across cells", () => {
+    assert.deepEqual(
+      selectNotebookCoverFromCells([
+        {
+          outputs: [
+            {
+              data: {
+                "image/png": { blob: "first-png" },
+              },
+            },
+          ],
+        },
+        {
+          outputs: [
+            {
+              data: {
+                "image/svg+xml": { blob: "last-svg" },
+              },
+            },
+          ],
+        },
+      ]),
+      { blobHash: "last-svg", mime: "image/svg+xml" },
+    );
+  });
+
+  it("uses raster MIME priority only within one output's alternates", () => {
+    assert.deepEqual(
+      selectNotebookCoverFromCells([
+        {
+          outputs: [
+            {
+              data: {
+                "image/jpeg": { blob: "plot-jpeg" },
+                "image/png": { blob: "plot-png" },
+                "image/svg+xml": { blob: "plot-svg" },
+              },
+            },
+          ],
+        },
+      ]),
+      { blobHash: "plot-png", mime: "image/png" },
+    );
+    assert.deepEqual(
+      selectNotebookCoverFromCells([
+        {
+          outputs: [
+            {
+              data: {
+                "image/png": { blob: "earlier-png" },
+              },
+            },
+            {
+              data: {
+                "image/jpeg": { blob: "later-jpeg" },
+              },
+            },
+          ],
+        },
+      ]),
+      { blobHash: "later-jpeg", mime: "image/jpeg" },
+    );
+  });
+
+  it("ignores non-image and malformed output manifests", () => {
+    assert.equal(
+      selectNotebookCoverFromCells([
+        { outputs: [{ data: { "text/html": { blob: "html-blob" } } }] },
+        { outputs: [{ data: { "image/png": { inline: "not-addressable" } } }] },
+        { outputs: [{ data: { "image/jpeg": "base64" } }] },
+        { outputs: [{ data: { "image/svg+xml": { hash: "" } } }] },
+        null,
+      ]),
+      null,
+    );
+  });
+
+  it("accepts hash-backed ContentRefs for image alternates", () => {
+    assert.deepEqual(
+      selectNotebookCoverFromCells([
+        { outputs: [{ data: { "image/jpeg": { hash: "jpeg-hash" } } }] },
+      ]),
+      { blobHash: "jpeg-hash", mime: "image/jpeg" },
+    );
+  });
+
+  it("counts only code/markdown/raw cell types and ignores unknowns", () => {
+    assert.deepEqual(
+      countCellComposition([
+        { cell_type: "code" },
+        { cell_type: "code" },
+        { cell_type: "markdown" },
+        { cell_type: "raw" },
+        { cell_type: "sql" },
+        { cell_type: 42 },
+        {},
+        null,
+      ]),
+      { code: 2, markdown: 1, raw: 1 },
+    );
+  });
+
+  it("returns zero composition for non-array cell payloads", () => {
+    assert.deepEqual(countCellComposition(null), { code: 0, markdown: 0, raw: 0 });
+    assert.deepEqual(countCellComposition("cells"), { code: 0, markdown: 0, raw: 0 });
+    assert.deepEqual(countCellComposition({ cells: [] }), { code: 0, markdown: 0, raw: 0 });
+  });
+
+  it("derives markdown from the first markdown cell and code from the last code cell", () => {
+    assert.deepEqual(
+      deriveNotebookPreviewCells([
+        { cell_type: "code", source: "first_code()", execution_count: "3" },
+        { cell_type: "markdown", source: "\n# First heading\nBody" },
+        { cell_type: "markdown", source: "# Second heading" },
+        {
+          cell_type: "code",
+          source: "import pandas as pd\nresult = fit(df)\nresult.head()\n",
+          execution_count: "12",
+        },
+      ]),
+      [
+        { kind: "markdown", text: "# First heading" },
+        { kind: "code", text: "result.head()", execution_count: 12 },
+      ],
+    );
+  });
+
+  it("truncates preview text at 140 characters", () => {
+    const longMarkdown = `# ${"m".repeat(SNAPSHOT_PREVIEW_TEXT_MAX_LENGTH + 20)}`;
+    const longCode = `print('${"c".repeat(SNAPSHOT_PREVIEW_TEXT_MAX_LENGTH + 20)}')`;
+
+    const preview = deriveNotebookPreviewCells([
+      { cell_type: "markdown", source: longMarkdown },
+      { cell_type: "code", source: longCode },
+    ]);
+
+    assert.equal(preview[0]?.text.length, SNAPSHOT_PREVIEW_TEXT_MAX_LENGTH);
+    assert.equal(preview[0]?.text, longMarkdown.slice(0, SNAPSHOT_PREVIEW_TEXT_MAX_LENGTH));
+    assert.equal(preview[1]?.text.length, SNAPSHOT_PREVIEW_TEXT_MAX_LENGTH);
+    assert.equal(preview[1]?.text, longCode.slice(0, SNAPSHOT_PREVIEW_TEXT_MAX_LENGTH));
+  });
+
+  it("omits execution counts that are not positive integer strings", () => {
+    assert.deepEqual(
+      deriveNotebookPreviewCells([
+        { cell_type: "code", source: "zero()", execution_count: "0" },
+        { cell_type: "code", source: "legacy()", execution_count: "7-ish" },
+      ]),
+      [{ kind: "code", text: "legacy()" }],
+    );
+  });
+
+  it("skips empty and malformed preview cells", () => {
+    assert.deepEqual(
+      deriveNotebookPreviewCells([
+        null,
+        "not-a-cell",
+        { cell_type: "markdown", source: "\n  \n" },
+        { cell_type: "code", source: 42, execution_count: "4" },
+        { cell_type: "raw", source: "raw is not previewed" },
+      ]),
+      [],
+    );
+  });
+
+  it("detects runtime from kernelspec name, language, language_info, and runt metadata", () => {
+    assert.equal(detectRuntimeFromMetadata({ kernelspec: { name: "python3" } }), "python");
+    assert.equal(detectRuntimeFromMetadata({ kernelspec: { name: "deno" } }), "deno");
+    assert.equal(detectRuntimeFromMetadata({ kernelspec: { language: "typescript" } }), "deno");
+    assert.equal(detectRuntimeFromMetadata({ language_info: { name: "python" } }), "python");
+    assert.equal(detectRuntimeFromMetadata({ runt: { uv: {} } }), "python");
+    assert.equal(detectRuntimeFromMetadata({ runt: { deno: {} } }), "deno");
+  });
+
+  it("returns null when metadata carries no runtime signal", () => {
+    assert.equal(detectRuntimeFromMetadata(null), null);
+    assert.equal(detectRuntimeFromMetadata({}), null);
+    assert.equal(detectRuntimeFromMetadata({ kernelspec: { name: "julia" } }), null);
+    assert.equal(detectRuntimeFromMetadata("python"), null);
+  });
+});

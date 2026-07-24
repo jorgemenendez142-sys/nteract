@@ -2,6 +2,7 @@ import type { EditorView, KeyBinding } from "@codemirror/view";
 import { Check, Pencil } from "lucide-react";
 import {
   memo,
+  type ClipboardEvent,
   type MouseEvent,
   type PointerEvent,
   type ReactNode,
@@ -12,6 +13,7 @@ import {
   useState,
 } from "react";
 import { CellContainer } from "@/components/cell/CellContainer";
+import { CommentSelectionAffordance } from "@/components/comments/CommentSelectionAffordance";
 import { CodeMirrorEditor, type CodeMirrorEditorRef } from "@/components/editor/codemirror-editor";
 import { remoteCursorsExtension } from "@/components/editor/remote-cursors";
 import { searchHighlight } from "@/components/editor/search-highlight";
@@ -25,13 +27,15 @@ import { ProjectedMarkdownView } from "./markdown/ProjectedMarkdownView";
 import { useColorTheme, useDarkMode } from "@/lib/dark-mode";
 import {
   canRenderMarkdownProjectionInHost,
+  markdownProjectionMatchesSource,
+  renderedTextForSourceRange,
   type MarkdownProjectionRun,
   projectedMarkdownPreviewHeight,
   projectMarkdownPlan,
   resolveMarkdownProjection,
 } from "../lib/markdown-projection";
 import { cn } from "@/lib/utils";
-import { usePresenceContext } from "../contexts/PresenceContext";
+import { usePresenceContext } from "@/components/notebook/presence-context";
 import { useCellKeyboardNavigation } from "../hooks/useCellKeyboardNavigation";
 import { useCrdtBridge } from "../hooks/useCrdtBridge";
 import { useBlobResolver } from "../lib/blob-port";
@@ -53,8 +57,25 @@ import { rewriteMarkdownAssetRefs } from "../lib/markdown-assets";
 import { openUrl } from "../lib/open-url";
 import { toggleMarkdownTaskMarker } from "../lib/markdown-task-source";
 import { presenceSenderExtension } from "../lib/presence-sender";
+import { sourceRangeAnchorFromRenderedMarkdownSelection } from "../lib/rendered-markdown-source-comment";
+import { buildRenderedCommentHighlights } from "../lib/rendered-comment-highlights";
+import { commentHighlightExtension } from "../lib/comment-highlight-extension";
+import { refreshCellCommentHighlights, type SourceCommentThread } from "../lib/comment-highlights";
+import {
+  resolveSourceRangeAnchor,
+  selectionRectFromDomRect,
+  selectionRectFromDomSelection,
+  type SourceCommentSelectionRect,
+  type SourceRangeCommentAnchor,
+} from "../lib/comment-source-anchor";
+import { sourceCommentExtension } from "../lib/source-comment-extension";
 import type { MarkdownCell as MarkdownCellType } from "../types";
 import { CellPresenceIndicators } from "./cell/CellPresenceIndicators";
+import { EditorContextMenu } from "./EditorContextMenu";
+import {
+  cleanRenderedMarkdownClipboardHtml,
+  RenderedMarkdownContextMenu,
+} from "./RenderedMarkdownContextMenu";
 
 const handleIframeError = (err: { message: string; stack?: string }) =>
   logger.error("[MarkdownCell] iframe error:", err);
@@ -64,6 +85,7 @@ const MARKDOWN_EDITOR_CONTENT_ATTRIBUTES = {
   autocorrect: "on",
   spellcheck: "true",
 } as const;
+const MARKDOWN_RENDERED_COMMENT_BUTTON_SIZE = 24;
 const MARKDOWN_PREVIEW_MIN_HEIGHT = 24;
 const MARKDOWN_PREVIEW_MAX_INITIAL_HEIGHT = 720;
 
@@ -125,6 +147,7 @@ interface MarkdownCellProps {
   onFocusPrevious?: (cursorPosition: "start" | "end") => void;
   onFocusNext?: (cursorPosition: "start" | "end") => void;
   onInsertCellAfter?: () => void;
+  onChangeCellType?: (type: "code" | "markdown") => void;
   onUpdateSource?: (source: string) => void;
   isLastCell?: boolean;
   /** Props for dnd-kit drag handle (applied to ribbon) */
@@ -135,6 +158,14 @@ interface MarkdownCellProps {
   rightGutterContent?: ReactNode;
   headingAnchors?: readonly MarkdownHeadingAnchor[];
   readOnly?: boolean;
+  onCreateSourceComment?: (
+    anchor: SourceRangeCommentAnchor,
+    rect: SourceCommentSelectionRect | null,
+    quote?: string | null,
+  ) => void;
+  onActivateCommentThread?: (threadId: string) => void;
+  commentThreads?: readonly SourceCommentThread[];
+  pendingCommentAnchor?: SourceRangeCommentAnchor | null;
   outputHostContext?: NteractEmbedHostContextPatch;
 }
 
@@ -145,6 +176,7 @@ export const MarkdownCell = memo(function MarkdownCell({
   onFocusPrevious,
   onFocusNext,
   onInsertCellAfter,
+  onChangeCellType,
   onUpdateSource,
   isLastCell = false,
   dragHandleProps,
@@ -152,6 +184,10 @@ export const MarkdownCell = memo(function MarkdownCell({
   rightGutterContent,
   headingAnchors = EMPTY_HEADING_ANCHORS,
   readOnly = false,
+  onCreateSourceComment,
+  onActivateCommentThread,
+  commentThreads,
+  pendingCommentAnchor,
   outputHostContext,
 }: MarkdownCellProps) {
   const isFocused = useIsCellFocused(cell.id);
@@ -235,6 +271,11 @@ export const MarkdownCell = memo(function MarkdownCell({
   const frameRef = useRef<IsolatedFrameHandle>(null);
   const injectedLibsRef = useRef(new Set<string>());
   const viewRef = useRef<HTMLDivElement>(null);
+  const [renderedSourceCommentTarget, setRenderedSourceCommentTarget] = useState<{
+    anchor: SourceRangeCommentAnchor;
+    left: number;
+    top: number;
+  } | null>(null);
   const [previewFrameInteractionActive, setPreviewFrameInteractionActive] = useState(false);
   const [previewFrameReadyGeneration, setPreviewFrameReadyGeneration] = useState(0);
   const previewSource = draftPreviewSource ?? cell.source;
@@ -244,6 +285,10 @@ export const MarkdownCell = memo(function MarkdownCell({
       setDraftPreviewSource(null);
     }
   }, [cell.source, draftPreviewSource]);
+
+  useEffect(() => {
+    setRenderedSourceCommentTarget(null);
+  }, [editing, previewSource]);
 
   // Same resolution rule as the outline rail: a source-matching attached plan
   // wins, an edited source reprojects, never render a plan for source the
@@ -257,6 +302,30 @@ export const MarkdownCell = memo(function MarkdownCell({
     [cell.markdownProjection, cell.source, draftPreviewSource],
   );
   const canRenderProjectionInHost = canRenderMarkdownProjectionInHost(markdownProjection);
+  const projectionMatchesPreview =
+    markdownProjection !== null &&
+    markdownProjectionMatchesSource(markdownProjection, previewSource);
+  const canCommentOnRenderedMarkdown =
+    Boolean(onCreateSourceComment) && !readOnly && !editing && projectionMatchesPreview;
+  const renderedCommentHighlights = useMemo(
+    () =>
+      buildRenderedCommentHighlights({
+        cellId: cell.id,
+        source: previewSource,
+        editing,
+        projectionMatchesPreview,
+        commentThreads,
+        pendingCommentAnchor,
+      }),
+    [
+      cell.id,
+      commentThreads,
+      editing,
+      pendingCommentAnchor,
+      previewSource,
+      projectionMatchesPreview,
+    ],
+  );
   const previewMinHeight = useMemo(
     () =>
       projectedMarkdownPreviewHeight(
@@ -303,6 +372,7 @@ export const MarkdownCell = memo(function MarkdownCell({
         registeredViewRef.current = view;
         registerCellEditor(cell.id, view);
         onEditorRegistered(cell.id);
+        refreshCellCommentHighlights(cell.id);
         return true;
       }
       return false;
@@ -408,7 +478,116 @@ export const MarkdownCell = memo(function MarkdownCell({
 
   const handlePreviewWrapperPointerDown = useCallback(() => {
     activatePreviewFrameInteraction();
+    setRenderedSourceCommentTarget(null);
   }, [activatePreviewFrameInteraction]);
+
+  const clearRenderedSourceCommentTarget = useCallback(() => {
+    setRenderedSourceCommentTarget(null);
+  }, []);
+
+  const updateRenderedSourceCommentTarget = useCallback(() => {
+    if (!canCommentOnRenderedMarkdown) {
+      clearRenderedSourceCommentTarget();
+      return;
+    }
+
+    const root = viewRef.current;
+    if (!root || typeof window === "undefined") {
+      clearRenderedSourceCommentTarget();
+      return;
+    }
+
+    const selection = window.getSelection();
+    const anchor = sourceRangeAnchorFromRenderedMarkdownSelection(
+      cell.id,
+      previewSource,
+      root,
+      selection,
+    );
+    if (!anchor || !selection || selection.rangeCount === 0) {
+      clearRenderedSourceCommentTarget();
+      return;
+    }
+
+    const rangeRect = selection.getRangeAt(0).getBoundingClientRect();
+    const rootRect = root.getBoundingClientRect();
+    if (rangeRect.width === 0 && rangeRect.height === 0) {
+      clearRenderedSourceCommentTarget();
+      return;
+    }
+
+    setRenderedSourceCommentTarget({
+      anchor,
+      left: Math.min(
+        Math.max(0, rangeRect.right - rootRect.left + 6),
+        Math.max(0, rootRect.width - MARKDOWN_RENDERED_COMMENT_BUTTON_SIZE),
+      ),
+      top: Math.max(0, rangeRect.top - rootRect.top - 32),
+    });
+  }, [canCommentOnRenderedMarkdown, cell.id, clearRenderedSourceCommentTarget, previewSource]);
+
+  const requestRenderedSourceComment = useCallback(() => {
+    if (!canCommentOnRenderedMarkdown || !onCreateSourceComment) return false;
+
+    const root = viewRef.current;
+    if (!root || typeof window === "undefined") return false;
+
+    const anchor = sourceRangeAnchorFromRenderedMarkdownSelection(
+      cell.id,
+      previewSource,
+      root,
+      window.getSelection(),
+    );
+
+    if (!anchor) return false;
+    const rect = selectionRectFromDomSelection(window.getSelection());
+    const range = resolveSourceRangeAnchor(previewSource, anchor);
+    const quote = range
+      ? renderedTextForSourceRange(markdownProjection, range.from, range.to)
+      : null;
+    onCreateSourceComment(anchor, rect, quote);
+    window.getSelection()?.removeAllRanges();
+    clearRenderedSourceCommentTarget();
+    return true;
+  }, [
+    canCommentOnRenderedMarkdown,
+    cell.id,
+    clearRenderedSourceCommentTarget,
+    markdownProjection,
+    onCreateSourceComment,
+    previewSource,
+  ]);
+
+  const handleRenderedSourceCommentClick = useCallback(
+    (event: MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (requestRenderedSourceComment()) return;
+      const anchor = renderedSourceCommentTarget?.anchor;
+      if (!anchor || !onCreateSourceComment) return;
+      const rect =
+        selectionRectFromDomSelection(
+          typeof window !== "undefined" ? window.getSelection() : null,
+        ) ?? selectionRectFromDomRect(event.currentTarget.getBoundingClientRect());
+      const range = resolveSourceRangeAnchor(previewSource, anchor);
+      const quote = range
+        ? renderedTextForSourceRange(markdownProjection, range.from, range.to)
+        : null;
+      onCreateSourceComment(anchor, rect, quote);
+      if (typeof window !== "undefined") {
+        window.getSelection()?.removeAllRanges();
+      }
+      clearRenderedSourceCommentTarget();
+    },
+    [
+      clearRenderedSourceCommentTarget,
+      markdownProjection,
+      onCreateSourceComment,
+      previewSource,
+      renderedSourceCommentTarget,
+      requestRenderedSourceComment,
+    ],
+  );
 
   const handlePreviewFrameMouseUp = useCallback(
     ({ hasSelection }: { hasSelection?: boolean }) => {
@@ -433,25 +612,15 @@ export const MarkdownCell = memo(function MarkdownCell({
     [releasePreviewFrameInteraction],
   );
 
-  // Derived boundary flag: re-run the focus effect only when source crosses
-  // empty↔non-empty, not on every keystroke.
-  const hasContent = previewSource.trim().length > 0;
   useEffect(() => {
     if (readOnly) {
       setEditing(false);
       return;
     }
-    if (!isFocused && editing && hasContent) {
-      setEditing(false);
-    }
     if (!isFocused || editing) {
       setPreviewFrameInteractionActive(false);
     }
-  }, [hasContent, isFocused, editing, readOnly]);
-
-  const handleBlur = useCallback(() => {
-    exitEditingToPreview();
-  }, [exitEditingToPreview]);
+  }, [isFocused, editing, readOnly]);
 
   const renderMarkdownPreviewFrame = useCallback(
     async (frame: IsolatedFrameHandle | null = frameRef.current) => {
@@ -507,7 +676,7 @@ export const MarkdownCell = memo(function MarkdownCell({
     const frame = frameRef.current;
     if (!frame || !previewSource) return;
 
-    // Clear injected set — a reloaded iframe has a fresh renderer registry.
+    // Clear injected set because a reloaded iframe has a fresh renderer registry.
     injectedLibsRef.current.clear();
     setPreviewFrameReadyGeneration((generation) => generation + 1);
     void renderMarkdownPreviewFrame(frame);
@@ -613,6 +782,14 @@ export const MarkdownCell = memo(function MarkdownCell({
   // Handle keyboard navigation in view mode (when not editing)
   const handleViewKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+      if (key === "m" && e.altKey && (e.metaKey || e.ctrlKey)) {
+        if (requestRenderedSourceComment()) {
+          e.preventDefault();
+          return;
+        }
+      }
+
       if (e.key === "ArrowDown") {
         onFocusNext?.("start");
         e.preventDefault();
@@ -635,7 +812,33 @@ export const MarkdownCell = memo(function MarkdownCell({
         e.preventDefault();
       }
     },
-    [enterEditing, onFocusNext, onFocusPrevious, readOnly],
+    [enterEditing, onFocusNext, onFocusPrevious, readOnly, requestRenderedSourceComment],
+  );
+
+  const handleRenderedMarkdownCopy = useCallback(
+    (event: ClipboardEvent<HTMLDivElement>) => {
+      if (editing || !canRenderProjectionInHost || !markdownProjection) return;
+
+      const root = viewRef.current;
+      const selection = typeof window === "undefined" ? null : window.getSelection();
+      if (!root || !selection || selection.rangeCount === 0 || selection.isCollapsed) return;
+
+      const range = selection.getRangeAt(0);
+      if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return;
+
+      const anchor = sourceRangeAnchorFromRenderedMarkdownSelection(
+        cell.id,
+        previewSource,
+        root,
+        selection,
+      );
+      if (!anchor?.exact_quote) return;
+
+      event.preventDefault();
+      event.clipboardData.setData("text/plain", anchor.exact_quote);
+      event.clipboardData.setData("text/html", cleanRenderedMarkdownClipboardHtml(range));
+    },
+    [canRenderProjectionInHost, cell.id, editing, markdownProjection, previewSource],
   );
 
   // Handle focus next, creating a new cell if at the end
@@ -659,13 +862,13 @@ export const MarkdownCell = memo(function MarkdownCell({
     [getCurrentEditorSource, isLastCell, onFocusNext, onInsertCellAfter, readOnly],
   );
 
-  // Remote cursors extension (stable — no deps that change)
+  // Remote cursors extension (stable, no deps that change)
   const remoteCursorsExt = useMemo(() => remoteCursorsExtension(), []);
 
-  // Text attribution extension (stable — no deps that change)
+  // Text attribution extension (stable, no deps that change)
   const textAttributionExt = useMemo(() => textAttributionExtension(), []);
 
-  // Presence sender extension — broadcasts local cursor/selection to other peers
+  // Presence sender extension broadcasts local cursor/selection to other peers.
   const presenceSenderExt = useMemo(() => {
     if (!presence) return [];
     return [
@@ -676,15 +879,39 @@ export const MarkdownCell = memo(function MarkdownCell({
     ];
   }, [cell.id, presence]);
 
-  // Search highlight extension for edit mode + remote cursors + presence sender
+  const sourceCommentExt = useMemo(() => {
+    if (readOnly || !onCreateSourceComment) return [];
+    return [sourceCommentExtension(cell.id, onCreateSourceComment)];
+  }, [cell.id, onCreateSourceComment, readOnly]);
+
+  const commentHighlightExt = useMemo(() => {
+    if (!onActivateCommentThread) return [];
+    return [
+      commentHighlightExtension({
+        onActivate: onActivateCommentThread,
+        onReady: () => refreshCellCommentHighlights(cell.id),
+      }),
+    ];
+  }, [cell.id, onActivateCommentThread]);
+
+  // Search highlight extension for edit mode, remote cursors, presence, and comments.
   const searchExtensions = useMemo(
     () => [
       ...searchHighlight(searchQuery || ""),
       ...remoteCursorsExt,
       ...textAttributionExt,
       ...presenceSenderExt,
+      ...sourceCommentExt,
+      ...commentHighlightExt,
     ],
-    [searchQuery, remoteCursorsExt, textAttributionExt, presenceSenderExt],
+    [
+      searchQuery,
+      remoteCursorsExt,
+      textAttributionExt,
+      presenceSenderExt,
+      sourceCommentExt,
+      commentHighlightExt,
+    ],
   );
   const editorExtensions = useMemo(
     () => [crdtBridgeExt, ...searchExtensions],
@@ -804,7 +1031,7 @@ export const MarkdownCell = memo(function MarkdownCell({
               title="View rendered markdown"
               aria-label="View rendered markdown"
             >
-              <Check className="h-3.5 w-3.5" />
+              <Check className="size-3.5" />
             </button>
             {rightGutterContent}
           </div>
@@ -817,7 +1044,7 @@ export const MarkdownCell = memo(function MarkdownCell({
               className="flex items-center justify-center rounded p-1 text-muted-foreground/40 transition-colors hover:text-foreground"
               title="Edit"
             >
-              <Pencil className="h-3.5 w-3.5" />
+              <Pencil className="size-3.5" />
             </button>
             {rightGutterContent}
           </div>
@@ -831,78 +1058,113 @@ export const MarkdownCell = memo(function MarkdownCell({
               <span className="text-xs text-muted-foreground font-mono">md</span>
             </div>
             <div>
-              <CodeMirrorEditor
-                ref={editorRef}
-                initialValue={cell.source}
-                language="markdown"
-                lineWrapping
-                onBlur={handleBlur}
-                onSelectionChange={noteEditorSourcePosition}
-                keyMap={keyMap}
-                extensions={editorExtensions}
-                contentAttributes={MARKDOWN_EDITOR_CONTENT_ATTRIBUTES}
-                placeholder="Enter markdown..."
-                className="min-h-[2rem]"
-                autoFocus={editing}
+              <EditorContextMenu
+                cellId={cell.id}
+                cellType="markdown"
                 readOnly={readOnly}
-              />
+                onChangeCellType={onChangeCellType}
+                onCreateSourceComment={onCreateSourceComment}
+              >
+                <CodeMirrorEditor
+                  ref={editorRef}
+                  initialValue={cell.source}
+                  language="markdown"
+                  lineWrapping
+                  onSelectionChange={noteEditorSourcePosition}
+                  keyMap={keyMap}
+                  extensions={editorExtensions}
+                  contentAttributes={MARKDOWN_EDITOR_CONTENT_ATTRIBUTES}
+                  placeholder="Enter markdown..."
+                  className="min-h-[2rem]"
+                  autoFocus={editing}
+                  readOnly={readOnly}
+                />
+              </EditorContextMenu>
             </div>
           </div>
 
-          {/* View section - hidden when editing */}
-          <div
-            ref={viewRef}
-            role="textbox"
-            aria-readonly
-            aria-label="Markdown cell content"
-            tabIndex={0}
-            className={cn("py-2 cursor-text outline-none", editing && "hidden")}
-            onFocus={activatePreviewFrameInteraction}
-            onDoubleClick={enterEditing}
-            onPointerDown={handlePreviewWrapperPointerDown}
-            onKeyDown={handleViewKeyDown}
+          <RenderedMarkdownContextMenu
+            cellId={cell.id}
+            source={previewSource}
+            markdownProjection={markdownProjection}
+            viewRef={viewRef}
+            onChangeCellType={onChangeCellType}
+            onCreateSourceComment={canCommentOnRenderedMarkdown ? onCreateSourceComment : undefined}
           >
-            {previewSource && canRenderProjectionInHost && markdownProjection ? (
-              <ProjectedMarkdownView
-                plan={markdownProjection}
-                headingAnchors={headingAnchors}
-                onLinkClick={handleLinkClick}
-                onTaskCheckedChange={
-                  readOnly || !onUpdateSource ? undefined : handleTaskCheckedChange
-                }
-                activeSourcePosition={activeSourcePosition}
-              />
-            ) : (
-              <div
-                className={previewSource ? undefined : "hidden"}
-                onPointerDown={handlePreviewWrapperPointerDown}
-                onPointerOut={deactivatePreviewFrameInteractionWhenIdle}
-              >
-                <IsolatedFrame
-                  ref={frameRef}
-                  name={`md-${cell.id}`}
-                  darkMode={darkMode}
-                  colorTheme={colorTheme}
-                  hostContext={outputHostContext}
-                  minHeight={previewMinHeight}
-                  autoHeight
-                  scrollPassthrough={!previewFrameInteractionActive}
-                  allowWheelBoundaryScroll={previewFrameInteractionActive}
-                  revealOnRender
-                  reserveHeightOnReveal
-                  onReady={handleFrameReady}
+            {/* View section - hidden when editing */}
+            <div
+              ref={viewRef}
+              role="textbox"
+              aria-readonly
+              aria-label="Markdown cell content"
+              tabIndex={0}
+              className={cn("relative py-2 cursor-text outline-none", editing && "hidden")}
+              onFocus={activatePreviewFrameInteraction}
+              onDoubleClick={enterEditing}
+              onPointerDown={handlePreviewWrapperPointerDown}
+              onMouseUp={updateRenderedSourceCommentTarget}
+              onKeyUp={updateRenderedSourceCommentTarget}
+              onKeyDown={handleViewKeyDown}
+              onCopy={handleRenderedMarkdownCopy}
+            >
+              {previewSource && canRenderProjectionInHost && markdownProjection ? (
+                <ProjectedMarkdownView
+                  plan={markdownProjection}
+                  commentHighlights={renderedCommentHighlights}
+                  headingAnchors={headingAnchors}
+                  onActivateCommentThread={onActivateCommentThread}
                   onLinkClick={handleLinkClick}
-                  onMouseDown={activatePreviewFrameInteraction}
-                  onMouseUp={handlePreviewFrameMouseUp}
-                  onDoubleClick={enterEditing}
-                  onError={handleIframeError}
-                  onDiagnostic={logNotebookIsolatedDiagnostic}
-                  className="w-full"
+                  onTaskCheckedChange={
+                    readOnly || !onUpdateSource ? undefined : handleTaskCheckedChange
+                  }
+                  activeSourcePosition={activeSourcePosition}
                 />
-              </div>
-            )}
-            {!previewSource && <p className="text-muted-foreground italic">Double-click to edit</p>}
-          </div>
+              ) : (
+                <div
+                  className={previewSource ? undefined : "hidden"}
+                  onPointerDown={handlePreviewWrapperPointerDown}
+                  onPointerOut={deactivatePreviewFrameInteractionWhenIdle}
+                >
+                  <IsolatedFrame
+                    ref={frameRef}
+                    name={`md-${cell.id}`}
+                    darkMode={darkMode}
+                    colorTheme={colorTheme}
+                    hostContext={outputHostContext}
+                    minHeight={previewMinHeight}
+                    autoHeight
+                    scrollPassthrough={!previewFrameInteractionActive}
+                    allowWheelBoundaryScroll={previewFrameInteractionActive}
+                    revealOnRender
+                    reserveHeightOnReveal
+                    onReady={handleFrameReady}
+                    onLinkClick={handleLinkClick}
+                    onMouseDown={activatePreviewFrameInteraction}
+                    onMouseUp={handlePreviewFrameMouseUp}
+                    onDoubleClick={enterEditing}
+                    onError={handleIframeError}
+                    onDiagnostic={logNotebookIsolatedDiagnostic}
+                    className="w-full"
+                  />
+                </div>
+              )}
+              {!previewSource && (
+                <p className="text-muted-foreground italic">Double-click to edit</p>
+              )}
+              {renderedSourceCommentTarget ? (
+                <CommentSelectionAffordance
+                  className="absolute z-20"
+                  style={{
+                    left: renderedSourceCommentTarget.left,
+                    top: renderedSourceCommentTarget.top,
+                  }}
+                  label="Comment on selected markdown"
+                  testId="markdown-source-comment-button"
+                  onActivate={handleRenderedSourceCommentClick}
+                />
+              ) : null}
+            </div>
+          </RenderedMarkdownContextMenu>
         </>
       }
     />

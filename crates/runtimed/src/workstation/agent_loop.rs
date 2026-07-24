@@ -2,8 +2,9 @@
 //!
 //! Rust port of `apps/notebook-cloud/scripts/hosted-workstation-agent.mjs`:
 //! registers/heartbeats this machine against the hosted workstation surface
-//! (`POST /api/workstations`), polls the attach-job queue
-//! (`GET /api/workstations/{id}/attach-jobs`), and serves each pending job by
+//! (`POST /api/workstations`), keeps a workstation event WebSocket open,
+//! and falls back to polling the attach-job queue
+//! (`GET /api/workstations/{id}/attach-jobs`). It serves each pending job by
 //! spawning a `runtimed cloud-runtime-agent` runtime peer (the agent *is*
 //! `runtimed`, so it spawns `std::env::current_exe()`).
 //!
@@ -31,8 +32,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use futures::{SinkExt, StreamExt};
+use runtime_doc::WorkstationAcceleratorState;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{HeaderValue, AUTHORIZATION};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
 pub use super::cloud_agent_cli::CLOUD_TOKEN_ENV;
@@ -43,19 +51,33 @@ pub use super::cloud_agent_cli::CLOUD_TOKEN_ENV;
 /// `.mjs` agent keys on the same string).
 pub const READINESS_LINE: &str = "Infrastructure ready, entering main loop";
 
-/// Default attach-job poll interval (mirrors the `.mjs` agent).
-pub const DEFAULT_POLL_MS: u64 = 2_000;
-/// Default registration-heartbeat interval (mirrors the `.mjs` agent).
-pub const DEFAULT_HEARTBEAT_MS: u64 = 20_000;
+/// Default attach-job fallback poll interval. The fast path is the workstation
+/// event socket; polling is recovery for missed events or older servers.
+pub const DEFAULT_POLL_MS: u64 = 60_000;
+/// Default workstation heartbeat interval. The event socket is the fast wakeup
+/// path, but registration heartbeat remains the durable online-presence
+/// fallback for missed or wedged sockets.
+pub const DEFAULT_HEARTBEAT_MS: u64 = 60_000;
+/// Refresh hardware/runtime-usability inventory without probing on every heartbeat.
+const ACCELERATOR_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Cooldown applied to 429/503 responses without a usable `Retry-After`.
 const DEFAULT_RETRY_AFTER_MS: u64 = 60_000;
+/// Missing/deleted workstation rows mean this agent is stale. Back off hard
+/// instead of steadily polling a registry entry the cloud no longer accepts.
+const DEFAULT_MISSING_WORKSTATION_RETRY_AFTER_MS: u64 = 15 * 60_000;
 /// Upper bound for rate-limit cooldowns (15 minutes, like the `.mjs` agent).
 const MAX_RETRY_AFTER_MS: u64 = 15 * 60_000;
+/// Idle workstation event sockets should reconnect rather than pinning an
+/// agent to a half-open network path forever.
+const WORKSTATION_EVENTS_IDLE_TIMEOUT_MS: u64 = 90_000;
+/// After an idle socket is probed, a missing response means the path is stale.
+const WORKSTATION_EVENTS_PING_TIMEOUT_MS: u64 = 10_000;
+const WORKSTATION_EVENTS_PING: &str = "nteract.workstation_events.ping.v1";
+const WORKSTATION_EVENTS_PONG: &str = "nteract.workstation_events.pong.v1";
 /// How often active children are checked for exit/readiness between polls
 /// (the `.mjs` agent's `readyPoll` interval).
 const CHILD_TICK_MS: u64 = 250;
-
 /// Configuration for [`run_workstation_agent`]. All fields are non-secret;
 /// the credential travels separately.
 #[derive(Debug, Clone)]
@@ -85,10 +107,16 @@ pub struct AttachJob {
     pub notebook_id: String,
     #[serde(default)]
     pub status: String,
+    #[serde(default = "default_attach_trigger")]
+    pub trigger: String,
     #[serde(default)]
     pub working_directory: Option<String>,
     #[serde(default)]
     pub notebook_path: Option<String>,
+}
+
+fn default_attach_trigger() -> String {
+    "user_attach".into()
 }
 
 /// Filesystem + argv plan for spawning one runtime peer. Pure data so the
@@ -110,10 +138,13 @@ pub struct AttachJobSpawnPlan {
 }
 
 /// Build the registration/heartbeat payload for `POST /api/workstations`.
-/// Field set mirrors `buildWorkstationRegistrationPayload` in
-/// `hosted-workstation-agent-core.mjs`; `cpu_count`/`memory_bytes` are
-/// omitted (the route treats them as optional) where the platform cannot
-/// report them.
+/// The core field set mirrors `buildWorkstationRegistrationPayload` in
+/// `hosted-workstation-agent-core.mjs`; `cpu_count`, `memory_bytes`, and
+/// `accelerators` are omitted where the platform cannot report them. A present
+/// empty accelerator list means detection ran and found none. Accelerator
+/// readiness describes runtime device access, never free or schedulable
+/// capacity. The build/channel fields identify the installed agent binary that
+/// owns the heartbeat.
 pub fn registration_payload(
     workstation_id: &str,
     display_name: &str,
@@ -121,6 +152,7 @@ pub fn registration_payload(
     python_path: &str,
     cpu_count: Option<u64>,
     memory_bytes: Option<u64>,
+    accelerators: Option<&[WorkstationAcceleratorState]>,
 ) -> Value {
     let mut payload = json!({
         "workstation_id": workstation_id,
@@ -128,6 +160,8 @@ pub fn registration_payload(
         "provider": "runtime_peer",
         "default_environment_label": "Current Python",
         "environment_policy": "current_python",
+        "installed_build": crate::daemon_version(),
+        "channel": runt_workspace::channel_display_name(),
         "working_directory": working_directory,
         "capabilities": {
             "launch_current_python": true,
@@ -142,6 +176,9 @@ pub fn registration_payload(
     }
     if let Some(mem) = memory_bytes {
         payload["memory_bytes"] = mem.into();
+    }
+    if let Some(accelerators) = accelerators {
+        payload["accelerators"] = json!(accelerators);
     }
     payload
 }
@@ -239,7 +276,6 @@ pub fn build_attach_job_spawn_plan(
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| opts.working_dir.clone());
-
     let mut args = vec![
         "cloud-runtime-agent".to_string(),
         "--auth-kind".to_string(),
@@ -263,6 +299,10 @@ pub fn build_attach_job_spawn_plan(
         "--workstation-display-name".to_string(),
         opts.display_name.clone(),
     ];
+    if job.trigger == "resume" {
+        args.insert(args.len() - 2, "--launch-mode".to_string());
+        args.insert(args.len() - 2, "execute".to_string());
+    }
     if let Some(notebook_path) = job.notebook_path.as_deref().filter(|path| !path.is_empty()) {
         args.push("--notebook-path".to_string());
         args.push(notebook_path.to_string());
@@ -333,27 +373,94 @@ pub fn normalize_jobs(body: &Value) -> Vec<AttachJob> {
         .collect()
 }
 
+fn workstation_event_name_from_ws_text(text: &str) -> Option<String> {
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .get("event")?
+        .as_str()
+        .map(str::to_string)
+}
+
+async fn handle_workstation_event_ws_message(
+    message: WsMessage,
+    tx: &mpsc::Sender<WorkstationControlEvent>,
+) -> Result<bool, AgentHttpError> {
+    match message {
+        WsMessage::Text(text) => {
+            if text.as_str() == WORKSTATION_EVENTS_PONG {
+                return Ok(true);
+            }
+            if workstation_event_name_from_ws_text(text.as_str()).as_deref() == Some("attach_jobs")
+                && tx.send(WorkstationControlEvent::AttachJobs).await.is_err()
+            {
+                return Ok(false);
+            }
+        }
+        WsMessage::Binary(bytes) => {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                if workstation_event_name_from_ws_text(text).as_deref() == Some("attach_jobs")
+                    && tx.send(WorkstationControlEvent::AttachJobs).await.is_err()
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        WsMessage::Close(_) => {
+            return Ok(false);
+        }
+        WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {}
+    }
+    Ok(true)
+}
+
+fn workstation_events_ws_url(http_url: &str) -> Result<String, AgentHttpError> {
+    if let Some(rest) = http_url.strip_prefix("https://") {
+        return Ok(format!("wss://{rest}"));
+    }
+    if let Some(rest) = http_url.strip_prefix("http://") {
+        return Ok(format!("ws://{rest}"));
+    }
+    Err(AgentHttpError::local(format!(
+        "workstation event URL must be http(s): {http_url}"
+    )))
+}
+
 /// Cooldown hint from a response: nonzero only for 429/503. `Retry-After`
 /// may be delta-seconds or an HTTP date; absent/unparseable falls back to
 /// [`DEFAULT_RETRY_AFTER_MS`]. Mirrors `retryAfterMs` in the `.mjs` agent.
 pub fn retry_after_ms(status: u16, retry_after_header: Option<&str>) -> u64 {
-    if status != 429 && status != 503 {
+    retry_after_ms_for_statuses(status, retry_after_header, &[429, 503])
+}
+
+fn retry_after_ms_for_statuses(
+    status: u16,
+    retry_after_header: Option<&str>,
+    retry_statuses: &[u16],
+) -> u64 {
+    if !retry_statuses.contains(&status) {
         return 0;
     }
     let Some(header) = retry_after_header.map(str::trim).filter(|h| !h.is_empty()) else {
-        return DEFAULT_RETRY_AFTER_MS;
+        return default_retry_after_ms(status);
     };
     if let Ok(seconds) = header.parse::<f64>() {
         if seconds.is_finite() && seconds >= 0.0 {
             return (((seconds * 1000.0).ceil()) as u64).max(1_000);
         }
-        return DEFAULT_RETRY_AFTER_MS;
+        return default_retry_after_ms(status);
     }
     if let Ok(date) = chrono::DateTime::parse_from_rfc2822(header) {
         let delta = date.timestamp_millis() - chrono::Utc::now().timestamp_millis();
         return delta.max(1_000) as u64;
     }
-    DEFAULT_RETRY_AFTER_MS
+    default_retry_after_ms(status)
+}
+
+fn default_retry_after_ms(status: u16) -> u64 {
+    match status {
+        404 | 410 => DEFAULT_MISSING_WORKSTATION_RETRY_AFTER_MS,
+        _ => DEFAULT_RETRY_AFTER_MS,
+    }
 }
 
 /// Exponential cooldown for repeated retryable failures, capped at
@@ -442,6 +549,7 @@ impl std::error::Error for AgentHttpError {}
 
 /// Thin client for the three workstation-surface endpoints. All calls carry
 /// `Authorization: Bearer <workstation credential>`.
+#[derive(Clone)]
 struct CloudApi {
     client: reqwest::Client,
     base: String,
@@ -451,7 +559,7 @@ struct CloudApi {
 impl CloudApi {
     fn new(cloud_url: &str, token: String) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(30))
             .build()
             .context("build HTTP client")?;
         Ok(Self {
@@ -482,9 +590,115 @@ impl CloudApi {
             encode_path_segment(workstation_id)
         );
         let body = self
-            .execute("poll attach jobs", self.client.get(&url), &[200])
+            .execute_with_retry_statuses(
+                "poll attach jobs",
+                self.client.get(&url),
+                &[200],
+                &[404, 410, 429, 503],
+            )
             .await?;
         Ok(normalize_jobs(&body))
+    }
+
+    async fn connect_workstation_events(
+        &self,
+        workstation_id: &str,
+        tx: mpsc::Sender<WorkstationControlEvent>,
+    ) -> Result<(), AgentHttpError> {
+        let http_url = format!(
+            "{}/api/workstations/{}/events",
+            self.base,
+            encode_path_segment(workstation_id)
+        );
+        let ws_url = workstation_events_ws_url(&http_url)?;
+        let mut request = ws_url.as_str().into_client_request().map_err(|e| {
+            AgentHttpError::local(format!("build workstation event websocket: {e}"))
+        })?;
+        let auth = HeaderValue::from_str(&format!("Bearer {}", self.token)).map_err(|e| {
+            AgentHttpError::local(format!("build workstation event auth header: {e}"))
+        })?;
+        request.headers_mut().insert(AUTHORIZATION, auth);
+
+        let (ws, _response) = match connect_async(request).await {
+            Ok(ok) => ok,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                let status = response.status().as_u16();
+                let retry_after_header = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let body = response
+                    .into_body()
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .map(|text| parse_response_body(&text))
+                    .unwrap_or_else(|| json!({}));
+                let snippet: String = serde_json::to_string(&body)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(500)
+                    .collect();
+                return Err(AgentHttpError {
+                    message: format!("connect workstation events failed: HTTP {status} {snippet}"),
+                    retry_after_ms: retry_after_ms_for_statuses(
+                        status,
+                        retry_after_header.as_deref(),
+                        &[404, 410, 429, 503],
+                    ),
+                    status: Some(status),
+                    body,
+                });
+            }
+            Err(error) => {
+                return Err(AgentHttpError::local(format!(
+                    "connect workstation events failed: {error}"
+                )));
+            }
+        };
+
+        let (mut write, mut read) = ws.split();
+        loop {
+            let message = match tokio::time::timeout(
+                Duration::from_millis(WORKSTATION_EVENTS_IDLE_TIMEOUT_MS),
+                read.next(),
+            )
+            .await
+            {
+                Ok(Some(message)) => message.map_err(|e| {
+                    AgentHttpError::local(format!("read workstation event websocket: {e}"))
+                })?,
+                Ok(None) => return Ok(()),
+                Err(_) => {
+                    write
+                        .send(WsMessage::Text(WORKSTATION_EVENTS_PING.into()))
+                        .await
+                        .map_err(|e| {
+                            AgentHttpError::local(format!("ping workstation event websocket: {e}"))
+                        })?;
+                    match tokio::time::timeout(
+                        Duration::from_millis(WORKSTATION_EVENTS_PING_TIMEOUT_MS),
+                        read.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some(message)) => message.map_err(|e| {
+                            AgentHttpError::local(format!(
+                                "read workstation event websocket after ping: {e}"
+                            ))
+                        })?,
+                        Ok(None) => return Ok(()),
+                        Err(_) => {
+                            return Err(AgentHttpError::local(
+                                "workstation event websocket idle timeout".to_string(),
+                            ));
+                        }
+                    }
+                }
+            };
+            if !handle_workstation_event_ws_message(message, &tx).await? {
+                return Ok(());
+            }
+        }
     }
 
     async fn patch_attach_job(
@@ -519,7 +733,19 @@ impl CloudApi {
         request: reqwest::RequestBuilder,
         expected_statuses: &[u16],
     ) -> Result<Value, AgentHttpError> {
+        self.execute_with_retry_statuses(label, request, expected_statuses, &[429, 503])
+            .await
+    }
+
+    async fn execute_with_retry_statuses(
+        &self,
+        label: &str,
+        request: reqwest::RequestBuilder,
+        expected_statuses: &[u16],
+        retry_statuses: &[u16],
+    ) -> Result<Value, AgentHttpError> {
         let response = request
+            .timeout(Duration::from_secs(30))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -542,11 +768,65 @@ impl CloudApi {
             .collect();
         Err(AgentHttpError {
             message: format!("{label} failed: HTTP {status} {snippet}"),
-            retry_after_ms: retry_after_ms(status, retry_after_header.as_deref()),
+            retry_after_ms: retry_after_ms_for_statuses(
+                status,
+                retry_after_header.as_deref(),
+                retry_statuses,
+            ),
             status: Some(status),
             body,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkstationControlEvent {
+    AttachJobs,
+}
+
+async fn run_workstation_event_listener(
+    api: CloudApi,
+    workstation_id: String,
+    tx: mpsc::Sender<WorkstationControlEvent>,
+) {
+    let mut reconnect_delay = Duration::from_secs(1);
+    loop {
+        if tx.is_closed() {
+            return;
+        }
+        match api
+            .connect_workstation_events(&workstation_id, tx.clone())
+            .await
+        {
+            Ok(()) => {
+                warn!("[workstation-agent] workstation event socket closed; reconnecting");
+                reconnect_delay = Duration::from_secs(1);
+            }
+            Err(error) => {
+                if error.status == Some(404) || error.status == Some(503) {
+                    warn!(
+                        "[workstation-agent] workstation event socket unavailable; using fallback polling: {}",
+                        error.message
+                    );
+                } else {
+                    warn!(
+                        "[workstation-agent] workstation event socket failed; reconnecting: {}",
+                        error.message
+                    );
+                }
+                reconnect_delay = retry_event_socket_delay(reconnect_delay, error.retry_after_ms);
+            }
+        }
+        tokio::time::sleep(reconnect_delay).await;
+    }
+}
+
+fn retry_event_socket_delay(previous: Duration, retry_after_ms: u64) -> Duration {
+    if retry_after_ms > 0 {
+        return Duration::from_millis(retry_after_ms)
+            .min(Duration::from_millis(MAX_RETRY_AFTER_MS));
+    }
+    previous.saturating_mul(2).min(Duration::from_secs(60))
 }
 
 /// One job this agent is responsible for. `child` is `Some` for peers this
@@ -633,6 +913,11 @@ pub async fn run_workstation_agent(opts: WorkstationAgentOptions, token: String)
         )
     })?;
     let _agent_lock = WorkstationAgentLock::try_acquire(&opts.agent_root, &opts.workstation_id)?;
+    // Reuse one bounded probe result across ordinary heartbeats, but refresh it
+    // periodically so driver/device-access loss or repair is reflected without
+    // requiring a workstation service restart.
+    let mut accelerators = super::accelerators::detect_accelerators().await;
+    let mut last_accelerator_detection = Instant::now();
 
     info!(
         "[workstation-agent] starting cloud_url={} workstation_id={} display_name={:?} working_dir={} python_path={} poll_ms={} heartbeat_ms={} agent_root={}",
@@ -647,8 +932,17 @@ pub async fn run_workstation_agent(opts: WorkstationAgentOptions, token: String)
     );
 
     let mut active: HashMap<String, ActiveJob> = HashMap::new();
-    let mut last_heartbeat: Option<Instant> = None;
+    let mut last_registration: Option<Instant> = None;
+    let mut last_poll: Option<Instant> = None;
+    let mut poll_requested = true;
+    let mut event_socket_closed = false;
     let mut tracker = StepTracker::default();
+    let (event_tx, mut event_rx) = mpsc::channel(16);
+    let _event_listener = tokio::spawn(run_workstation_event_listener(
+        api.clone(),
+        opts.workstation_id.clone(),
+        event_tx,
+    ));
 
     loop {
         if let Some(remaining) = tracker.cooldown_remaining() {
@@ -656,11 +950,18 @@ pub async fn run_workstation_agent(opts: WorkstationAgentOptions, token: String)
             continue;
         }
 
-        // Registration heartbeat.
-        if last_heartbeat.is_none_or(|at| at.elapsed() >= opts.heartbeat_interval) {
-            let result = heartbeat(&api, &opts).await;
+        // Register on startup and refresh workstation metadata periodically.
+        // The event socket is the fast attach-job wakeup path; this heartbeat is
+        // the durable fallback that keeps a locally-running workstation visible
+        // if that socket is missed, half-open, or blocked by an intermediary.
+        if should_register_workstation(last_registration, opts.heartbeat_interval) {
+            if should_refresh_accelerators(last_accelerator_detection) {
+                accelerators = super::accelerators::detect_accelerators().await;
+                last_accelerator_detection = Instant::now();
+            }
+            let result = heartbeat(&api, &opts, accelerators.as_deref()).await;
             if result.is_ok() {
-                last_heartbeat = Some(Instant::now());
+                last_registration = Some(Instant::now());
             }
             tracker.record("heartbeat", result.map(|()| true));
         }
@@ -668,24 +969,59 @@ pub async fn run_workstation_agent(opts: WorkstationAgentOptions, token: String)
             continue;
         }
 
-        // Accept/adopt attach jobs.
-        let result = poll_attach_jobs(&api, &opts, &token, &mut active).await;
-        tracker.record("poll_attach_jobs", result);
+        if !event_socket_closed {
+            while let Ok(WorkstationControlEvent::AttachJobs) = event_rx.try_recv() {
+                poll_requested = true;
+            }
+        }
+
+        // Accept/adopt attach jobs. The event socket is the fast wakeup path; this fallback
+        // poll catches missed events, server versions without /events, and
+        // jobs that existed before this agent started.
+        if poll_requested || last_poll.is_none_or(|at| at.elapsed() >= opts.poll_interval) {
+            let result = poll_attach_jobs(&api, &opts, &token, &mut active).await;
+            last_poll = Some(Instant::now());
+            poll_requested = false;
+            tracker.record("poll_attach_jobs", result);
+        }
 
         // Periodic status re-patch so the cloud sees active jobs as live.
         let result = heartbeat_active_jobs(&api, &opts, &mut active).await;
         tracker.record("heartbeat_active_jobs", result);
 
-        // Watch children at a finer tick than the poll interval so readiness
-        // and exits land promptly (the `.mjs` agent's 250ms readyPoll).
-        let deadline = Instant::now() + opts.poll_interval;
+        // Watch children at a finer tick than the fallback poll interval so
+        // readiness and exits land promptly (the `.mjs` agent's 250ms
+        // readyPoll), but sleep cheaply while idle.
+        let next_poll_at = last_poll.map_or_else(Instant::now, |at| at + opts.poll_interval);
+        let deadline = next_registration_deadline(last_registration, opts.heartbeat_interval)
+            .map_or(next_poll_at, |next_registration_at| {
+                next_poll_at.min(next_registration_at)
+            });
         loop {
             tick_active_jobs(&api, &opts, &mut active).await;
             let now = Instant::now();
             if now >= deadline {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(CHILD_TICK_MS).min(deadline - now)).await;
+            let sleep_for = if active.is_empty() {
+                deadline - now
+            } else {
+                Duration::from_millis(CHILD_TICK_MS).min(deadline - now)
+            };
+            tokio::select! {
+                event = event_rx.recv(), if !event_socket_closed => {
+                    match event {
+                        Some(WorkstationControlEvent::AttachJobs) => {
+                            poll_requested = true;
+                            break;
+                        }
+                        None => {
+                            event_socket_closed = true;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(sleep_for) => {}
+            }
         }
     }
 }
@@ -788,7 +1124,11 @@ fn workstation_agent_lock_dir(agent_root: &Path) -> &Path {
     agent_root
 }
 
-async fn heartbeat(api: &CloudApi, opts: &WorkstationAgentOptions) -> Result<(), AgentHttpError> {
+async fn heartbeat(
+    api: &CloudApi,
+    opts: &WorkstationAgentOptions,
+    accelerators: Option<&[WorkstationAcceleratorState]>,
+) -> Result<(), AgentHttpError> {
     let payload = registration_payload(
         &opts.workstation_id,
         &opts.display_name,
@@ -796,8 +1136,33 @@ async fn heartbeat(api: &CloudApi, opts: &WorkstationAgentOptions) -> Result<(),
         &opts.python_path.to_string_lossy(),
         cpu_count(),
         total_memory_bytes(),
+        accelerators,
     );
     api.register_workstation(&payload).await
+}
+
+fn should_register_workstation(
+    last_registration: Option<Instant>,
+    heartbeat_interval: Duration,
+) -> bool {
+    if last_registration.is_none() {
+        return true;
+    }
+    last_registration.is_some_and(|at| at.elapsed() >= heartbeat_interval)
+}
+
+fn should_refresh_accelerators(last_detection: Instant) -> bool {
+    last_detection.elapsed() >= ACCELERATOR_REFRESH_INTERVAL
+}
+
+fn next_registration_deadline(
+    last_registration: Option<Instant>,
+    heartbeat_interval: Duration,
+) -> Option<Instant> {
+    match last_registration {
+        None => Some(Instant::now()),
+        Some(at) => Some(at + heartbeat_interval),
+    }
 }
 
 async fn poll_attach_jobs(
@@ -1405,6 +1770,7 @@ mod tests {
             job_id: job_id.to_string(),
             notebook_id: notebook_id.to_string(),
             status: "pending".to_string(),
+            trigger: "user_attach".to_string(),
             working_directory: None,
             notebook_path: None,
         }
@@ -1481,9 +1847,18 @@ mod tests {
         );
     }
 
-    /// (c) Heartbeat payload field set matches the `.mjs` agent exactly.
+    /// Heartbeats retain the shared launcher fields and add native inventory.
     #[test]
-    fn registration_payload_matches_mjs_field_set() {
+    fn registration_payload_includes_detected_hardware() {
+        let accelerators = vec![WorkstationAcceleratorState {
+            kind: "gpu".to_string(),
+            vendor: Some("NVIDIA".to_string()),
+            model: Some("A100-SXM4-80GB".to_string()),
+            count: 1,
+            memory_bytes_per_device: Some(80 * 1024 * 1024 * 1024),
+            readiness: "ready".to_string(),
+            diagnostic: None,
+        }];
         let payload = registration_payload(
             "ws-lab2",
             "lab2 workstation",
@@ -1491,34 +1866,176 @@ mod tests {
             "/opt/k/bin/python",
             Some(8),
             Some(16_000_000_000),
+            Some(&accelerators),
         );
-        assert_eq!(
-            payload,
-            serde_json::json!({
-                "workstation_id": "ws-lab2",
-                "display_name": "lab2 workstation",
-                "provider": "runtime_peer",
-                "default_environment_label": "Current Python",
-                "environment_policy": "current_python",
-                "working_directory": "/home/ubuntu/project",
-                "cpu_count": 8,
-                "memory_bytes": 16_000_000_000u64,
-                "capabilities": {
-                    "launch_current_python": true,
-                },
-                "runtime": {
-                    "binary": "runtimed",
-                    "python_path": "/opt/k/bin/python",
-                },
-            })
-        );
+        let expected_shape = serde_json::json!({
+            "workstation_id": "ws-lab2",
+            "display_name": "lab2 workstation",
+            "provider": "runtime_peer",
+            "default_environment_label": "Current Python",
+            "environment_policy": "current_python",
+            "working_directory": "/home/ubuntu/project",
+            "cpu_count": 8,
+            "memory_bytes": 16_000_000_000u64,
+            "accelerators": [{
+                "kind": "gpu",
+                "vendor": "NVIDIA",
+                "model": "A100-SXM4-80GB",
+                "count": 1,
+                "memory_bytes_per_device": (80u64 * 1024 * 1024 * 1024),
+                "readiness": "ready",
+                "diagnostic": null,
+            }],
+            "capabilities": {
+                "launch_current_python": true,
+            },
+            "runtime": {
+                "binary": "runtimed",
+                "python_path": "/opt/k/bin/python",
+            },
+        });
+        for (key, value) in expected_shape.as_object().unwrap() {
+            assert_eq!(payload.get(key), Some(value));
+        }
+
+        let installed_build = payload
+            .get("installed_build")
+            .and_then(|value| value.as_str())
+            .expect("installed_build is present");
+        assert!(!installed_build.is_empty());
+        assert!(installed_build.contains('+'));
+        assert!(!installed_build.chars().any(char::is_whitespace));
+
+        let channel = payload
+            .get("channel")
+            .and_then(|value| value.as_str())
+            .expect("channel is present");
+        assert!(matches!(channel, "nightly" | "stable"));
     }
 
     #[test]
     fn registration_payload_omits_unknown_hardware_facts() {
-        let payload = registration_payload("ws", "ws", "/w", "/usr/bin/python3", None, None);
+        let payload = registration_payload("ws", "ws", "/w", "/usr/bin/python3", None, None, None);
         assert!(payload.get("cpu_count").is_none());
         assert!(payload.get("memory_bytes").is_none());
+        assert!(payload.get("accelerators").is_none());
+    }
+
+    #[test]
+    fn registration_payload_preserves_known_no_accelerators() {
+        let payload =
+            registration_payload("ws", "ws", "/w", "/usr/bin/python3", None, None, Some(&[]));
+        assert_eq!(payload.get("accelerators"), Some(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn workstation_registration_is_startup_and_periodic() {
+        let heartbeat_interval = Duration::from_secs(60);
+        let stale_registration = Instant::now() - Duration::from_secs(120);
+        let fresh_registration = Instant::now();
+
+        assert!(!should_register_workstation(
+            Some(fresh_registration),
+            heartbeat_interval
+        ));
+        assert!(should_register_workstation(
+            Some(stale_registration),
+            heartbeat_interval
+        ));
+        assert!(should_register_workstation(None, heartbeat_interval));
+    }
+
+    #[test]
+    fn accelerator_inventory_refreshes_on_a_bounded_cadence() {
+        let stale_detection = Instant::now() - ACCELERATOR_REFRESH_INTERVAL;
+        let fresh_detection = Instant::now();
+
+        assert!(should_refresh_accelerators(stale_detection));
+        assert!(!should_refresh_accelerators(fresh_detection));
+    }
+
+    #[test]
+    fn workstation_registration_has_periodic_wakeup_deadline() {
+        let heartbeat_interval = Duration::from_secs(60);
+        let registered = Instant::now();
+
+        assert!(next_registration_deadline(None, heartbeat_interval).is_some());
+        assert_eq!(
+            next_registration_deadline(Some(registered), heartbeat_interval),
+            Some(registered + heartbeat_interval)
+        );
+    }
+
+    #[test]
+    fn workstation_event_name_reads_json_messages() {
+        assert_eq!(
+            workstation_event_name_from_ws_text(r#"{"event":"attach_jobs","data":{"job_id":"j"}}"#),
+            Some("attach_jobs".to_string())
+        );
+        assert_eq!(
+            workstation_event_name_from_ws_text(r#"{"event":"ready","data":{"ok":true}}"#),
+            Some("ready".to_string())
+        );
+        assert_eq!(workstation_event_name_from_ws_text("not json"), None);
+        assert_eq!(
+            workstation_event_name_from_ws_text(WORKSTATION_EVENTS_PONG),
+            None
+        );
+        assert_eq!(workstation_event_name_from_ws_text(r#"{"data":{}}"#), None);
+    }
+
+    #[tokio::test]
+    async fn workstation_event_ws_message_ignores_pong_and_forwards_attach_jobs() {
+        let (tx, mut rx) = mpsc::channel(1);
+
+        assert!(handle_workstation_event_ws_message(
+            WsMessage::Text(WORKSTATION_EVENTS_PONG.into()),
+            &tx,
+        )
+        .await
+        .unwrap());
+        assert!(rx.try_recv().is_err());
+
+        assert!(handle_workstation_event_ws_message(
+            WsMessage::Text(r#"{"event":"attach_jobs","data":{"job_id":"j"}}"#.into()),
+            &tx,
+        )
+        .await
+        .unwrap());
+        assert_eq!(rx.recv().await, Some(WorkstationControlEvent::AttachJobs));
+    }
+
+    #[test]
+    fn workstation_event_url_uses_websocket_scheme() {
+        assert_eq!(
+            workstation_events_ws_url("https://preview.runt.run/api/workstations/ws/events")
+                .unwrap(),
+            "wss://preview.runt.run/api/workstations/ws/events"
+        );
+        assert_eq!(
+            workstation_events_ws_url("http://localhost:8787/api/workstations/ws/events").unwrap(),
+            "ws://localhost:8787/api/workstations/ws/events"
+        );
+        assert!(workstation_events_ws_url("file:///tmp/socket").is_err());
+    }
+
+    #[test]
+    fn event_socket_retry_delay_uses_retry_after_and_caps_backoff() {
+        assert_eq!(
+            retry_event_socket_delay(Duration::from_secs(1), 42_000),
+            Duration::from_secs(42)
+        );
+        assert_eq!(
+            retry_event_socket_delay(
+                Duration::from_secs(1),
+                DEFAULT_MISSING_WORKSTATION_RETRY_AFTER_MS
+            ),
+            Duration::from_millis(DEFAULT_MISSING_WORKSTATION_RETRY_AFTER_MS)
+        );
+        assert_eq!(
+            retry_event_socket_delay(Duration::from_secs(45), 0),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -1682,6 +2199,35 @@ mod tests {
     }
 
     #[test]
+    fn attach_job_trigger_defaults_to_user_attach() {
+        let job: AttachJob = serde_json::from_value(json!({
+            "job_id": "job-default",
+            "notebook_id": "nb-default",
+        }))
+        .unwrap();
+
+        assert_eq!(job.trigger, "user_attach");
+        let plan = build_attach_job_spawn_plan(&job, &options()).unwrap();
+        assert!(!plan.args.iter().any(|arg| arg == "--launch-mode"));
+    }
+
+    #[test]
+    fn spawn_plan_uses_execute_launch_mode_for_resume_jobs() {
+        let mut resume = job("job-resume", "nb-resume");
+        resume.trigger = "resume".to_string();
+        let plan = build_attach_job_spawn_plan(&resume, &options()).unwrap();
+
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--launch-mode" && pair[1] == "execute"));
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--python-path" && pair[1] == "/opt/k/bin/python"));
+    }
+
+    #[test]
     fn spawn_plan_honors_job_cwd_and_notebook_path_overrides() {
         let mut overridden = job("job-2", "nb-2");
         overridden.working_directory = Some("/srv/notebook-project".to_string());
@@ -1780,6 +2326,7 @@ mod tests {
         assert_eq!(retry_after_ms(200, None), 0);
         assert_eq!(retry_after_ms(429, Some("7")), 7_000);
         assert_eq!(retry_after_ms(503, None), 60_000);
+        assert_eq!(retry_after_ms(404, Some("900")), 0);
         // Sub-second hints are floored to 1s.
         assert_eq!(retry_after_ms(429, Some("0")), 1_000);
         // Unparseable headers fall back to the default.
@@ -1789,6 +2336,19 @@ mod tests {
             retry_after_ms(429, Some("Tue, 15 Nov 1994 08:12:31 GMT")),
             1_000
         );
+    }
+
+    #[test]
+    fn stale_workstation_statuses_can_back_off_selected_paths() {
+        assert_eq!(
+            retry_after_ms_for_statuses(404, Some("900"), &[404, 410, 429, 503]),
+            900_000
+        );
+        assert_eq!(
+            retry_after_ms_for_statuses(410, None, &[404, 410, 429, 503]),
+            DEFAULT_MISSING_WORKSTATION_RETRY_AFTER_MS
+        );
+        assert_eq!(retry_after_ms_for_statuses(404, None, &[429, 503]), 0);
     }
 
     #[test]

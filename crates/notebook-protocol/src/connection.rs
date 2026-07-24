@@ -18,8 +18,9 @@ pub use framing::{
 };
 
 pub use handshake::{
-    recv_typed_bootstrap_frame, send_typed_bootstrap_frame, ConnectionBootstrap, Handshake,
-    NotebookConnectionInfo, ProtocolCapabilities, PutBlobCapability, PROTOCOL_V4, PROTOCOL_VERSION,
+    recv_typed_bootstrap_frame, send_typed_bootstrap_frame, ConnectionBootstrap,
+    CreateNotebookRequest, Handshake, NotebookConnectionInfo, ProtocolCapabilities,
+    PutBlobCapability, PROTOCOL_V4, PROTOCOL_VERSION,
 };
 
 #[cfg(windows)]
@@ -233,32 +234,17 @@ mod tests {
         );
 
         // CreateNotebook without working_dir
-        let json = serde_json::to_string(&Handshake::CreateNotebook {
-            runtime: "python".into(),
-            working_dir: None,
-            notebook_id: None,
-            ephemeral: None,
-            package_manager: None,
-            environment_mode: None,
-            dependencies: vec![],
-            typed_bootstrap: None,
-            operator: None,
-        })
+        let json = serde_json::to_string(&Handshake::CreateNotebook(CreateNotebookRequest::new(
+            "python",
+        )))
         .unwrap();
         assert_eq!(json, r#"{"channel":"create_notebook","runtime":"python"}"#);
 
         // CreateNotebook with working_dir
-        let json = serde_json::to_string(&Handshake::CreateNotebook {
-            runtime: "deno".into(),
+        let json = serde_json::to_string(&Handshake::CreateNotebook(CreateNotebookRequest {
             working_dir: Some("/home/user/project".into()),
-            notebook_id: None,
-            ephemeral: None,
-            package_manager: None,
-            environment_mode: None,
-            dependencies: vec![],
-            typed_bootstrap: None,
-            operator: None,
-        })
+            ..CreateNotebookRequest::new("deno")
+        }))
         .unwrap();
         assert_eq!(
             json,
@@ -266,39 +252,45 @@ mod tests {
         );
 
         // CreateNotebook with notebook_id hint (session restore)
-        let json = serde_json::to_string(&Handshake::CreateNotebook {
-            runtime: "python".into(),
-            working_dir: None,
+        let json = serde_json::to_string(&Handshake::CreateNotebook(CreateNotebookRequest {
             notebook_id: Some("550e8400-e29b-41d4-a716-446655440000".into()),
-            ephemeral: None,
-            package_manager: None,
-            environment_mode: None,
-            dependencies: vec![],
-            typed_bootstrap: None,
-            operator: None,
-        })
+            ..CreateNotebookRequest::new("python")
+        }))
         .unwrap();
         assert_eq!(
             json,
             r#"{"channel":"create_notebook","runtime":"python","notebook_id":"550e8400-e29b-41d4-a716-446655440000"}"#
         );
 
-        let json = serde_json::to_string(&Handshake::CreateNotebook {
-            runtime: "python".into(),
+        let json = serde_json::to_string(&Handshake::CreateNotebook(CreateNotebookRequest {
             working_dir: Some("/home/user/project".into()),
-            notebook_id: None,
-            ephemeral: None,
-            package_manager: None,
             environment_mode: Some(CreateNotebookEnvironmentMode::Notebook),
-            dependencies: vec![],
-            typed_bootstrap: None,
-            operator: None,
-        })
+            ..CreateNotebookRequest::new("python")
+        }))
         .unwrap();
         assert_eq!(
             json,
             r#"{"channel":"create_notebook","runtime":"python","working_dir":"/home/user/project","environment_mode":"notebook"}"#
         );
+
+        // CreateNotebook deserializes from minimal JSON (all optional fields
+        // absent), the shape older clients send.
+        let parsed: Handshake =
+            serde_json::from_str(r#"{"channel":"create_notebook","runtime":"python"}"#).unwrap();
+        match parsed {
+            Handshake::CreateNotebook(req) => {
+                assert_eq!(req.runtime, "python");
+                assert!(req.working_dir.is_none());
+                assert!(req.notebook_id.is_none());
+                assert!(req.ephemeral.is_none());
+                assert!(req.package_manager.is_none());
+                assert!(req.environment_mode.is_none());
+                assert!(req.dependencies.is_empty());
+                assert!(req.typed_bootstrap.is_none());
+                assert!(req.operator.is_none());
+            }
+            other => panic!("expected CreateNotebook, got {other:?}"),
+        }
 
         let json = serde_json::to_string(&Handshake::OpenNotebook {
             path: "/home/user/notebook.ipynb".into(),
@@ -325,6 +317,8 @@ mod tests {
                 put_blob: None,
                 actor_label: None,
                 connection_scope: None,
+                comments_doc_id: None,
+                comments_notebook_ref: None,
             }
         }
 
@@ -396,6 +390,28 @@ mod tests {
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains(r#""notebook_path":"/home/user/notebook.ipynb""#));
+
+        // With CommentsDoc identity
+        let info = NotebookConnectionInfo {
+            capabilities: capabilities(None, None).with_comments_doc_identity(
+                Some("comments:local-room:550e8400-e29b-41d4-a716-446655440000".into()),
+                Some(serde_json::json!({
+                    "kind": "local_room",
+                    "room_id": "550e8400-e29b-41d4-a716-446655440000"
+                })),
+            ),
+            notebook_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            cell_count: 5,
+            needs_trust_approval: false,
+            error: None,
+            ephemeral: true,
+            notebook_path: None,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains(
+            r#""comments_doc_id":"comments:local-room:550e8400-e29b-41d4-a716-446655440000""#
+        ));
+        assert!(json.contains(r#""comments_notebook_ref":{"kind":"local_room","room_id":"550e8400-e29b-41d4-a716-446655440000"}"#));
 
         // With identity metadata
         let info = NotebookConnectionInfo {
@@ -606,6 +622,7 @@ mod tests {
             ft::RUNTIME_STATE_SYNC,
             ft::COMMS_DOC_SYNC,
             ft::POOL_STATE_SYNC,
+            ft::COMMENTS_DOC_SYNC,
             ft::SESSION_CONTROL,
             ft::PUT_BLOB,
         ] {

@@ -36,6 +36,8 @@ vi.mock("@tauri-apps/api/core", () => ({
         return Promise.resolve([]);
       case "get_username":
         return Promise.resolve("kyle");
+      case "list_font_families":
+        return Promise.resolve(["Fraunces", "Georgia"]);
       case "get_daemon_ready_info":
         return Promise.resolve({
           notebook_id: "nb-1",
@@ -45,11 +47,17 @@ vi.mock("@tauri-apps/api/core", () => ({
           ephemeral: true,
           notebook_path: null,
           runtime: "python",
+          comments_doc_id: "comments:local-room:nb-1",
+          comments_notebook_ref: { kind: "local_room", room_id: "nb-1" },
         });
       case "get_default_save_directory":
         return Promise.resolve("/tmp/notebooks");
       case "clone_notebook_to_ephemeral":
         return Promise.resolve("clone-1");
+      case "get_synced_settings":
+        return Promise.resolve({ theme: "system", color_theme: "classic" });
+      case "rotate_install_id":
+        return Promise.resolve("install-2");
       default:
         return Promise.resolve(undefined);
     }
@@ -70,12 +78,16 @@ vi.mock("@tauri-apps/api/webview", () => ({
 const mockWindowUnlisten = vi.fn();
 let capturedFocusCb: ((ev: { payload: boolean }) => void) | null = null;
 let mockWindowTitle = "notebook";
+let mockWindowTheme: "light" | "dark" | null = null;
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     title: vi.fn(async () => mockWindowTitle),
     setTitle: vi.fn(async (t: string) => {
       mockWindowTitle = t;
+    }),
+    setTheme: vi.fn(async (theme: "light" | "dark" | null) => {
+      mockWindowTheme = theme;
     }),
     onFocusChanged: vi.fn(async (cb: (ev: { payload: boolean }) => void) => {
       capturedFocusCb = cb;
@@ -166,6 +178,7 @@ beforeEach(() => {
   vi.mocked(stubTransport.sendRequest).mockReset();
   capturedFocusCb = null;
   mockWindowTitle = "notebook";
+  mockWindowTheme = null;
 });
 
 describe("createTauriHost()", () => {
@@ -185,6 +198,51 @@ describe("createTauriHost()", () => {
     const host = createTauriHost({ transport: stubTransport });
     await host.daemon.reconnect();
     expect(capturedInvokes.at(-1)?.cmd).toBe("reconnect_to_daemon");
+    expect(capturedInvokes.at(-1)?.args).toEqual({ force: false });
+  });
+
+  it("passes force through daemon.reconnect for stuck relay recovery", async () => {
+    const host = createTauriHost({ transport: stubTransport });
+    await host.daemon.reconnect({ force: true });
+    expect(capturedInvokes.at(-1)).toEqual({
+      cmd: "reconnect_to_daemon",
+      args: { force: true },
+    });
+  });
+
+  it("queues a forced reconnect behind an in-flight non-forced reconnect", async () => {
+    const host = createTauriHost({ transport: stubTransport });
+    let resolveReconnect!: () => void;
+    reconnectPromiseOverride = new Promise((resolve) => {
+      resolveReconnect = () => resolve(undefined);
+    });
+
+    const nonForced = host.daemon.reconnect();
+    await Promise.resolve();
+    const forced = host.daemon.reconnect({ force: true });
+    await Promise.resolve();
+
+    expect(capturedInvokes.filter((x) => x.cmd === "reconnect_to_daemon")).toEqual([
+      {
+        cmd: "reconnect_to_daemon",
+        args: { force: false },
+      },
+    ]);
+
+    reconnectPromiseOverride = null;
+    resolveReconnect();
+    await Promise.all([nonForced, forced]);
+
+    expect(capturedInvokes.filter((x) => x.cmd === "reconnect_to_daemon")).toEqual([
+      {
+        cmd: "reconnect_to_daemon",
+        args: { force: false },
+      },
+      {
+        cmd: "reconnect_to_daemon",
+        args: { force: true },
+      },
+    ]);
   });
 
   it("routes daemon.getInfo to get_daemon_info and passes the payload through", async () => {
@@ -260,19 +318,22 @@ describe("createTauriHost()", () => {
     await expect(host.notebook.getDefaultSaveDirectory()).resolves.toBe("/tmp/notebooks");
     await host.notebook.saveAs("/tmp/notebooks/a.ipynb");
     await host.notebook.openInNewWindow("/tmp/notebooks/a.ipynb");
+    await host.notebook.openHostedInNewWindow("https://app.runt.run/n/cloud-123");
     await expect(host.notebook.cloneToEphemeral()).resolves.toBe("clone-1");
 
     expect(capturedInvokes.map((x) => x.cmd)).toEqual([
       "get_default_save_directory",
       "save_notebook_as",
       "open_notebook_in_new_window",
+      "open_hosted_notebook_in_new_window",
       "clone_notebook_to_ephemeral",
     ]);
     expect(capturedInvokes[1].args).toEqual({ path: "/tmp/notebooks/a.ipynb" });
     expect(capturedInvokes[2].args).toEqual({ path: "/tmp/notebooks/a.ipynb" });
+    expect(capturedInvokes[3].args).toEqual({ url: "https://app.runt.run/n/cloud-123" });
   });
 
-  it("system.getGitInfo and getUsername route to the correct commands", async () => {
+  it("system methods route to the correct commands", async () => {
     const host = createTauriHost({ transport: stubTransport });
     await expect(host.system.getGitInfo()).resolves.toEqual({
       branch: "main",
@@ -280,6 +341,12 @@ describe("createTauriHost()", () => {
       description: null,
     });
     await expect(host.system.getUsername()).resolves.toBe("kyle");
+    await expect(host.system.getFontFamilies()).resolves.toEqual(["Fraunces", "Georgia"]);
+    expect(capturedInvokes.map((x) => x.cmd)).toEqual([
+      "get_git_info",
+      "get_username",
+      "list_font_families",
+    ]);
   });
 
   it("daemonEvents.onReady subscribes to 'daemon:ready' and returns a working unlisten", async () => {
@@ -292,9 +359,12 @@ describe("createTauriHost()", () => {
     const unlisten = host.daemonEvents.onReady((p) => received.push(p));
     // Flush the listen() promise so the callback is registered.
     await Promise.resolve();
-    const entry = capturedListens.find((x) => x.event === "daemon:ready");
-    expect(entry).toBeTruthy();
-    entry?.cb({ payload: { runtime: "python" } });
+    // Two listeners share this event: the host-level reconnect-governor
+    // listener installed at construction (payload-ignoring) and the one this
+    // test installed. A real Tauri event fires every registered callback.
+    const entries = capturedListens.filter((x) => x.event === "daemon:ready");
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) entry.cb({ payload: { runtime: "python" } });
     expect(received).toContainEqual({ runtime: "python" });
     unlisten();
     await Promise.resolve();
@@ -309,8 +379,10 @@ describe("createTauriHost()", () => {
     await Promise.resolve();
     expect(capturedInvokes.map((x) => x.cmd)).not.toContain("get_daemon_ready_info");
 
-    const entry = capturedListens.find((x) => x.event === "daemon:ready");
-    entry?.cb({ payload: { runtime: "python" } });
+    // Fire every daemon:ready listener (the reconnect governor holds one
+    // too); only the subscriber this test installed records the payload.
+    const entries = capturedListens.filter((x) => x.event === "daemon:ready");
+    for (const entry of entries) entry.cb({ payload: { runtime: "python" } });
     expect(received).toEqual([{ runtime: "python" }]);
   });
 
@@ -331,6 +403,8 @@ describe("createTauriHost()", () => {
       ephemeral: true,
       notebook_path: null,
       runtime: "python",
+      comments_doc_id: "comments:local-room:nb-1",
+      comments_notebook_ref: { kind: "local_room", room_id: "nb-1" },
     });
   });
 
@@ -433,17 +507,72 @@ describe("createTauriHost()", () => {
     host.daemonEvents.onDisconnected(second);
     await Promise.resolve();
 
+    // Three listeners: the host-level reconnect-governor listener installed
+    // at construction plus the two notification-only subscribers. One
+    // simulated Tauri event fires every registered callback once.
     const entries = capturedListens.filter((x) => x.event === "daemon:disconnected");
-    expect(entries).toHaveLength(2);
-    entries[0]?.cb({ payload: undefined });
-    entries[1]?.cb({ payload: undefined });
+    expect(entries).toHaveLength(3);
+    for (const entry of entries) entry.cb({ payload: undefined });
 
     expect(first).toHaveBeenCalledTimes(1);
     expect(second).toHaveBeenCalledTimes(1);
-    expect(capturedInvokes.filter((x) => x.cmd === "reconnect_to_daemon")).toHaveLength(1);
+    expect(capturedInvokes.filter((x) => x.cmd === "reconnect_to_daemon")).toEqual([
+      {
+        cmd: "reconnect_to_daemon",
+        args: { force: true },
+      },
+    ]);
 
     resolveReconnect();
     await reconnectPromiseOverride;
+  });
+
+  it("latched auto-reconnect suppresses the disconnect redial until a manual reconnect", async () => {
+    const host = createTauriHost({ transport: stubTransport });
+    await Promise.resolve();
+
+    host.daemon.autoReconnect?.latchFailure("initial load failed");
+    expect(host.daemon.autoReconnect?.getState()).toEqual({
+      kind: "latched",
+      reason: "initial load failed",
+    });
+
+    const entries = capturedListens.filter((x) => x.event === "daemon:disconnected");
+    for (const entry of entries) entry.cb({ payload: undefined });
+    expect(capturedInvokes.filter((x) => x.cmd === "reconnect_to_daemon")).toEqual([]);
+
+    // Manual Retry drops the latch and dials once.
+    await host.daemon.reconnect({ force: true });
+    expect(host.daemon.autoReconnect?.getState()).toEqual({ kind: "idle" });
+    expect(capturedInvokes.filter((x) => x.cmd === "reconnect_to_daemon")).toEqual([
+      {
+        cmd: "reconnect_to_daemon",
+        args: { force: true },
+      },
+    ]);
+  });
+
+  it("autoReconnect.retryNow dials through the governor and no-ops while latched", async () => {
+    const host = createTauriHost({ transport: stubTransport });
+    await Promise.resolve();
+
+    host.daemon.autoReconnect?.retryNow();
+    expect(capturedInvokes.filter((x) => x.cmd === "reconnect_to_daemon")).toEqual([
+      {
+        cmd: "reconnect_to_daemon",
+        args: { force: true },
+      },
+    ]);
+
+    // Link comes up (governor returns to idle), then the room load fails
+    // terminally: retryNow must not bypass the latch, that path is
+    // reserved for the manual Retry's reset.
+    for (const entry of capturedListens.filter((x) => x.event === "daemon:ready")) {
+      entry.cb({ payload: { runtime: "python" } });
+    }
+    host.daemon.autoReconnect?.latchFailure("initial load failed");
+    host.daemon.autoReconnect?.retryNow();
+    expect(capturedInvokes.filter((x) => x.cmd === "reconnect_to_daemon")).toHaveLength(1);
   });
 
   it("exposes a command registry", () => {
@@ -463,6 +592,7 @@ describe("createTauriHost()", () => {
         "menu:open",
         "menu:clone",
         "menu:insert-cell",
+        "menu:change-cell-type",
         "menu:clear-outputs",
         "menu:clear-all-outputs",
         "menu:run-all",
@@ -495,6 +625,14 @@ describe("createTauriHost()", () => {
     await expect(host.window.getTitle()).resolves.toBe("notebook");
     await host.window.setTitle("* notebook");
     await expect(host.window.getTitle()).resolves.toBe("* notebook");
+  });
+
+  it("window.setTheme routes to getCurrentWindow theme chrome", async () => {
+    const host = createTauriHost({ transport: stubTransport });
+    await host.window.setTheme("dark");
+    expect(mockWindowTheme).toBe("dark");
+    await host.window.setTheme(null);
+    expect(mockWindowTheme).toBeNull();
   });
 
   it("window.onFocusChange forwards focused boolean and returns a working unlisten", async () => {
@@ -644,6 +782,32 @@ describe("createTauriHost()", () => {
     expect(capturedInvokes.map((x) => x.cmd)).toEqual(["begin_upgrade", "open_settings_window"]);
   });
 
+  it("settings routes synced settings through host IPC and events", async () => {
+    const host = createTauriHost({ transport: stubTransport });
+    const settings = await host.settings.getSynced();
+    await host.settings.setSynced("theme", "dark");
+    await expect(host.settings.rotateInstallId()).resolves.toBe("install-2");
+
+    expect(settings).toEqual({ theme: "system", color_theme: "classic" });
+    expect(capturedInvokes.map((x) => x.cmd)).toEqual([
+      "get_synced_settings",
+      "set_synced_setting",
+      "rotate_install_id",
+    ]);
+    expect(capturedInvokes[1].args).toEqual({ key: "theme", value: "dark" });
+
+    const received: unknown[] = [];
+    mockUnlisten.mockClear();
+    const unlisten = host.settings.onChanged((payload) => received.push(payload));
+    await Promise.resolve();
+    const entry = capturedListens.find((x) => x.event === "settings:changed");
+    entry?.cb({ payload: { theme: "light" } });
+    expect(received).toEqual([{ theme: "light" }]);
+    unlisten();
+    await Promise.resolve();
+    expect(mockUnlisten).toHaveBeenCalled();
+  });
+
   it("host.log forwards each level to plugin-log", () => {
     const host = createTauriHost({ transport: stubTransport });
     host.log.debug("hello");
@@ -679,6 +843,28 @@ describe("createTauriHost()", () => {
     entry?.cb({ payload: "gibberish" });
     await Promise.resolve();
     expect(handler).toHaveBeenCalledTimes(3); // still 3 — the 4th was skipped
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("menu bridge accepts code/markdown payloads on menu:change-cell-type and drops the rest", async () => {
+    const host = createTauriHost({ transport: stubTransport });
+    const handler = vi.fn();
+    host.commands.register("notebook.changeCellType", handler);
+    const entry = capturedListens.find((x) => x.event === "menu:change-cell-type");
+    await Promise.resolve();
+
+    entry?.cb({ payload: "markdown" });
+    entry?.cb({ payload: "code" });
+    await Promise.resolve();
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(handler).toHaveBeenNthCalledWith(1, { type: "markdown" });
+    expect(handler).toHaveBeenNthCalledWith(2, { type: "code" });
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    entry?.cb({ payload: "raw" });
+    await Promise.resolve();
+    expect(handler).toHaveBeenCalledTimes(2);
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });

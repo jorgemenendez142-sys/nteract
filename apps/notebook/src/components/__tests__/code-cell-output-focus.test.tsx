@@ -140,6 +140,7 @@ vi.mock("../../lib/cursor-registry", () => ({
 vi.mock("../../lib/editor-registry", () => ({
   registerCellEditor: vi.fn(),
   unregisterCellEditor: vi.fn(),
+  getCellEditor: vi.fn(() => null),
 }));
 
 vi.mock("../../lib/kernel-completion", () => ({
@@ -629,6 +630,33 @@ describe("CodeCell output focus", () => {
     expect(getByTestId("output").getAttribute("data-use-output-well")).toBe("true");
     expect(queryByLabelText("Output mode")).toBeNull();
     expect(getByTitle("Hide outputs")).toBeTruthy();
+  });
+
+  it("keeps the output comment button reachable from keyboard navigation", () => {
+    const onCreateOutputComment = vi.fn();
+    const { getByRole } = render(
+      <CodeCell
+        cell={makeCell()}
+        onFocus={() => {}}
+        onExecute={() => {}}
+        onInterrupt={() => {}}
+        onDelete={() => {}}
+        onCreateOutputComment={onCreateOutputComment}
+      />,
+    );
+
+    const commentButton = getByRole("button", { name: "Comment on outputs" });
+    expect(commentButton).not.toHaveAttribute("tabindex", "-1");
+    expect(commentButton).toHaveClass("focus-visible:ring-2");
+
+    fireEvent.click(commentButton);
+
+    expect(onCreateOutputComment).toHaveBeenCalledWith({
+      kind: "output",
+      cell_id: "code-1",
+      execution_id: undefined,
+      output_id: undefined,
+    });
   });
 
   it("keeps output chrome for a single sift table without layout mode controls", () => {

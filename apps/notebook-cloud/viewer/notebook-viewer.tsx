@@ -8,23 +8,32 @@ import {
   type ReactNode,
 } from "react";
 import { NotebookHostProvider } from "@nteract/notebook-host";
-import { AlertCircle, Check, Loader2, PanelLeftOpen, X } from "lucide-react";
+import { AlertCircle, Check, Info, Loader2, LogIn, PanelLeftOpen, X } from "lucide-react";
 import type { NteractEmbedHostContextPatch } from "@/components/isolated/host-context";
 import {
   useHasIsolatedOutputs,
   useIsolatedRenderer,
 } from "@/components/isolated/isolated-renderer-context";
-import { NotebookNotice } from "@/components/notebook/NotebookNotice";
 import type { NotebookRailPanelId } from "@/components/notebook-rail";
+import { NotebookNotice } from "@/components/notebook/NotebookNotice";
 import {
+  markdownProjectionMatchesSource,
+  renderedTextForSourceRange,
+  resolveMarkdownProjection,
+} from "@/lib/markdown-projection";
+import {
+  NotebookAccessGate,
   NotebookConnectionIdentity,
+  NotebookCommentsPanel,
   NotebookDocumentToolbar,
   navigateNotebookOutlineItem,
   NotebookDocumentRail,
   NotebookDocumentShell,
   NotebookPackageSummaryPanel,
   NotebookWorkstationsPanel,
+  KernelLaunchErrorBanner,
   projectNotebookCommandRuntimeStatusFromRuntimeState,
+  shouldShowKernelLaunchErrorBanner,
   shouldShowNotebookDocumentCommandToolbar,
   useActiveOutlineItemId,
   useOutlineSelection,
@@ -34,17 +43,37 @@ import {
   type NotebookInteractionMode,
   type NotebookPackageSection,
   flushCellUIState,
+  getCellById,
   setFocusedCellId,
   useFocusedCellId,
   useNotebookViewModel,
+  type CommentAuthor,
+  type CommentAnchor,
+  type CommentThreadSnapshot,
+  type CommentsProjection,
+  type NotebookCommentDraftTarget,
 } from "@/components/notebook";
+import { resolveCommentsUiSurface } from "@/components/notebook/comments-ui-gate";
+import {
+  openNotebookRailPanel,
+  setActiveNotebookRailPanel,
+  setNotebookRailCollapsed,
+  useNotebookRailUiState,
+} from "@/components/notebook/state/rail-ui-state";
+import {
+  outputCommentAnchorMatchesLiveState,
+  useDemoteDetachedOutputCommentThreads,
+} from "@/components/notebook/output-comment-demotion";
 import { useWidgetStoreRequired } from "@/components/widgets/widget-store-context";
 import { useTheme } from "@/hooks/useTheme";
 import { EnvironmentSummary } from "@/components/environment";
 import {
+  colorForActorIdentity,
+  contrastColorForActorIdentity,
   NotebookClient,
   workstationAttachmentCanExecute,
   workstationAttachmentIsConnected,
+  type ActorDisplay,
   type CellChangeset,
   type NotebookOutlineItem,
   type SyncEngineLogger,
@@ -57,31 +86,39 @@ import {
   cloudSyncAuthFromAppSessionCookie,
   cloudSyncAuthFromPrototypeAuthState,
   prepareCloudOidcViewerLogin,
-  storeCloudRequestedScope,
   shouldShowCloudHeaderSignIn,
 } from "./collaborator-auth";
 import type { ConnectionScope } from "../src/auth-shared";
 
 import { useCloudViewerSession } from "./cloud-viewer-session";
+import { NotebookView } from "../../notebook/src/notebook-surface";
+import { InlineCommentComposer } from "../../notebook/src/components/InlineCommentComposer";
 import {
-  cloudBrowserApiAuthStateForFetch,
-  cloudSyncAuthConnectionKey,
-} from "./session-auth-stability";
+  setSourceCommentThreads,
+  type SourceCommentThread,
+} from "../../notebook/src/lib/comment-highlights";
+import {
+  resolveSourceRangeAnchor,
+  type OutputCommentAnchor,
+  type SourceCommentSelectionRect,
+  type SourceRangeCommentAnchor,
+} from "../../notebook/src/lib/comment-source-anchor";
 import {
   CrdtBridgeProvider,
   createNotebookCellId,
   createNotebookController,
-  NotebookView,
   PresenceValueProvider,
-  getCellById,
+  type PresenceContextValue,
+} from "@/components/notebook";
+import {
   useRuntimeState,
   useWorkstationAttachment,
-  type PresenceContextValue,
-} from "../../notebook/src/notebook-surface";
+} from "@/components/notebook/state/runtime-state";
 import { beginOidcLogin } from "./oidc-auth";
 import { cloudViewerLoadingPolicy } from "./loading-policy";
 import { markCloudViewerLoadMilestone } from "./load-milestones";
 import { cloudPresenceHasRuntimePeer, cloudPresenceRuntimePeerCount } from "./presence";
+import { commentAuthorActorLabels } from "./comment-author-profiles";
 import type { ResolvedCell } from "./render-resolution";
 import {
   CloudNotebookNotices,
@@ -100,34 +137,25 @@ import {
 import { useOfflineMergeNoticeAutoClear } from "./use-offline-merge-notice";
 import { useSustainedReconnecting } from "./use-sustained-reconnecting";
 import type { ViewerStatus } from "./notice-types";
-import type { CloudNotebookAccessRequest } from "./sharing-client";
 import { CloudSharingControls } from "./sharing-controls";
 import { createCloudNotebookHost } from "./cloud-notebook-host";
 import { cloudResponseError } from "./cloud-response";
 import { preloadSiftWasmForCells } from "./sift-preload";
 import { cloudSourceLanguage } from "./source-language";
 import { clearCloudAppSession, readCloudAppSessionStatus } from "./app-session";
+import type { CloudAccessRequestNoticeProjection } from "./cloud-access-request-state";
 import {
-  projectCloudAccessRequestTransition,
-  type CloudAccessRequestNoticeProjection,
-} from "./cloud-access-request-state";
-import {
+  cloudNotebookCatalogAccessFromCatalogResponse,
   cloudNotebookSyncScopeForCatalogAccess,
   createCloudNotebookCatalogAccessLoader,
-  type CloudNotebookCatalogAccessLoadResult,
-  type CloudNotebookCatalogAccessScope,
 } from "./cloud-notebook-catalog-access";
 import { applyDocumentTheme, CLOUD_VIEWER_THEME_STORAGE_KEY } from "./theme";
-import {
-  cloudNotebookModeFromSearch,
-  replaceCloudNotebookModeInCurrentUrl,
-} from "./cloud-notebook-mode";
+import { replaceCloudNotebookModeInCurrentUrl } from "./cloud-notebook-mode";
 import {
   CloudAccessFactsStore,
-  cloudCatalogAccessFacts,
-  projectCloudAccessLiveRoomPolicy,
   type CloudAccessFactsProjection,
   type CloudAccessSourceFacts,
+  type CloudCatalogAccessFacts,
 } from "./cloud-access-facts";
 import { useCloudFactsProjection } from "./cloud-facts-react";
 import type {
@@ -135,19 +163,40 @@ import type {
   CloudViewerAuthConfig,
   ViewerRuntime,
 } from "./cloud-viewer-types";
+import { useCloudAuthStore } from "./cloud-auth-context";
+import { useCloudStores } from "./cloud-stores-context";
 import {
-  useCloudAppSessionBridge,
-  useCloudAppSessionStatus,
-  useCloudPrototypeAuth,
-} from "./use-cloud-auth";
+  useBrowserApiAuthState,
+  useCloudAppSession,
+  useCloudAuthRenewal,
+  useCloudAuthState,
+  useCloudSyncAuthConnectionKey,
+} from "./use-cloud-auth-store";
+import {
+  useCloudAccessRequestController,
+  useCloudAccessRequestFacts,
+  useCloudSelectedMode,
+} from "./use-cloud-access-request-controller";
+import {
+  useCloudCatalogAccessFacts,
+  useCloudCatalogController,
+  useCloudCatalogLiveRoomPolicy,
+  useCloudNotebookTitle,
+  useCloudNotebookTitleError,
+} from "./use-cloud-catalog-store";
+import {
+  useCloudUserProfiles,
+  useCloudUserStoreController,
+  useResolvedActorProfile,
+} from "./use-cloud-user-store";
 import { useCloudShellCapabilities } from "./use-cloud-shell-capabilities";
 import { useCloudWorkstationManager } from "./use-cloud-workstations";
-import { CloudNotebookSignInButton } from "./cloud-auth-controls";
+import { cloudSignInMethodForConfig, CloudNotebookSignInButton } from "./cloud-auth-controls";
 import { CloudNotebookEditModeButton } from "./cloud-edit-mode-button";
 import { CloudNotebookTitle, cloudNotebookRouteTitle } from "./cloud-notebook-title";
 import {
-  cloudNotebookCatalogResponseTitle,
   cloudNotebookDocumentTitle,
+  cloudNotebookGatedTitle,
   cloudNotebookTitleDisplay,
   cloudNotebookUrlAfterRename,
   type CloudNotebookCatalogResponse,
@@ -162,8 +211,18 @@ const cloudNotebookClientLogger: SyncEngineLogger = {
 };
 
 const CLOUD_VIEWER_OUTPUT_IFRAME_ROOT_MARGIN = "400px 0px";
-const CLOUD_ACCESS_REQUEST_POLL_INTERVAL_MS = 30_000;
 const CLOUD_EMPTY_ROOM_GRACE_MS = 900;
+
+function mapToCommentAuthor(display: ActorDisplay): CommentAuthor {
+  return {
+    displayName: display.displayName,
+    color: display.color,
+    imageUrl: display.imageUrl,
+    isAgent: display.isAgent,
+    onBehalfOf: display.onBehalfOf,
+    onBehalfOfColor: display.onBehalfOfColor,
+  };
+}
 
 function decodeHashAnchorId(hash: string): string {
   const raw = hash.startsWith("#") ? hash.slice(1) : hash;
@@ -174,28 +233,17 @@ function decodeHashAnchorId(hash: string): string {
   }
 }
 
-function shouldPollPendingCloudAccessRequest(): boolean {
-  return typeof document === "undefined" || document.visibilityState !== "hidden";
-}
-
 function useCloudAccessFactsProjection(source: CloudAccessSourceFacts): CloudAccessFactsProjection {
   return useCloudFactsProjection(source, (initial) => new CloudAccessFactsStore(initial));
 }
 
-async function resolveCloudAppSessionSyncScope(
-  loadCatalogAccess: () => Promise<CloudNotebookCatalogAccessLoadResult>,
+function resolveCloudAppSessionSyncScope(
+  catalog: CloudCatalogAccessFacts,
   selectedMode: NotebookInteractionMode,
-): Promise<Exclude<ConnectionScope, "runtime_peer">> {
-  try {
-    return cloudNotebookSyncScopeForCatalogAccess({
-      ...(await loadCatalogAccess()),
-      selectedMode,
-    });
-  } catch (error) {
-    console.warn("[notebook-cloud] unable to resolve notebook access scope before sync", error);
-  }
+): Exclude<ConnectionScope, "runtime_peer"> {
   return cloudNotebookSyncScopeForCatalogAccess({
-    catalogResolved: false,
+    catalogResolved: catalog.status === "ready",
+    catalogScope: catalog.scope,
     selectedMode,
   });
 }
@@ -208,40 +256,35 @@ export function NotebookViewer({
   authConfig: CloudViewerAuthConfig;
 }) {
   const { config } = runtime;
+  // Store actions and snapshot reads below resolve through their consumption
+  // contexts (the singletons by default) so provider overrides route this
+  // component to the same instances it reads and mutates.
+  const auth = useCloudAuthStore();
+  const { accessRequest, catalog, user } = useCloudStores();
   const routeTitle = useMemo(() => cloudNotebookRouteTitle(), []);
-  const [catalogNotebookTitle, setCatalogNotebookTitle] = useState<string | null | undefined>(
-    undefined,
-  );
   const [notebookTitleSaving, setNotebookTitleSaving] = useState(false);
-  const [notebookTitleError, setNotebookTitleError] = useState<string | null>(null);
-  const notebookTitle = useMemo(
-    () => cloudNotebookTitleDisplay(catalogNotebookTitle, routeTitle),
-    [catalogNotebookTitle, routeTitle],
-  );
   const loadingPolicy = useMemo(() => cloudViewerLoadingPolicy(config), [config.headsHash]);
   const { resolvedTheme } = useTheme(CLOUD_VIEWER_THEME_STORAGE_KEY);
+  const commentsUiEnabled = config.featureFlags?.enable_comments === true;
   const { store: widgetStore } = useWidgetStoreRequired();
-  const appSessionStatus = useCloudAppSessionStatus(config.session ?? null);
-  const hasAppSession = Boolean(appSessionStatus.session);
-  const { authState, authRenewal, refreshAuthState } = useCloudPrototypeAuth(authConfig, {
-    appSessionRefreshFallback: true,
-    appSessionLoading: appSessionStatus.status === "loading",
-    appSession: appSessionStatus.session,
-  });
-  const authStateRef = useRef(authState);
-  useEffect(() => {
-    authStateRef.current = authState;
-  }, [authState]);
-  const appSessionStatusRef = useRef(appSessionStatus);
-  useEffect(() => {
-    appSessionStatusRef.current = appSessionStatus;
-  }, [appSessionStatus]);
-  useCloudAppSessionBridge(
-    authState,
-    appSessionStatus.session,
-    appSessionStatus.status === "loading",
-    appSessionStatus.refreshAppSessionStatus,
+  // Selected interaction mode and the user's edit-access request are owned by the
+  // access-request store; this component reads them through its domain hooks and
+  // writes them through store actions (setSelectedMode, requestEditAccess, reset).
+  const selectedInteractionMode = useCloudSelectedMode();
+  const accessRequestFacts = useCloudAccessRequestFacts();
+  const handleSelectInteractionMode = useCallback(
+    (mode: NotebookInteractionMode) => {
+      accessRequest.setSelectedMode(mode);
+    },
+    [accessRequest],
   );
+  const appSessionStatus = useCloudAppSession();
+  const hasAppSession = Boolean(appSessionStatus.session);
+  const authState = useCloudAuthState();
+  const authRenewal = useCloudAuthRenewal();
+  const refreshAuthState = useCallback(() => {
+    auth.refreshAuthState();
+  }, [auth]);
   // Cell focus is owned by the shared cell-ui-state store, not host React state.
   // NotebookView already writes and synchronously flushes the interaction target
   // on user focus (publishInteractionTarget, which carries the real
@@ -256,40 +299,24 @@ export function NotebookViewer({
     flushCellUIState();
   }, []);
   const handleNotebookViewFocus = useCallback(() => {}, []);
-  const [activeRailPanel, setActiveRailPanel] = useState<NotebookRailPanelId>("outline");
-  const [railCollapsed, setRailCollapsed] = useState(initialCloudRailCollapsed);
-  const handledHeadingHashRef = useRef<string | null>(null);
-  const [latestAccessRequest, setLatestAccessRequest] = useState<CloudNotebookAccessRequest | null>(
+  const { activePanelId: activeRailPanel, collapsed: railCollapsed } = useNotebookRailUiState();
+  const [commentsProjection, setCommentsProjection] = useState<CommentsProjection | null>(null);
+  const [commentsError, setCommentsError] = useState<string | null>(null);
+  const [commentDraftTarget, setCommentDraftTarget] = useState<NotebookCommentDraftTarget | null>(
     null,
   );
-  const [catalogAccessScope, setCatalogAccessScope] =
-    useState<CloudNotebookCatalogAccessScope | null>(null);
-  const [catalogAccessResolved, setCatalogAccessResolved] = useState(false);
-  const [catalogAccessLoadFailed, setCatalogAccessLoadFailed] = useState(false);
-  const [accessRequestError, setAccessRequestError] = useState<string | null>(null);
-  const [selectedInteractionMode, setSelectedInteractionMode] = useState<NotebookInteractionMode>(
-    () => cloudNotebookModeFromSearch(window.location.search),
+  const [sourceCommentRequest, setSourceCommentRequest] = useState<{
+    anchor: SourceRangeCommentAnchor;
+    rect: SourceCommentSelectionRect;
+    quote?: string | null;
+  } | null>(null);
+  const [commentFocus, setCommentFocus] = useState<{ threadId: string; nonce: number } | null>(
+    null,
   );
-  const [editAccessRequestedByUser, setEditAccessRequestedByUser] = useState(false);
-  // Scope resolution reads the latest selected mode at connect time, but
-  // access-mode correction itself must not rebuild the live-room callback:
-  // viewer-owned `?mode=edit` links are corrected to view mode after access is
-  // known, and making that correction a dependency tears the room down.
-  const selectedInteractionModeRef = useRef(selectedInteractionMode);
-  useEffect(() => {
-    selectedInteractionModeRef.current = selectedInteractionMode;
-  }, [selectedInteractionMode]);
+  const [dismissedLaunchError, setDismissedLaunchError] = useState<string | null>(null);
+  const handledHeadingHashRef = useRef<string | null>(null);
   const [emptyRoomGraceElapsed, setEmptyRoomGraceElapsed] = useState(false);
-  const browserApiAuthState = useMemo(
-    () => cloudBrowserApiAuthStateForFetch(authState),
-    [
-      authState.mode,
-      authState.mode === "dev" ? authState.token : null,
-      authState.mode === "dev" ? authState.user : null,
-      authState.mode === "dev" ? authState.requestedScope : null,
-      authState.mode === "dev" ? authState.problem : null,
-    ],
-  );
+  const browserApiAuthState = useBrowserApiAuthState();
   const canUseAuthenticatedCloudApi = cloudBrowserCanUseAuthenticatedApi({
     authState,
     hasAppSession,
@@ -298,10 +325,9 @@ export function NotebookViewer({
     () =>
       createCloudNotebookCatalogAccessLoader({
         notebookId: config.notebookId,
-        loadNotebooks: async () => {
-          const endpoint = new URL("api/n?limit=100", `${window.location.origin}/`);
+        loadCatalogAccess: async () => {
           const response = await fetchWithCloudPrototypeAuth(
-            endpoint.href,
+            config.catalogEndpoint,
             {
               cache: "no-store",
               headers: { Accept: "application/json" },
@@ -309,86 +335,41 @@ export function NotebookViewer({
             browserApiAuthState,
           );
           if (!response.ok) {
-            throw new Error(`Unable to load notebook catalog: ${response.status}`);
+            throw await cloudResponseError(response, "Unable to load notebook catalog");
           }
-          const body = (await response.json()) as { notebooks?: unknown };
-          return Array.isArray(body.notebooks) ? body.notebooks : [];
+          return cloudNotebookCatalogAccessFromCatalogResponse(
+            (await response.json()) as CloudNotebookCatalogResponse,
+            config.notebookId,
+          );
         },
       }),
-    [browserApiAuthState, config.notebookId],
+    [browserApiAuthState, config.catalogEndpoint, config.notebookId],
   );
-  const catalogAccessFacts = useMemo(
-    () =>
-      cloudCatalogAccessFacts({
-        canUseAuthenticatedCloudApi,
-        loadFailed: catalogAccessLoadFailed,
-        resolved: catalogAccessResolved,
-        scope: catalogAccessScope,
-      }),
-    [
-      canUseAuthenticatedCloudApi,
-      catalogAccessLoadFailed,
-      catalogAccessResolved,
-      catalogAccessScope,
-    ],
+  // Catalog access and the notebook title are owned by the catalog store. The
+  // loader is host-built (it carries the browser API auth identity); the store
+  // drives the fetch, projects the access facts and live-room policy, and is the
+  // single writer of the title. `loadCatalogAccess` ignores the abort signal to
+  // match the loader's coalescing contract; fetchLatest's switchMap drops the
+  // superseded result.
+  const loadCatalogAccess = useCallback(
+    (_signal: AbortSignal) => catalogAccessLoader.load(),
+    [catalogAccessLoader],
   );
-  useEffect(() => {
-    if (!canUseAuthenticatedCloudApi) {
-      setCatalogNotebookTitle(undefined);
-      setNotebookTitleError(null);
-      return;
-    }
-
-    const controller = new AbortController();
-    let cancelled = false;
-    void (async () => {
-      try {
-        const response = await fetchWithCloudPrototypeAuth(
-          config.catalogEndpoint,
-          {
-            cache: "no-store",
-            headers: { Accept: "application/json" },
-            signal: controller.signal,
-          },
-          browserApiAuthState,
-        );
-        if (!response.ok) {
-          throw await cloudResponseError(response, "Unable to load notebook title");
-        }
-        const body = (await response.json()) as CloudNotebookCatalogResponse;
-        const title = cloudNotebookCatalogResponseTitle(body, config.notebookId);
-        if (!cancelled) {
-          setCatalogNotebookTitle(title);
-          setNotebookTitleError(null);
-        }
-      } catch (error) {
-        if (
-          cancelled ||
-          (typeof DOMException !== "undefined" &&
-            error instanceof DOMException &&
-            error.name === "AbortError")
-        ) {
-          return;
-        }
-        console.warn("[notebook-cloud] unable to load notebook title", error);
-        if (!cancelled) {
-          setCatalogNotebookTitle(undefined);
-        }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, [browserApiAuthState, canUseAuthenticatedCloudApi, config.catalogEndpoint, config.notebookId]);
-  const catalogLiveRoomPolicy = useMemo(
-    () =>
-      projectCloudAccessLiveRoomPolicy({
-        canUseAuthenticatedCloudApi,
-        catalog: catalogAccessFacts,
-      }),
-    [canUseAuthenticatedCloudApi, catalogAccessFacts],
+  useCloudCatalogController({
+    canUseAuthenticatedCloudApi,
+    loadCatalogAccess,
+    initialCatalogAccess: config.initialCatalogAccess,
+  });
+  useCloudUserStoreController(config.authorProfilesEndpoint ?? null);
+  const catalogAccessFacts = useCloudCatalogAccessFacts();
+  const catalogAccessScope = catalogAccessFacts.scope;
+  const catalogAccessResolved = catalogAccessFacts.status === "ready";
+  const catalogLiveRoomPolicy = useCloudCatalogLiveRoomPolicy();
+  const catalogNotebookTitle = useCloudNotebookTitle();
+  const notebookTitleError = useCloudNotebookTitleError();
+  const notebookTitle = useMemo(
+    () => cloudNotebookTitleDisplay(catalogNotebookTitle, routeTitle),
+    [catalogNotebookTitle, routeTitle],
   );
   const effectiveLoadingPolicy = useMemo(
     () => ({
@@ -421,33 +402,31 @@ export function NotebookViewer({
     },
     [config.blobBasePath, config.rendererAssetsBasePath, config.rendererAssets.siftWasm],
   );
-  const syncAuthConnectionKey = cloudSyncAuthConnectionKey(authState, {
-    hasAppSession,
-  });
+  const syncAuthConnectionKey = useCloudSyncAuthConnectionKey();
   const liveRoomDisabledStatus = loadingPolicy.shouldConnectLiveRoom
     ? catalogLiveRoomPolicy.disabledStatus
     : null;
   const resolveSyncAuth = useCallback(
     async (sessionId: string) => {
-      const currentAppSessionStatus = appSessionStatusRef.current;
+      const currentAppSessionStatus = auth.appSessionSnapshot;
       const appSession =
         currentAppSessionStatus.session ??
         (currentAppSessionStatus.status === "loading"
           ? ((await readCloudAppSessionStatus().catch(() => null))?.session ?? null)
           : null);
       if (appSession) {
-        const requestedScope = await resolveCloudAppSessionSyncScope(
-          catalogAccessLoader.load,
-          selectedInteractionModeRef.current,
+        const requestedScope = resolveCloudAppSessionSyncScope(
+          catalog.catalogAccessFactsSnapshot,
+          accessRequest.selectedModeSnapshot,
         );
         return cloudSyncAuthFromAppSessionCookie({
           requestedScope,
           sessionId,
         });
       }
-      return cloudSyncAuthFromPrototypeAuthState(authStateRef.current);
+      return cloudSyncAuthFromPrototypeAuthState(auth.authSnapshot);
     },
-    [catalogAccessLoader, config.notebookId, syncAuthConnectionKey],
+    [accessRequest, auth, catalog, config.notebookId, syncAuthConnectionKey],
   );
   const {
     connectionActorLabel,
@@ -482,6 +461,56 @@ export function NotebookViewer({
     resolveSyncAuth,
     widgetStore,
   });
+  useEffect(
+    () => user.connectPresence(presenceStore, () => auth.authSnapshot),
+    [auth, presenceStore, user],
+  );
+  const selfProfile = useResolvedActorProfile(connectionActorLabel);
+  useEffect(() => {
+    if (!connectionActorLabel || !config.authorProfilesEndpoint) {
+      return;
+    }
+    user.requestResolve([connectionActorLabel]);
+  }, [config.authorProfilesEndpoint, connectionActorLabel, user]);
+  const selfDisplay = useMemo(() => {
+    const label = selfProfile?.displayName?.trim() || null;
+    const imageUrl = selfProfile?.avatarUrl?.trim() || null;
+    if (!label && !imageUrl) {
+      return undefined;
+    }
+    return { label, imageUrl };
+  }, [connectionActorLabel, selfProfile?.avatarUrl, selfProfile?.displayName]);
+  // Mirror the desktop app: expose the local author's comment color and a
+  // legible foreground as CSS vars the shared affordance and composer styles
+  // read. The cloud viewer previously set neither, so cloud create surfaces fell
+  // back to the neutral --primary.
+  useEffect(() => {
+    if (!connectionActorLabel) return;
+    const color = colorForActorIdentity(connectionActorLabel);
+    const contrast = contrastColorForActorIdentity(connectionActorLabel);
+    document.documentElement.style.setProperty("--comment-author-color", color);
+    document.documentElement.style.setProperty("--comment-author-contrast", contrast);
+    return () => {
+      document.documentElement.style.removeProperty("--comment-author-color");
+      document.documentElement.style.removeProperty("--comment-author-contrast");
+    };
+  }, [connectionActorLabel]);
+  useEffect(() => {
+    const liveRuntime = liveRuntimeRef.current;
+    if (!liveRuntime) {
+      setCommentsProjection(null);
+      return;
+    }
+    const initialProjection = liveRuntime.handle.get_comments_projection?.() as
+      | CommentsProjection
+      | undefined;
+    setCommentsProjection(initialProjection ?? null);
+    const subscription = liveRuntime.engine.commentsProjection$.subscribe((projection) => {
+      setCommentsProjection(projection);
+      setCommentsError(null);
+    });
+    return () => subscription.unsubscribe();
+  }, [connectionPeerId, liveRuntimeRef]);
   const cloudExecutionStartPromiseRef = useRef<Promise<boolean> | null>(null);
   const cloudNotebookHost = useMemo(
     () =>
@@ -510,7 +539,38 @@ export function NotebookViewer({
     presenceStore.getSnapshot,
     presenceStore.getSnapshot,
   );
+  const commentAuthorLabels = useMemo(
+    () => commentAuthorActorLabels(commentsProjection),
+    [commentsProjection],
+  );
+  const commentAuthorLabelsKey = commentAuthorLabels.join("\u0000");
+  const profilesSnapshot = useCloudUserProfiles();
+  useEffect(() => {
+    if (commentAuthorLabelsKey === "") {
+      return;
+    }
+    user.requestResolve(commentAuthorLabels);
+  }, [commentAuthorLabels, commentAuthorLabelsKey, config.authorProfilesEndpoint, user]);
+  const resolveCloudCommentAuthor = useCallback(
+    (actorLabel: string): CommentAuthor => mapToCommentAuthor(user.resolve(actorLabel)),
+    [profilesSnapshot, user],
+  );
+  const resolveCloudPresenceActor = useCallback(
+    (actorLabel: string): ActorDisplay => user.resolve(actorLabel),
+    [profilesSnapshot, user],
+  );
   const runtimeState = useRuntimeState();
+  const cloudKernelLifecycle = runtimeState.kernel.lifecycle;
+  const cloudKernelErrorDetails =
+    runtimeState.kernel.error_details && runtimeState.kernel.error_details.length > 0
+      ? runtimeState.kernel.error_details
+      : null;
+  const cloudKernelErrorReason = runtimeState.kernel.error_reason;
+  useEffect(() => {
+    if (cloudKernelLifecycle.lifecycle !== "Error") {
+      setDismissedLaunchError(null);
+    }
+  }, [cloudKernelLifecycle.lifecycle]);
   // Deduplicated shared projection — re-renders only when attachment facts
   // change, not on every runtime tick (was per-host shadow state).
   const workstationAttachment = useWorkstationAttachment();
@@ -542,19 +602,15 @@ export function NotebookViewer({
   useEffect(() => {
     replaceCloudNotebookModeInCurrentUrl(selectedInteractionMode);
   }, [selectedInteractionMode]);
-  useEffect(() => {
-    if (selectedInteractionMode !== "edit") {
-      setEditAccessRequestedByUser(false);
-    }
-  }, [selectedInteractionMode]);
 
   const getOutlineStatusLabel = useOutlineStatusLabel();
   const notebookViewModel = useNotebookViewModel({
     metadata: notebookMetadata,
     resolveLanguage: cloudSourceLanguage,
     getOutlineStatusLabel,
+    includeDocumentAnchors: true,
   });
-  const { codeCellCount, outlineItems } = notebookViewModel;
+  const { codeCellCount, documentAnchors, outlineItems } = notebookViewModel;
   const notebookCellIds = notebookViewModel.cellIds;
   const activeOutlineItemId = useActiveOutlineItemId(
     outlineItems,
@@ -581,67 +637,42 @@ export function NotebookViewer({
     handleSelectOutlineItem(item);
     navigateNotebookOutlineItem(item, hash, {
       behavior: "auto",
+      documentAnchors,
       headingHashTarget: "cell",
     });
-  }, [handleSelectOutlineItem, outlineItems]);
+  }, [documentAnchors, handleSelectOutlineItem, outlineItems]);
   const handleNavigateOutlineItem = useCallback(
     (item: NotebookOutlineItem, href: string) => {
       handleSelectOutlineItem(item);
-      return navigateNotebookOutlineItem(item, href, { headingHashTarget: "cell" });
+      return navigateNotebookOutlineItem(item, href, {
+        documentAnchors,
+        headingHashTarget: "cell",
+      });
     },
-    [handleSelectOutlineItem],
+    [documentAnchors, handleSelectOutlineItem],
   );
   const handleTogglePackagesRail = useCallback(() => {
     if (activeRailPanel === "packages" && !railCollapsed) {
-      setActiveRailPanel("outline");
+      setActiveNotebookRailPanel("outline");
       return;
     }
-    setRailCollapsed(false);
-    setActiveRailPanel("packages");
+    openNotebookRailPanel("packages");
   }, [activeRailPanel, railCollapsed]);
+  const handleRailPanelChange = useCallback(
+    (panelId: NotebookRailPanelId) => {
+      if (!commentsUiEnabled && panelId === "comments") return;
+      setActiveNotebookRailPanel(panelId);
+    },
+    [commentsUiEnabled],
+  );
   const handleOpenMobileRail = useCallback(() => {
-    setRailCollapsed(false);
+    setNotebookRailCollapsed(false);
   }, []);
   const handleOpenWorkstationsRail = useCallback(() => {
-    setRailCollapsed(false);
-    setActiveRailPanel("workstations");
+    openNotebookRailPanel("workstations");
   }, []);
   const hasBrowserAppIdentity =
     hasAppSession || authState.mode === "dev" || authState.mode === "oidc";
-  useEffect(() => {
-    if (!canUseAuthenticatedCloudApi) {
-      setCatalogAccessScope(null);
-      setCatalogAccessResolved(false);
-      setCatalogAccessLoadFailed(false);
-      return;
-    }
-
-    let cancelled = false;
-    setCatalogAccessScope(null);
-    setCatalogAccessResolved(false);
-    setCatalogAccessLoadFailed(false);
-    void (async () => {
-      try {
-        const access = await catalogAccessLoader.load();
-        if (!cancelled) {
-          setCatalogAccessScope(access.catalogScope);
-          setCatalogAccessResolved(access.catalogResolved);
-          setCatalogAccessLoadFailed(false);
-        }
-      } catch {
-        if (!cancelled) {
-          setCatalogAccessScope(null);
-          setCatalogAccessResolved(false);
-          setCatalogAccessLoadFailed(true);
-        }
-        return;
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [canUseAuthenticatedCloudApi, catalogAccessLoader]);
   const cloudAccessSourceFacts = useMemo<CloudAccessSourceFacts>(
     () => ({
       canUseAuthenticatedCloudApi,
@@ -653,40 +684,39 @@ export function NotebookViewer({
         statusKind: status.kind,
       },
       hasBrowserAppIdentity,
-      request: {
-        error: accessRequestError,
-        latest: latestAccessRequest,
-        requestedByUser: editAccessRequestedByUser,
-      },
+      request: accessRequestFacts,
       selectedMode: selectedInteractionMode,
     }),
     [
-      accessRequestError,
+      accessRequestFacts,
       canUseAuthenticatedCloudApi,
       catalogAccessFacts,
       connectionError,
       connectionPeerId,
       connectionScope,
-      editAccessRequestedByUser,
       hasBrowserAppIdentity,
-      latestAccessRequest,
       selectedInteractionMode,
       status.kind,
     ],
   );
   const cloudAccessFacts = useCloudAccessFactsProjection(cloudAccessSourceFacts);
-  const {
-    accessConnectionScope,
-    catalogGrantsDocumentEdit,
-    effectiveAccessRequest,
-    selectedInteractionModeForAccess,
-    shouldLoadOwnEditAccessRequest,
-  } = cloudAccessFacts;
-  useEffect(() => {
-    if (cloudAccessFacts.shouldFallbackEditUrlToView) {
-      setSelectedInteractionMode("view");
-    }
-  }, [cloudAccessFacts.shouldFallbackEditUrlToView]);
+  const { accessConnectionScope, catalogGrantsDocumentEdit, selectedInteractionModeForAccess } =
+    cloudAccessFacts;
+  // The access-request store owns the poll, the mode corrections, and the
+  // loaded-request transition. It reads this gate/context through the controller
+  // seam; connection facts stay React-owned this branch (Phase 6 folds them in).
+  useCloudAccessRequestController({
+    facts: cloudAccessFacts,
+    browserAuth: browserApiAuthState,
+    authState: { mode: authState.mode, requestedScope: authState.requestedScope },
+    hasAppSession,
+    connectionScope,
+    catalogAccessScope,
+    endpoint: config.accessRequestsEndpoint,
+    notebookId: config.notebookId,
+    onRetryLiveConnection: retryLiveConnection,
+    onRefreshAuth: refreshAuthState,
+  });
   const saveCloudNotebookTitle = useCallback(
     async (nextTitle: string): Promise<boolean> => {
       if (!canUseAuthenticatedCloudApi || !catalogGrantsDocumentEdit || notebookTitleSaving) {
@@ -695,7 +725,7 @@ export function NotebookViewer({
 
       try {
         setNotebookTitleSaving(true);
-        setNotebookTitleError(null);
+        catalog.clearTitleError();
         const response = await fetchWithCloudPrototypeAuth(
           config.catalogEndpoint,
           {
@@ -718,7 +748,7 @@ export function NotebookViewer({
         if (body.ok !== true || body.notebook_id !== config.notebookId) {
           throw new Error("Unable to rename notebook: response shape was invalid");
         }
-        setCatalogNotebookTitle(body.title ?? null);
+        catalog.applyTitleSaved(body.title ?? null);
         if (body.viewer_url) {
           const nextHref = cloudNotebookUrlAfterRename(window.location.href, body.viewer_url);
           if (nextHref !== window.location.href) {
@@ -727,7 +757,7 @@ export function NotebookViewer({
         }
         return true;
       } catch (error) {
-        setNotebookTitleError(error instanceof Error ? error.message : String(error));
+        catalog.applyTitleSaveFailure(error instanceof Error ? error.message : String(error));
         return false;
       } finally {
         setNotebookTitleSaving(false);
@@ -736,6 +766,7 @@ export function NotebookViewer({
     [
       browserApiAuthState,
       canUseAuthenticatedCloudApi,
+      catalog,
       catalogGrantsDocumentEdit,
       config.catalogEndpoint,
       config.notebookId,
@@ -746,7 +777,7 @@ export function NotebookViewer({
     ? workstationAttachmentIsConnected(workstationAttachment)
     : runtimePeerAvailable;
   const cloudRuntimeExecutionAvailableForStatus = workstationAttachment
-    ? workstationAttachmentCanExecute(workstationAttachment)
+    ? workstationAttachmentCanExecute(workstationAttachment) && runtimePeerAvailable
     : runtimePeerAvailable;
   const cloudRuntimeStatus = useMemo<NotebookCommandToolbarStatus | null>(() => {
     if (!cloudRuntimeConnectedForStatus && !cloudRuntimeExecutionAvailableForStatus) {
@@ -761,16 +792,12 @@ export function NotebookViewer({
       ? cloudRuntimeStatus.label
       : null
     : null;
-  useEffect(() => {
-    if (cloudAccessFacts.selectedModeCorrection) {
-      setSelectedInteractionMode(cloudAccessFacts.selectedModeCorrection);
-    }
-  }, [cloudAccessFacts.selectedModeCorrection]);
   const { shellCapabilities, canAcceptCellMutations, editAccessPending } =
     useCloudShellCapabilities({
       accessConnectionScope,
       authState,
       codeCellCount,
+      selfDisplay,
       connectionActorLabel,
       connectionError,
       connectionPeerId,
@@ -779,6 +806,7 @@ export function NotebookViewer({
       hasAppSession,
       hostCapabilities: config.hostCapabilities,
       kernelStatusLabel: cloudKernelStatusLabel,
+      runtimeLastSeenAt: runtimeState.kernel.last_seen,
       runtimePeerAvailable,
       runtimePeerCount,
       selectedMode: selectedInteractionModeForAccess,
@@ -1120,206 +1148,355 @@ export function NotebookViewer({
     },
     [shellCapabilities.canEditCells, shellCapabilities.canEditMarkdown, noteLocalCellEdit],
   );
+  const canWriteComments = connectionScope === "editor" || connectionScope === "owner";
+  useEffect(() => {
+    if (!canWriteComments) {
+      setCommentDraftTarget(null);
+      setSourceCommentRequest(null);
+    }
+  }, [canWriteComments]);
+
+  const refreshCloudCommentsProjection = useCallback(() => {
+    const liveRuntime = liveRuntimeRef.current;
+    const projection = liveRuntime?.handle.get_comments_projection?.() as
+      | CommentsProjection
+      | undefined;
+    setCommentsProjection(projection ?? null);
+    return projection ?? null;
+  }, [liveRuntimeRef]);
+
+  const applyLocalCommentEvent = useCallback(
+    (event: unknown): boolean => {
+      const liveRuntime = liveRuntimeRef.current;
+      if (!liveRuntime) {
+        setCommentsError("Comments are not connected.");
+        return false;
+      }
+      const applied = liveRuntime.engine.applyLocalMutationEvent(
+        event as Parameters<typeof liveRuntime.engine.applyLocalMutationEvent>[0],
+      );
+      if (!applied) {
+        setCommentsError("Unable to update comments.");
+        return false;
+      }
+      setCommentsError(null);
+      liveRuntime.engine.scheduleFlush();
+      refreshCloudCommentsProjection();
+      return true;
+    },
+    [liveRuntimeRef, refreshCloudCommentsProjection],
+  );
+
+  const handleCreateAnchoredCommentThread = useCallback(
+    async (anchor: CommentAnchor, body: string) => {
+      if (!canWriteComments) {
+        setCommentsError("Comments are read-only.");
+        return;
+      }
+      const liveRuntime = liveRuntimeRef.current;
+      if (!liveRuntime || typeof liveRuntime.handle.create_comment_thread !== "function") {
+        setCommentsError("Comments are not ready.");
+        return;
+      }
+      try {
+        const projection = refreshCloudCommentsProjection() ?? commentsProjection;
+        const orderScope = commentAnchorThreadOrderScope(anchor);
+        const afterThreadId =
+          projection?.threads
+            .filter((thread) => commentAnchorThreadOrderScope(thread.anchor) === orderScope)
+            .at(-1)?.id ?? null;
+        const event = liveRuntime.handle.create_comment_thread(
+          createCloudCommentId("thread"),
+          createCloudCommentId("message"),
+          anchor,
+          body,
+          afterThreadId,
+          new Date().toISOString(),
+        );
+        applyLocalCommentEvent(event);
+      } catch (error) {
+        setCommentsError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [
+      applyLocalCommentEvent,
+      canWriteComments,
+      commentsProjection,
+      liveRuntimeRef,
+      refreshCloudCommentsProjection,
+    ],
+  );
+
+  const handleCreateCommentThread = useCallback(
+    async (body: string) => {
+      await handleCreateAnchoredCommentThread({ kind: "notebook" }, body);
+    },
+    [handleCreateAnchoredCommentThread],
+  );
+
+  const handleCreatePanelComment = useCallback(
+    async (body: string) => {
+      if (!commentDraftTarget) {
+        await handleCreateCommentThread(body);
+        return;
+      }
+      if (
+        commentDraftTarget.anchor.kind === "source_range" &&
+        !sourceRangeAnchorMatchesCurrentCell(commentDraftTarget.anchor)
+      ) {
+        setCommentsError("Selected source changed. Select the text again before commenting.");
+        return;
+      }
+      if (
+        commentDraftTarget.anchor.kind === "output" &&
+        !outputCommentAnchorMatchesLiveState(commentDraftTarget.anchor)
+      ) {
+        setCommentsError(OUTPUT_COMMENT_STALE_MESSAGE);
+        return;
+      }
+      await handleCreateAnchoredCommentThread(commentDraftTarget.anchor, body);
+      setCommentDraftTarget(null);
+    },
+    [commentDraftTarget, handleCreateAnchoredCommentThread, handleCreateCommentThread],
+  );
+
+  const handleRequestSourceComment = useCallback(
+    (
+      anchor: SourceRangeCommentAnchor,
+      rect: SourceCommentSelectionRect | null,
+      quote?: string | null,
+    ) => {
+      setCommentsError(null);
+      if (rect) {
+        setSourceCommentRequest({ anchor, rect, quote });
+        return;
+      }
+      setSourceCommentRequest(null);
+      setCommentDraftTarget({ anchor, quote: quote ?? anchor.exact_quote ?? null });
+      openNotebookRailPanel("comments");
+    },
+    [],
+  );
+
+  const handleRequestOutputComment = useCallback((anchor: OutputCommentAnchor) => {
+    setCommentsError(null);
+    if (!outputCommentAnchorMatchesLiveState(anchor)) {
+      setCommentsError(OUTPUT_COMMENT_STALE_MESSAGE);
+      return;
+    }
+    setSourceCommentRequest(null);
+    setCommentDraftTarget({ anchor, quote: null });
+    openNotebookRailPanel("comments");
+  }, []);
+
+  const handleSubmitSourceComment = useCallback(
+    async (body: string) => {
+      if (!sourceCommentRequest) return;
+      if (!sourceRangeAnchorMatchesCurrentCell(sourceCommentRequest.anchor)) {
+        setSourceCommentRequest(null);
+        setCommentsError("Selected source changed. Select the text again before commenting.");
+        return;
+      }
+      await handleCreateAnchoredCommentThread(sourceCommentRequest.anchor, body);
+      setSourceCommentRequest(null);
+    },
+    [handleCreateAnchoredCommentThread, sourceCommentRequest],
+  );
+
+  const handleCancelSourceComment = useCallback(() => {
+    setSourceCommentRequest(null);
+  }, []);
+
+  const handleClearCommentDraftTarget = useCallback(() => {
+    setCommentDraftTarget(null);
+  }, []);
+
+  const sourceCommentThreadsByCell = useMemo(() => {
+    const map = new Map<string, SourceCommentThread[]>();
+    for (const thread of commentsProjection?.threads ?? []) {
+      if (thread.anchor.kind !== "source_range") continue;
+      const list = map.get(thread.anchor.cell_id) ?? [];
+      const firstMessage = thread.messages[0];
+      const author = thread.created_by_actor_label
+        ? resolveCloudCommentAuthor(thread.created_by_actor_label)
+        : undefined;
+      list.push({
+        threadId: thread.id,
+        anchor: thread.anchor,
+        resolved: thread.status === "resolved",
+        color: author?.color,
+        preview: firstMessage
+          ? {
+              authorName: author?.displayName ?? "Unknown",
+              authorColor: author?.color,
+              imageUrl: author?.imageUrl,
+              isAgent: author?.isAgent,
+              onBehalfOf: author?.onBehalfOf,
+              onBehalfOfColor: author?.onBehalfOfColor,
+              body: firstMessage.body,
+              replyCount: Math.max(0, thread.messages.length - 1),
+            }
+          : undefined,
+      });
+      map.set(thread.anchor.cell_id, list);
+    }
+    return map;
+  }, [commentsProjection, resolveCloudCommentAuthor]);
+
+  useEffect(() => {
+    setSourceCommentThreads(sourceCommentThreadsByCell);
+  }, [sourceCommentThreadsByCell]);
+
+  const handleActivateCommentThread = useCallback((threadId: string) => {
+    openNotebookRailPanel("comments");
+    setCommentFocus((previous) => ({ threadId, nonce: (previous?.nonce ?? 0) + 1 }));
+  }, []);
+
+  const resolveCommentSourceLanguage = useCallback((cellId: string): string | undefined => {
+    const cell = getCellById(cellId);
+    if (cell?.cell_type !== "code") return undefined;
+    const language = typeof cell.metadata.language === "string" ? cell.metadata.language : null;
+    return cloudSourceLanguage(language);
+  }, []);
+
+  const handleReplyCommentThread = useCallback(
+    async (threadId: string, body: string) => {
+      if (!canWriteComments) return;
+      const liveRuntime = liveRuntimeRef.current;
+      if (!liveRuntime || typeof liveRuntime.handle.reply_comment_thread !== "function") {
+        setCommentsError("Comments are not ready.");
+        return;
+      }
+      try {
+        const projection = refreshCloudCommentsProjection() ?? commentsProjection;
+        const afterMessageId =
+          projection?.threads.find((thread) => thread.id === threadId)?.messages.at(-1)?.id ?? null;
+        const event = liveRuntime.handle.reply_comment_thread(
+          threadId,
+          createCloudCommentId("message"),
+          body,
+          afterMessageId,
+          new Date().toISOString(),
+        );
+        applyLocalCommentEvent(event);
+      } catch (error) {
+        setCommentsError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [
+      applyLocalCommentEvent,
+      canWriteComments,
+      commentsProjection,
+      liveRuntimeRef,
+      refreshCloudCommentsProjection,
+    ],
+  );
+  const handleResolveCommentThread = useCallback(
+    async (threadId: string) => {
+      if (!canWriteComments) return;
+      const liveRuntime = liveRuntimeRef.current;
+      if (!liveRuntime || typeof liveRuntime.handle.resolve_comment_thread !== "function") {
+        setCommentsError("Comments are not ready.");
+        return;
+      }
+      try {
+        const event = liveRuntime.handle.resolve_comment_thread(threadId, new Date().toISOString());
+        applyLocalCommentEvent(event);
+      } catch (error) {
+        setCommentsError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [applyLocalCommentEvent, canWriteComments, liveRuntimeRef],
+  );
+  const handleReopenCommentThread = useCallback(
+    async (threadId: string) => {
+      if (!canWriteComments) return;
+      const liveRuntime = liveRuntimeRef.current;
+      if (!liveRuntime || typeof liveRuntime.handle.reopen_comment_thread !== "function") {
+        setCommentsError("Comments are not ready.");
+        return;
+      }
+      try {
+        const event = liveRuntime.handle.reopen_comment_thread(threadId);
+        applyLocalCommentEvent(event);
+      } catch (error) {
+        setCommentsError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [applyLocalCommentEvent, canWriteComments, liveRuntimeRef],
+  );
+
+  const handleDemoteDetachedOutputCommentThread = useCallback(
+    (threadId: string): boolean => {
+      // Background auto-repair: report success so the hook only stops retrying
+      // once the demote commits, and stay quiet on the user-facing error state.
+      if (!canWriteComments) return false;
+      const liveRuntime = liveRuntimeRef.current;
+      if (
+        !liveRuntime ||
+        typeof liveRuntime.handle.demote_comment_thread_to_notebook !== "function"
+      ) {
+        return false;
+      }
+      try {
+        liveRuntime.handle.demote_comment_thread_to_notebook(threadId);
+        refreshCloudCommentsProjection();
+        liveRuntime.engine.scheduleFlush();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [canWriteComments, liveRuntimeRef, refreshCloudCommentsProjection],
+  );
+
+  useDemoteDetachedOutputCommentThreads({
+    commentsProjection,
+    enabled: canWriteComments,
+    demoteThreadToNotebook: handleDemoteDetachedOutputCommentThread,
+  });
+
+  const handleFocusCommentAnchor = useCallback(
+    (thread: CommentThreadSnapshot) => {
+      const cellId = thread.badge_cell_ids[0];
+      if (cellId) {
+        focusCellInStore(cellId);
+      }
+    },
+    [focusCellInStore],
+  );
   const resetPrototypeAuth = useCallback(() => {
     void clearCloudAppSession().catch((error: unknown) => {
       console.warn("[notebook-cloud] app session clear failed", error);
     });
     clearCloudPrototypeDevAuth(window.localStorage);
-    setLatestAccessRequest(null);
-    setAccessRequestError(null);
-    setSelectedInteractionMode("view");
+    accessRequest.reset();
     refreshAuthState();
-  }, [refreshAuthState]);
+  }, [accessRequest, refreshAuthState]);
   const beginNotebookAuth = useCallback(async () => {
-    const localDevAuth = authConfig.localDev;
-    if (localDevAuth) {
-      window.location.assign(localDevAuth.authUrl);
-      return;
-    }
-    if (!authConfig.oidc) {
-      resetPrototypeAuth();
-      return;
-    }
-    try {
-      prepareCloudOidcViewerLogin(window.localStorage);
-      const url = await beginOidcLogin(authConfig.oidc, {
-        currentUrl: window.location.href,
-        storage: window.localStorage,
-      });
-      window.location.assign(url.href);
-    } catch (error) {
-      console.warn("[notebook-cloud] sign-in start failed", error);
-    }
-  }, [authConfig.localDev, authConfig.oidc, resetPrototypeAuth]);
-  const applyLatestAccessRequest = useCallback(
-    (
-      request: CloudNotebookAccessRequest | null,
-      options?: { selectedMode?: NotebookInteractionMode },
-    ) => {
-      setLatestAccessRequest(request);
-      const transition = projectCloudAccessRequestTransition({
-        accessScope: catalogAccessScope,
-        authState: {
-          mode: authState.mode,
-          requestedScope: authState.requestedScope,
-        },
-        connectionScope,
-        hasAppSession,
-        request: catalogGrantsDocumentEdit ? null : request,
-        selectedMode: options?.selectedMode ?? selectedInteractionMode,
-      });
-      if (transition.requestedScope) {
-        storeCloudRequestedScope(window.localStorage, transition.requestedScope);
-      }
-      if (transition.selectedMode) {
-        setSelectedInteractionMode(transition.selectedMode);
-      }
-      if (transition.retryLiveConnection) {
-        retryLiveConnection();
-      }
-      if (transition.refreshPrototypeAuth) {
-        refreshAuthState();
-      }
-    },
-    [
-      authState.mode,
-      authState.requestedScope,
-      catalogAccessScope,
-      catalogGrantsDocumentEdit,
-      connectionScope,
-      hasAppSession,
-      refreshAuthState,
-      retryLiveConnection,
-      selectedInteractionMode,
-    ],
-  );
-  const loadOwnAccessRequest = useCallback(
-    async (options?: { signal?: AbortSignal }) => {
-      if (!shouldLoadOwnEditAccessRequest) {
-        return;
-      }
-
+    const method = cloudSignInMethodForConfig(authConfig);
+    if (method === "oidc" && authConfig.oidc) {
       try {
-        const response = await fetchWithCloudPrototypeAuth(
-          config.accessRequestsEndpoint,
-          { headers: { Accept: "application/json" }, signal: options?.signal },
-          browserApiAuthState,
-        );
-        if (options?.signal?.aborted) {
-          return;
-        }
-        if (!response.ok) {
-          return;
-        }
-        const body = (await response.json()) as {
-          access_requests?: CloudNotebookAccessRequest[];
-        };
-        setAccessRequestError(null);
-        applyLatestAccessRequest(
-          Array.isArray(body.access_requests) ? (body.access_requests[0] ?? null) : null,
-        );
-      } catch {
-        return;
-      }
-    },
-    [
-      applyLatestAccessRequest,
-      browserApiAuthState,
-      config.accessRequestsEndpoint,
-      shouldLoadOwnEditAccessRequest,
-    ],
-  );
-  useEffect(() => {
-    if (!shouldLoadOwnEditAccessRequest) {
-      setLatestAccessRequest(null);
-      return;
-    }
-    const controller = new AbortController();
-    void loadOwnAccessRequest({ signal: controller.signal });
-    return () => controller.abort();
-  }, [loadOwnAccessRequest, shouldLoadOwnEditAccessRequest]);
-  useEffect(() => {
-    if (effectiveAccessRequest?.status !== "pending" || !shouldLoadOwnEditAccessRequest) {
-      return;
-    }
-
-    const controller = new AbortController();
-    let pollInFlight = false;
-    const poll = () => {
-      if (!shouldPollPendingCloudAccessRequest() || pollInFlight) {
-        return;
-      }
-      pollInFlight = true;
-      void loadOwnAccessRequest({ signal: controller.signal }).finally(() => {
-        pollInFlight = false;
-      });
-    };
-    const intervalId = window.setInterval(() => {
-      poll();
-    }, CLOUD_ACCESS_REQUEST_POLL_INTERVAL_MS);
-    const handleVisibilityChange = () => {
-      poll();
-    };
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => {
-      controller.abort();
-      window.clearInterval(intervalId);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
-  }, [effectiveAccessRequest?.status, loadOwnAccessRequest, shouldLoadOwnEditAccessRequest]);
-  const requestCloudEditAccess = useCallback(() => {
-    void (async () => {
-      setEditAccessRequestedByUser(true);
-      setAccessRequestError(null);
-      try {
-        const response = await fetchWithCloudPrototypeAuth(
-          config.accessRequestsEndpoint,
-          {
-            method: "POST",
-            headers: {
-              Accept: "application/json",
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ scope: "editor" }),
-          },
-          browserApiAuthState,
-        );
-        if (!response.ok) {
-          throw await cloudResponseError(response, "Unable to request edit access");
-        }
-        const body = (await response.json()) as {
-          access_request?: CloudNotebookAccessRequest | null;
-          access_status?: string;
-        };
-        if (body.access_status === "granted") {
-          applyLatestAccessRequest(
-            {
-              id: "already-granted",
-              notebook_id: config.notebookId,
-              requester_principal: "",
-              scope: "editor",
-              status: "approved",
-              requested_by_actor_label: "",
-              resolved_by_actor_label: null,
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-              resolved_at: new Date().toISOString(),
-            },
-            { selectedMode: "edit" },
-          );
-          return;
-        }
-        applyLatestAccessRequest(body.access_request ?? null, { selectedMode: "edit" });
+        prepareCloudOidcViewerLogin(window.localStorage);
+        const url = await beginOidcLogin(authConfig.oidc, {
+          currentUrl: window.location.href,
+          storage: window.localStorage,
+        });
+        window.location.assign(url.href);
       } catch (error) {
-        setAccessRequestError(error instanceof Error ? error.message : String(error));
+        console.warn("[notebook-cloud] sign-in start failed", error);
       }
-    })();
-  }, [
-    applyLatestAccessRequest,
-    browserApiAuthState,
-    config.accessRequestsEndpoint,
-    config.notebookId,
-  ]);
+      return;
+    }
+    if (method === "localDev" && authConfig.localDev) {
+      window.location.assign(authConfig.localDev.authUrl);
+      return;
+    }
+    resetPrototypeAuth();
+  }, [authConfig.localDev, authConfig.oidc, resetPrototypeAuth]);
+  const requestCloudEditAccess = useCallback(() => {
+    accessRequest.requestEditAccess();
+  }, [accessRequest]);
   const shouldShowPackageEnvironmentSummary =
     shellCapabilities.canExecute || shellCapabilities.canManagePackages;
   const shouldShowCloudWorkstationsPanel =
@@ -1327,7 +1504,7 @@ export function NotebookViewer({
     shellCapabilities.auth.canUseAuthenticatedIdentity;
   useEffect(() => {
     if (!shouldShowCloudWorkstationsPanel && activeRailPanel === "workstations") {
-      setActiveRailPanel("outline");
+      setActiveNotebookRailPanel("outline");
     }
   }, [activeRailPanel, shouldShowCloudWorkstationsPanel]);
   const toolbarAddAfterCellId =
@@ -1337,9 +1514,51 @@ export function NotebookViewer({
     [],
   );
   const renderedActiveRailPanel =
-    !shouldShowCloudWorkstationsPanel && activeRailPanel === "workstations"
+    !commentsUiEnabled && activeRailPanel === "comments"
       ? "outline"
-      : activeRailPanel;
+      : !shouldShowCloudWorkstationsPanel && activeRailPanel === "workstations"
+        ? "outline"
+        : activeRailPanel;
+  const commentsPanelStatus = commentsProjection ? null : "Syncing comments...";
+  const resolveSourceQuote = useCallback((anchor: SourceRangeCommentAnchor): string | null => {
+    const cell = getCellById(anchor.cell_id);
+    if (cell?.cell_type !== "markdown") return anchor.exact_quote ?? null;
+    const range = resolveSourceRangeAnchor(cell.source, anchor);
+    if (!range) return anchor.exact_quote ?? null;
+    const plan = resolveMarkdownProjection(cell.markdownProjection, cell.source);
+    if (!plan || !markdownProjectionMatchesSource(plan, cell.source)) {
+      return anchor.exact_quote ?? null;
+    }
+    return renderedTextForSourceRange(plan, range.from, range.to) ?? anchor.exact_quote ?? null;
+  }, []);
+  const commentsPanel = (
+    <NotebookCommentsPanel
+      projection={commentsProjection}
+      readOnly={!canWriteComments}
+      draftTarget={canWriteComments ? commentDraftTarget : null}
+      statusMessage={commentsPanelStatus}
+      errorMessage={commentsError}
+      onClearDraftTarget={commentDraftTarget ? handleClearCommentDraftTarget : undefined}
+      onCreateThread={canWriteComments ? handleCreatePanelComment : undefined}
+      onReplyThread={canWriteComments ? handleReplyCommentThread : undefined}
+      onResolveThread={canWriteComments ? handleResolveCommentThread : undefined}
+      onReopenThread={canWriteComments ? handleReopenCommentThread : undefined}
+      onFocusThreadAnchor={handleFocusCommentAnchor}
+      resolveCommentAuthor={resolveCloudCommentAuthor}
+      focusedThreadId={commentFocus?.threadId ?? null}
+      focusNonce={commentFocus?.nonce ?? 0}
+      resolveSourceLanguage={resolveCommentSourceLanguage}
+      resolveSourceQuote={resolveSourceQuote}
+    />
+  );
+  const commentsUiSurface = resolveCommentsUiSurface({
+    commentsUiEnabled,
+    canCreateComments: canWriteComments,
+    commentsPanel,
+    onCreateSourceComment: handleRequestSourceComment,
+    onCreateOutputComment: handleRequestOutputComment,
+    onActivateCommentThread: handleActivateCommentThread,
+  });
   const rail = (
     <NotebookDocumentRail
       viewModel={notebookViewModel}
@@ -1349,6 +1568,7 @@ export function NotebookViewer({
       activeOutlineItemId={activeOutlineItemId}
       selectedOutlineItemId={selectedOutlineItemId}
       selectedOutlineCellId={focusedCellId}
+      commentsPanel={commentsUiSurface.commentsPanel}
       workstationsPanel={
         shouldShowCloudWorkstationsPanel ? (
           <NotebookWorkstationsPanel
@@ -1365,23 +1585,23 @@ export function NotebookViewer({
         ) : undefined
       }
       packagesPanel={
-        <NotebookPackageSummaryPanel
-          packages={notebookViewModel.packages}
-          readOnly={!shellCapabilities.canManagePackages}
-          header={
-            shouldShowPackageEnvironmentSummary ? (
-              <EnvironmentSummary
-                capabilities={shellCapabilities}
-                packages={notebookViewModel.packages}
-                showPackageDetails={false}
-                className="cloud-package-summary-header"
-              />
-            ) : undefined
-          }
-        />
+        <>
+          {shouldShowPackageEnvironmentSummary ? (
+            <EnvironmentSummary
+              capabilities={shellCapabilities}
+              packages={notebookViewModel.packages}
+              showPackageDetails={false}
+              className="cloud-package-summary-header"
+            />
+          ) : null}
+          <NotebookPackageSummaryPanel
+            packages={notebookViewModel.packages}
+            readOnly={!shellCapabilities.canManagePackages}
+          />
+        </>
       }
-      onActivePanelChange={setActiveRailPanel}
-      onCollapsedChange={setRailCollapsed}
+      onActivePanelChange={handleRailPanelChange}
+      onCollapsedChange={setNotebookRailCollapsed}
       onSelectOutlineItem={handleSelectOutlineItem}
       onNavigateOutlineItem={handleNavigateOutlineItem}
       className="cloud-notebook-rail"
@@ -1391,9 +1611,34 @@ export function NotebookViewer({
   const showCloudCommandToolbar = shouldShowNotebookDocumentCommandToolbar(shellCapabilities, {
     reserve: editAccessPending,
   });
+  const notebookHasReadableSnapshot =
+    notebookCellIds.length > 0 ||
+    (!connectionError && snapshotResolvedRef.current && status.kind === "ready");
+  // The route has no authenticated identity and the live-room join is retrying
+  // without a readable public snapshot: a hard sign-in wall, distinct from stale
+  // or expired auth. This owns the whole stage (NotebookAccessGate below) instead
+  // of riding the thin notice banner, so the signed-out canvas reads as gated
+  // rather than an empty/broken notebook.
+  const signedOutNotebookSignInRequired =
+    Boolean(authConfig.localDev || authConfig.oidc) &&
+    appSessionStatus.status !== "loading" &&
+    !hasAppSession &&
+    authState.mode === "anonymous" &&
+    !isPublicViewer &&
+    !notebookHasReadableSnapshot &&
+    status.kind === "loading" &&
+    Boolean(connectionError && isTransportReconnectError(connectionError));
   const notebookBodyAccessBlocked = cloudConnectionDiagnosticBlocksNotebookBody(connectionError);
+  // A signed-out gate blocks the body just like an access diagnostic: quiet the
+  // presence/edit/identity chrome so the header does not advertise collaboration
+  // affordances behind a sign-in wall.
+  const notebookStageGated = notebookBodyAccessBlocked || signedOutNotebookSignInRequired;
+  // Behind a gate the catalog title is unknown, so `notebookTitle` falls back to
+  // the humanized URL slug — a guessed, CSS-truncated fragment (e.g. "Ob…") that
+  // reads as broken. Show a clean intentional label instead until access resolves.
+  const gatedNotebookTitle = useMemo(cloudNotebookGatedTitle, []);
   const notebookHeaderChrome = projectCloudNotebookHeaderChrome({
-    bodyAccessBlocked: notebookBodyAccessBlocked,
+    bodyAccessBlocked: notebookStageGated,
     liveRoomAccessPending: liveRoomDisabledStatus?.kind === "loading",
   });
 
@@ -1404,7 +1649,7 @@ export function NotebookViewer({
       headerClassName="cloud-room-toolbar"
       presence={
         <CloudNotebookTitle
-          title={notebookTitle}
+          title={notebookStageGated ? gatedNotebookTitle : notebookTitle}
           renameTitle={catalogNotebookTitle?.trim() ?? ""}
           canRename={catalogAccessResolved && catalogGrantsDocumentEdit}
           renameSaving={notebookTitleSaving}
@@ -1414,7 +1659,11 @@ export function NotebookViewer({
       }
       utilityControls={
         notebookHeaderChrome.showPresenceStatus ? (
-          <CloudPresenceStatus connectionError={connectionError} store={presenceStore} />
+          <CloudPresenceStatus
+            connectionError={connectionError}
+            store={presenceStore}
+            resolveActor={resolveCloudPresenceActor}
+          />
         ) : null
       }
       authControls={
@@ -1436,16 +1685,21 @@ export function NotebookViewer({
         />
       }
       editControls={
-        <CloudNotebookEditModeButton
-          authState={authState}
-          hasAppSession={hasAppSession}
-          interaction={shellCapabilities.interaction ?? null}
-          accessLevel={shellCapabilities.access.level}
-          accessPending={editAccessPending}
-          reconnecting={sustainedReconnecting}
-          onModeChange={setSelectedInteractionMode}
-          onRequestEditAccess={requestCloudEditAccess}
-        />
+        notebookHeaderChrome.showEditModeControl ? (
+          <CloudNotebookEditModeButton
+            authState={authState}
+            hasAppSession={hasAppSession}
+            interaction={shellCapabilities.interaction ?? null}
+            accessLevel={shellCapabilities.access.level}
+            accessPending={editAccessPending}
+            hasSentEditRequest={
+              accessRequestFacts.requestedByUser || Boolean(cloudAccessFacts.effectiveAccessRequest)
+            }
+            reconnecting={sustainedReconnecting}
+            onModeChange={handleSelectInteractionMode}
+            onRequestEditAccess={requestCloudEditAccess}
+          />
+        ) : null
       }
       identityControls={
         // Connection/identity slot: self-identity avatar + connectivity dot
@@ -1489,20 +1743,10 @@ export function NotebookViewer({
       }}
     />
   );
-  const notebookHasReadableSnapshot =
-    notebookCellIds.length > 0 ||
-    (!connectionError && snapshotResolvedRef.current && status.kind === "ready");
-  const signedOutNotebookSignInRequired =
-    Boolean(authConfig.localDev || authConfig.oidc) &&
-    appSessionStatus.status !== "loading" &&
-    !hasAppSession &&
-    authState.mode === "anonymous" &&
-    !isPublicViewer &&
-    !notebookHasReadableSnapshot &&
-    status.kind === "loading" &&
-    Boolean(connectionError && isTransportReconnectError(connectionError));
   const notebookViewSurface = projectCloudNotebookViewSurface({
-    bodyAccessBlocked: notebookBodyAccessBlocked,
+    // A signed-out gate owns the stage: suppress the empty NotebookView so it
+    // does not paint a blank canvas behind the gate.
+    bodyAccessBlocked: notebookStageGated,
     cellCount: notebookCellIds.length,
     canEditStructure: shellCapabilities.canEditStructure,
     connectionError,
@@ -1529,15 +1773,45 @@ export function NotebookViewer({
   const rendererAssetError = hasIsolatedOutputs
     ? (isolatedRenderer.error ?? isolatedRenderer.lastError)
     : null;
+  const cloudKernelRuntime =
+    runtimeState.kernel.language === "deno" || notebookLanguageRef.current === "deno"
+      ? "deno"
+      : "python";
+  const shouldRenderKernelLaunchError =
+    shouldShowKernelLaunchErrorBanner({
+      lifecycle: cloudKernelLifecycle,
+      errorDetails: cloudKernelErrorDetails,
+      errorReason: cloudKernelErrorReason,
+      runtime: cloudKernelRuntime,
+    }) && dismissedLaunchError !== cloudKernelErrorDetails;
+  const kernelLaunchNotice =
+    shouldRenderKernelLaunchError && cloudKernelErrorDetails ? (
+      <KernelLaunchErrorBanner
+        errorDetails={cloudKernelErrorDetails}
+        onRetry={() => {
+          setDismissedLaunchError(null);
+          handleCloudRestartRuntime();
+        }}
+        onDismiss={() => setDismissedLaunchError(cloudKernelErrorDetails)}
+      />
+    ) : null;
+  const diagnostics =
+    kernelLaunchNotice || accessRequestNotice ? (
+      <>
+        {kernelLaunchNotice}
+        {accessRequestNotice}
+      </>
+    ) : null;
   const hasNotices = cloudNotebookHasNotices({
     authState,
     authRenewal,
     connectionError,
-    diagnostics: accessRequestNotice,
+    diagnostics,
     hasAppSession,
     isPublicViewer,
     hasReadableSnapshot: notebookHasReadableSnapshot,
     signInRequired: signedOutNotebookSignInRequired,
+    signInRequiredOwnedByStage: signedOutNotebookSignInRequired,
     offlineMergeNotice,
     rendererAssetError,
     sustainedReconnecting,
@@ -1549,11 +1823,12 @@ export function NotebookViewer({
       authState={authState}
       authRenewal={authRenewal}
       connectionError={connectionError}
-      diagnostics={accessRequestNotice}
+      diagnostics={diagnostics}
       hasAppSession={hasAppSession}
       isPublicViewer={isPublicViewer}
       hasReadableSnapshot={notebookHasReadableSnapshot}
       signInRequired={signedOutNotebookSignInRequired}
+      signInRequiredOwnedByStage={signedOutNotebookSignInRequired}
       offlineMergeNotice={offlineMergeNotice}
       rendererAssetError={rendererAssetError}
       sustainedReconnecting={sustainedReconnecting}
@@ -1563,6 +1838,26 @@ export function NotebookViewer({
       onRetryConnection={retryLiveConnection}
       onRetryRendererAssets={isolatedRenderer.retry}
       onSignInAgain={authConfig.localDev || authConfig.oidc ? beginNotebookAuth : undefined}
+    />
+  ) : null;
+
+  // Full-stage sign-in wall for a signed-out private notebook link. Owns the
+  // whole canvas (the empty NotebookView is suppressed and the rail hidden) so
+  // the surface reads as intentionally gated. The primary action reuses
+  // CloudNotebookSignInButton, the single sign-in source of truth, so its copy
+  // and OIDC-vs-localDev priority cannot drift from the rest of the app.
+  const signedOutGate = signedOutNotebookSignInRequired ? (
+    <NotebookAccessGate
+      tone="info"
+      icon={<LogIn aria-hidden="true" />}
+      title="Sign in to open this notebook"
+      detail="This notebook is private. Sign in with your account and we'll bring you straight back here."
+      primaryAction={
+        <div className="cloud-notebook-signed-out-actions cloud-notebook-gate-actions">
+          <CloudNotebookSignInButton authConfig={authConfig} authState={authState} />
+        </div>
+      }
+      data-testid="cloud-notebook-signed-out-gate"
     />
   ) : null;
 
@@ -1581,7 +1876,7 @@ export function NotebookViewer({
         notices={notices}
         noticesClassName="cloud-notebook-notices"
         capabilities={shellCapabilities}
-        rail={rail}
+        rail={notebookStageGated ? undefined : rail}
         stageLabel="Hosted notebook"
       >
         <h1 className="sr-only">{notebookTitle.title}</h1>
@@ -1593,6 +1888,7 @@ export function NotebookViewer({
             onSyncNeeded={handleSourceSyncNeeded}
             localActor={connectionActorLabel ?? ""}
           >
+            {signedOutGate}
             {notebookViewSurface.shouldRenderNotebookView ? (
               <NotebookView
                 cellIds={notebookCellIds}
@@ -1612,6 +1908,11 @@ export function NotebookViewer({
                 onMoveCell={handleCloudMoveCell}
                 onSetCellSourceHidden={handleCloudSetCellSourceHidden}
                 onSetCellOutputsHidden={handleCloudSetCellOutputsHidden}
+                onCreateSourceComment={commentsUiSurface.onCreateSourceComment}
+                onCreateOutputComment={commentsUiSurface.onCreateOutputComment}
+                onActivateCommentThread={commentsUiSurface.onActivateCommentThread}
+                commentThreadsByCell={commentsUiEnabled ? sourceCommentThreadsByCell : undefined}
+                pendingCommentAnchor={sourceCommentRequest?.anchor ?? null}
                 markdownHeadingAnchorsByCellId={notebookViewModel.markdownHeadingAnchorsByCellId}
                 outputHostContext={outputHostContext}
                 deferOutputIsolatedFramesUntilVisible={!shellCapabilities.canEditCells}
@@ -1622,6 +1923,15 @@ export function NotebookViewer({
           </CrdtBridgeProvider>
         </PresenceValueProvider>
       </NotebookDocumentShell>
+      {commentsUiEnabled && sourceCommentRequest ? (
+        <InlineCommentComposer
+          rect={sourceCommentRequest.rect}
+          quote={sourceCommentRequest.quote ?? sourceCommentRequest.anchor.exact_quote}
+          disabled={!canWriteComments}
+          onSubmit={handleSubmitSourceComment}
+          onCancel={handleCancelSourceComment}
+        />
+      ) : null}
     </NotebookHostProvider>
   );
 }
@@ -1635,6 +1945,41 @@ function cloudNotebookEnvironmentManager(
     }
   }
   return null;
+}
+
+function commentAnchorThreadOrderScope(anchor: CommentAnchor): string {
+  switch (anchor.kind) {
+    case "notebook":
+      return "notebook";
+    case "cell":
+    case "source_range":
+      return `cell:${anchor.cell_id}`;
+    case "cell_range":
+      return `cell_range:${anchor.start_cell_id}:${anchor.end_cell_id}`;
+    case "output":
+      return `output:${anchor.cell_id}:${anchor.execution_id ?? ""}:${anchor.output_id ?? ""}`;
+  }
+}
+
+function sourceRangeAnchorMatchesCurrentCell(anchor: SourceRangeCommentAnchor): boolean {
+  const cell = getCellById(anchor.cell_id);
+  if (
+    !cell ||
+    (cell.cell_type !== "code" && cell.cell_type !== "raw" && cell.cell_type !== "markdown")
+  ) {
+    return false;
+  }
+  return resolveSourceRangeAnchor(cell.source, anchor) !== null;
+}
+
+const OUTPUT_COMMENT_STALE_MESSAGE =
+  "Selected outputs changed. Comment on the current outputs before submitting.";
+
+function createCloudCommentId(prefix: string): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function cloudAccessRequestNotice(
@@ -1692,6 +2037,18 @@ function cloudAccessRequestNotice(
     );
   }
 
+  if (projection.kind === "dismissed") {
+    return (
+      <NotebookNotice
+        tone={projection.tone}
+        icon={<Info className="h-4 w-4" />}
+        title={projection.title}
+      >
+        {projection.message}
+      </NotebookNotice>
+    );
+  }
+
   return (
     <NotebookNotice
       tone={projection.tone}
@@ -1701,8 +2058,4 @@ function cloudAccessRequestNotice(
       {projection.message}
     </NotebookNotice>
   );
-}
-
-function initialCloudRailCollapsed(): boolean {
-  return true;
 }

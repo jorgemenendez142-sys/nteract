@@ -22,7 +22,11 @@ import { getBlobResolver } from "./blob-port";
 import type { CellChangeset } from "./cell-changeset";
 import { logger } from "./logger";
 import { materializeCellFromWasm } from "./materialize-cells";
-import { getCellById, updateCellById } from "./notebook-cells";
+import {
+  getCellById,
+  getCellIdsSnapshot,
+  updateCellById,
+} from "./notebook-cells";
 import { notifyMetadataChanged } from "./notebook-metadata";
 
 // Re-export CellChangeset types so existing consumers don't break.
@@ -54,6 +58,84 @@ export interface MaterializeDeps {
 
   /** Host-provided blob resolver. Defaults to the desktop daemon resolver. */
   blobResolver?: BlobResolver | null;
+
+  /**
+   * When set, large structural additions publish this many leading cells before
+   * finishing the full projection. Used for file-load TTFC only.
+   */
+  progressiveStructuralBatchSize?: number;
+}
+
+export interface ProgressiveInitialMaterializeDeps {
+  /** Shared output manifest cache (mutated in place). */
+  outputCache: Map<string, JupyterOutput>;
+
+  /** Number of leading cells to publish before the full initial projection. */
+  progressiveStructuralBatchSize: number;
+
+  /** Host-provided blob resolver. Defaults to the desktop daemon resolver. */
+  blobResolver?: BlobResolver | null;
+}
+
+function yieldForProgressivePaint(): Promise<void> {
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => resolve());
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+}
+
+export async function publishProgressiveInitialStructureSlice(
+  handle: NotebookHandle,
+  deps: ProgressiveInitialMaterializeDeps,
+): Promise<boolean> {
+  const progressiveBatchSize = deps.progressiveStructuralBatchSize;
+  if (progressiveBatchSize <= 0 || typeof handle.get_cell_ids !== "function") {
+    return false;
+  }
+
+  const currentCellIds = getCellIdsSnapshot();
+  if (currentCellIds.length >= progressiveBatchSize) {
+    return false;
+  }
+
+  const orderedCellIds = [...handle.get_cell_ids()];
+  if (orderedCellIds.length <= progressiveBatchSize) {
+    return false;
+  }
+
+  const progressiveCellIds = orderedCellIds.slice(0, progressiveBatchSize);
+  const blobResolver =
+    "blobResolver" in deps ? (deps.blobResolver ?? null) : getBlobResolver();
+  const upsertedCells: NotebookCell[] = [];
+
+  for (const cellId of progressiveCellIds) {
+    const cell = materializeCellFromWasm(
+      handle,
+      cellId,
+      deps.outputCache,
+      getCellById(cellId),
+      blobResolver,
+    );
+    if (!cell) return false;
+    upsertedCells.push(cell);
+    if (cell.cell_type === "code") {
+      const rawOutputs: unknown[] = handle.get_cell_outputs(cellId) ?? [];
+      preWarmPluginsForRawOutputs(rawOutputs);
+    }
+  }
+
+  applyNotebookCellStructureProjection({
+    orderedCellIds: progressiveCellIds,
+    upsertedCells,
+  });
+  logger.debug(
+    `[frame-pipeline] progressive initial structure: first ${progressiveBatchSize} of ${orderedCellIds.length}`,
+  );
+  await yieldForProgressivePaint();
+  return true;
 }
 
 // ── Plugin pre-warm helper ──────────────────────────────────────────
@@ -102,6 +184,7 @@ export async function materializeChangeset(
 ): Promise<void> {
   const handle = deps.getHandle();
   if (!handle) return;
+  const isCurrentHandle = () => deps.getHandle() === handle;
 
   // ── Full materialization fallback ──────────────────────────────────
 
@@ -117,6 +200,7 @@ export async function materializeChangeset(
       );
     }
     await deps.materializeCells(handle);
+    if (!isCurrentHandle()) return;
     notifyMetadataChanged();
     return;
   }
@@ -126,16 +210,19 @@ export async function materializeChangeset(
   if (!changeset) return;
 
   const cache = deps.outputCache;
-  const blobResolver = "blobResolver" in deps ? (deps.blobResolver ?? null) : getBlobResolver();
+  const blobResolver =
+    "blobResolver" in deps ? (deps.blobResolver ?? null) : getBlobResolver();
 
   // ── Structural incremental materialization ────────────────────────
 
-  if (projectionPlan.structural) {
+  const structuralPlan = projectionPlan.structural;
+  if (structuralPlan) {
     if (typeof handle.get_cell_ids !== "function") {
       logger.debug(
         "[frame-pipeline] full materialization: structural changeset without get_cell_ids",
       );
       await deps.materializeCells(handle);
+      if (!isCurrentHandle()) return;
       notifyMetadataChanged();
       return;
     }
@@ -144,8 +231,44 @@ export async function materializeChangeset(
     const finalCellIds = new Set(orderedCellIds);
     const addedCells: NotebookCell[] = [];
     const materializedCellIds = new Set<string>();
+    const materializedCellsById = new Map<string, NotebookCell>();
+    const progressiveBatchSize = deps.progressiveStructuralBatchSize ?? 0;
+    let progressiveProjectionPublished = false;
 
-    for (const cellId of projectionPlan.structural.added) {
+    const maybePublishProgressiveProjection = async () => {
+      if (getCellIdsSnapshot().length >= progressiveBatchSize) {
+        return;
+      }
+      const progressiveCellIds = orderedCellIds.slice(0, progressiveBatchSize);
+      const progressiveCells: NotebookCell[] = [];
+      for (const cellId of progressiveCellIds) {
+        const materialized = materializedCellsById.get(cellId);
+        if (materialized) {
+          progressiveCells.push(materialized);
+          continue;
+        }
+        if (!getCellById(cellId)) return;
+      }
+      if (
+        progressiveProjectionPublished ||
+        progressiveBatchSize <= 0 ||
+        structuralPlan.removed.length > 0 ||
+        progressiveCellIds.length < progressiveBatchSize
+      ) {
+        return;
+      }
+      progressiveProjectionPublished = true;
+      applyNotebookCellStructureProjection({
+        orderedCellIds: progressiveCellIds,
+        upsertedCells: progressiveCells,
+      });
+      logger.debug(
+        `[frame-pipeline] progressive structure: first ${progressiveBatchSize} of ${orderedCellIds.length}`,
+      );
+      await yieldForProgressivePaint();
+    };
+
+    for (const cellId of structuralPlan.added) {
       if (!finalCellIds.has(cellId)) continue;
 
       const cell = materializeCellFromWasm(
@@ -160,16 +283,19 @@ export async function materializeChangeset(
           `[frame-pipeline] full materialization: structural added cell ${cellId.slice(0, 8)} unavailable`,
         );
         await deps.materializeCells(handle);
+        if (!isCurrentHandle()) return;
         notifyMetadataChanged();
         return;
       }
 
       addedCells.push(cell);
       materializedCellIds.add(cell.id);
+      materializedCellsById.set(cell.id, cell);
       if (cell.cell_type === "code") {
         const rawOutputs: unknown[] = handle.get_cell_outputs(cellId) ?? [];
         preWarmPluginsForRawOutputs(rawOutputs);
       }
+      await maybePublishProgressiveProjection();
     }
 
     for (const cellId of orderedCellIds) {
@@ -187,25 +313,33 @@ export async function materializeChangeset(
           `[frame-pipeline] full materialization: structural ordered cell ${cellId.slice(0, 8)} unavailable`,
         );
         await deps.materializeCells(handle);
+        if (!isCurrentHandle()) return;
         notifyMetadataChanged();
         return;
       }
 
       addedCells.push(cell);
       materializedCellIds.add(cell.id);
+      materializedCellsById.set(cell.id, cell);
       if (cell.cell_type === "code") {
         const rawOutputs: unknown[] = handle.get_cell_outputs(cellId) ?? [];
         preWarmPluginsForRawOutputs(rawOutputs);
       }
+      await maybePublishProgressiveProjection();
     }
+
+    const orderedAddedCells = orderedCellIds.flatMap((cellId) => {
+      const cell = materializedCellsById.get(cellId);
+      return cell ? [cell] : [];
+    });
 
     applyNotebookCellStructureProjection({
       orderedCellIds,
-      upsertedCells: addedCells,
+      upsertedCells: orderedAddedCells,
     });
 
     logger.debug(
-      `[frame-pipeline] incremental structure: +${projectionPlan.structural.added.length} -${projectionPlan.structural.removed.length} reorder=${projectionPlan.structural.order_changed} materialized-added=${addedCells.length}`,
+      `[frame-pipeline] incremental structure: +${structuralPlan.added.length} -${structuralPlan.removed.length} reorder=${structuralPlan.order_changed} materialized-added=${addedCells.length}`,
     );
   }
 
@@ -217,11 +351,9 @@ export async function materializeChangeset(
   for (const projection of projectionPlan.cells) {
     const cellId = projection.cell_id;
     // Phase C-lite: outputs live in the per-output / per-execution stores
-    // (see notebook-outputs.ts, notebook-executions.ts). The cell store
-    // still carries an `outputs: JupyterOutput[]` field for legacy readers
-    // on full materialization, but the frame pipeline no longer touches
-    // that field on incremental updates — the outputs store is the source
-    // of truth for <OutputArea>.
+    // (see notebook-outputs.ts, notebook-executions.ts). Full materialization
+    // can still carry an `outputs: JupyterOutput[]` source snapshot, but
+    // rendered views derive from the execution/output stores.
     if (!projection.touches_chrome) {
       // Output-only change — the outputs store already has the new data
       // from `applyOutputChangeset`. Still warm the plugin cache for any

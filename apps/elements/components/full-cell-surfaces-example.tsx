@@ -3,15 +3,14 @@
 import { NotebookHostProvider } from "@nteract/notebook-host";
 import { FileCode2, FileText, Rows3, ShieldCheck } from "lucide-react";
 import { useLayoutEffect, useMemo, useState } from "react";
+import { CrdtBridgeProvider, type NotebookViewCell } from "@/components/notebook";
 import {
   getElementsNotebookPrimaryCodeCell,
   getElementsNotebookScenario,
   resolveElementsNotebookLanguage,
 } from "@/components/notebook-scenarios";
-import type { NotebookViewCell } from "@/components/notebook";
 import {
   CodeCell,
-  CrdtBridgeProvider,
   MarkdownCell,
   NotebookView,
   RawCell,
@@ -427,7 +426,7 @@ export function FullCellSurfacesExample() {
   return (
     <NotebookHostProvider host={notebookHost}>
       <div className="not-prose space-y-6">
-        <section className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4 text-emerald-900 dark:text-emerald-100">
+        <section className="border-l border-fd-border py-1 pl-4 text-fd-muted-foreground">
           <div className="flex items-start gap-3">
             <ShieldCheck className="mt-0.5 size-4 flex-none" aria-hidden="true" />
             <div>
@@ -464,11 +463,6 @@ export function FullCellSurfacesExample() {
                 onFocusPrevious={noop}
                 onFocusNext={() => focusFixtureCell(markdownCell.id)}
                 onInsertCellAfter={noop}
-                rightGutterContent={
-                  <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
-                    seeded runtime
-                  </span>
-                }
               />
             </div>
           </section>
@@ -536,11 +530,6 @@ export function FullCellSurfacesExample() {
                   onFocusPrevious={() => focusFixtureCell(codeCell.id)}
                   onFocusNext={() => focusFixtureCell(rawCell.id)}
                   onInsertCellAfter={noop}
-                  rightGutterContent={
-                    <span className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[11px] font-medium text-sky-700 dark:text-sky-300">
-                      preview adapter
-                    </span>
-                  }
                 />
               </div>
               <div className="rounded-lg border border-fd-border bg-fd-background p-3">
@@ -574,11 +563,6 @@ export function FullCellSurfacesExample() {
                 onFocusPrevious={() => focusFixtureCell(markdownCell.id)}
                 onFocusNext={noop}
                 onInsertCellAfter={noop}
-                rightGutterContent={
-                  <span className="rounded-full border border-fd-border bg-fd-background px-2 py-1 font-mono text-[11px] text-fd-muted-foreground">
-                    yaml
-                  </span>
-                }
               />
             </div>
           </section>

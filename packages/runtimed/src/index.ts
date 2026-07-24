@@ -48,6 +48,26 @@ export {
 // Reactive runtime-state store (framework-agnostic RxJS projections)
 export { BUSY_THROTTLE_MS, RuntimeStateStore, throttleBusyStatus } from "./runtime-state-store";
 
+// Observable store base + free select helper (source stores extend this)
+export { ObservableStore, select } from "./observable-store";
+
+// Polling + fetch-on-input primitives (injected scheduler/fetch, abort-wired)
+export {
+  createPoll,
+  fetchLatest,
+  type AfterSettlePoll,
+  type FixedRatePoll,
+  type PollDefinition,
+} from "./poll";
+
+// Client reconnect policy: exponential backoff with jitter plus a terminal
+// failed-load latch (see reconnect-governor.ts)
+export {
+  ReconnectGovernor,
+  type ReconnectGovernorOptions,
+  type ReconnectGovernorState,
+} from "./reconnect-governor";
+
 // Local-first persistence: the NotebookDoc seed record plus the render-only
 // RuntimeStateDoc paint cache (see notebookDocChanged$ and the key-segment
 // docs in notebook-doc-persistence.ts)
@@ -123,11 +143,15 @@ export {
 
 // Handle
 export type {
+  CommentAnchor,
+  CommentThreadSnapshot,
+  CommentsProjection,
   ExecutionQueueProjection,
   ExecutionViewChangeset,
   ExecutionViewSnapshot,
   SyncableHandle,
   FrameEvent,
+  HostedBridgeStatus,
   LocalMutationResult,
   InitialLoadPhase,
   NotebookDocPhase,
@@ -172,6 +196,11 @@ export {
 
 // Runtime state
 export {
+  type BokehSessionCheckpoint,
+  type BokehSessionContentRef,
+  type BokehSessionPatchRef,
+  type BokehSessionState,
+  type BokehSessionStatus,
   type CommDocEntry,
   DEFAULT_RUNTIME_STATE,
   type EnvState,
@@ -180,6 +209,8 @@ export {
   type EnvProgressPhase,
   type ExecutionState,
   type ExecutionTransition,
+  type FileCheckpointState,
+  type FileSourceIssue,
   KERNEL_ERROR_REASON,
   type KernelActivity,
   type KernelErrorReasonKey,
@@ -195,6 +226,8 @@ export {
   type RuntimeState,
   type TrustState,
   type TrustStatus,
+  type WorkstationAcceleratorReadiness,
+  type WorkstationAcceleratorState,
   type WorkstationAttachmentState,
   diffExecutions,
 } from "./runtime-state";
@@ -203,7 +236,17 @@ export {
 export { type PoolState, type RuntimePoolState, DEFAULT_POOL_STATE } from "./pool-state";
 
 // Broadcast types
-export { type CommBroadcast, isCommBroadcast, type KnownBroadcast } from "./broadcast-types";
+export {
+  type BokehSessionBufferRef,
+  type BokehSessionCheckpointPayload,
+  type BokehSessionPatchBroadcast,
+  type BokehSessionPatchEvent,
+  type BokehSessionPatchPayload,
+  type CommBroadcast,
+  isBokehSessionPatchBroadcast,
+  isCommBroadcast,
+  type KnownBroadcast,
+} from "./broadcast-types";
 
 // Env progress projection
 export {
@@ -290,10 +333,31 @@ export {
   type ParsedNotebookActorLabel,
 } from "./notebook-actor-projection";
 
+// Notebook actor colors
+export {
+  CURSOR_COLORS,
+  colorForActorIdentity,
+  contrastColorForActorIdentity,
+  identityColorKey,
+  peerColor,
+  readableForegroundForColor,
+} from "./notebook-actor-color";
+
+// Notebook actor display
+export { onBehalfOfText } from "./notebook-actor-attribution";
+export {
+  actorInitials,
+  resolveActorDisplay,
+  type ActorDisplay,
+  type ActorDisplayPeer,
+  type ResolveActorDisplayOptions,
+} from "./notebook-actor-display";
+
 // Notebook shell capability projection
 export {
   notebookShellRuntimeTargetSummary,
   notebookShellWorkstationAttachmentCacheKey,
+  notebookShellWorkstationAcceleratorsCacheKey,
   projectNotebookShellCapabilities,
   projectNotebookRuntimeTargetFromWorkstationAttachment,
   readOnlyNotebookShellCapabilities,
@@ -309,6 +373,8 @@ export {
   type NotebookShellControlPolicy,
   type NotebookShellExecutionPolicy,
   type NotebookShellPackagePolicy,
+  type NotebookShellRoomLinkProjection,
+  type NotebookShellRoomLinkStatus,
   type NotebookShellRuntimeCapabilities,
   type NotebookShellRuntimeTargetKind,
   type NotebookShellRuntimeTargetProjection,
@@ -331,15 +397,18 @@ export {
 // Notebook workstation selection projection
 export {
   clearNotebookWorkstationSelectionProjectionCacheForTests,
+  projectNotebookWorkstationAcceleratorSummary,
   projectNotebookWorkstationSelection,
   type NotebookRegisteredWorkstation,
   type NotebookRegisteredWorkstationEnvironment,
   type NotebookRegisteredWorkstationFactKind,
   type NotebookRegisteredWorkstationFactProjection,
+  type NotebookRegisteredWorkstationFactTone,
   type NotebookRegisteredWorkstationProjection,
   type NotebookRegisteredWorkstationStatus,
   type NotebookWorkstationEnvironmentPolicy,
   type NotebookWorkstationEnvironmentProjection,
+  type NotebookWorkstationAcceleratorSummary,
   type NotebookWorkstationSelectionProjection,
   type NotebookWorkstationSelectionState,
   type ProjectNotebookWorkstationSelectionOptions,
@@ -354,6 +423,19 @@ export {
   type ProjectNotebookWorkstationAttachmentFromClaimOptions,
 } from "./notebook-workstation-attachment";
 
+// Notebook compute session projection
+export {
+  clearNotebookComputeSessionProjectionCacheForTests,
+  isNotebookComputeSessionStatus,
+  isNotebookComputeSessionSummary,
+  projectNotebookComputeSessionFact,
+  projectNotebookComputeSessionSummary,
+  type NotebookComputeSessionFactProjection,
+  type NotebookComputeSessionStatus,
+  type NotebookComputeSessionSummary,
+  type ProjectNotebookComputeSessionSummaryOptions,
+} from "./notebook-compute-session";
+
 // Notebook workstation launch-readiness projection
 export {
   clearNotebookWorkstationLaunchReadinessProjectionCacheForTests,
@@ -364,6 +446,16 @@ export {
   type NotebookWorkstationLaunchReadinessState,
   type ProjectNotebookWorkstationLaunchReadinessOptions,
 } from "./notebook-workstation-launch";
+
+// Notebook workstation surface projection
+export {
+  clearNotebookWorkstationSurfaceProjectionCacheForTests,
+  projectNotebookWorkstationSurface,
+  type NotebookWorkstationSurfaceMutationProjection,
+  type NotebookWorkstationSurfaceProjection,
+  type NotebookWorkstationToolbarActionProjection,
+  type ProjectNotebookWorkstationSurfaceOptions,
+} from "./notebook-workstation-surface";
 
 // Notebook launch environment projection
 export {
@@ -470,13 +562,18 @@ export {
 
 // Notebook client
 export {
+  type ApplyBokehSessionPatchOptions,
+  type BokehPatchBuffer,
+  type GuardedNotebookProvenance,
   NotebookClient,
   type ExecuteCellOptions,
   type NotebookClientOptions,
+  type ReconcileNotebookSourceOutcome,
   type RunAllCellsOptions,
-  SaveNotebookError,
+  type SaveNotebookOutcome,
 } from "./notebook-client";
 export type {
+  BokehSessionPatchReply,
   BlobDurability,
   BlobUploadErrorKind,
   CommRequestMessage,
@@ -484,14 +581,16 @@ export type {
   DependencyGuard,
   DenoLaunchedConfig,
   EnvSource,
-  GuardedNotebookProvenance,
   HistoryEntry,
   LaunchedEnvConfig,
   LaunchSpec,
   NotebookRequest,
   NotebookResponse,
   PackageManager,
-  SaveErrorKind,
+  SaveBlockedReason,
+  SourceReconciliation,
+  SourceReconciliationBlockedReason,
+  SourceReconciliationOperation,
 } from "./request-types";
 
 // Blob upload

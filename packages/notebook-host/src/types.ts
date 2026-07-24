@@ -29,7 +29,8 @@
  *   point — not pre-optional now, to keep the contract honest.
  */
 
-import type { BlobRef, BlobResolver, NotebookTransport } from "runtimed";
+import type { BlobRef, BlobResolver, NotebookTransport, ReconnectGovernorState } from "runtimed";
+import type { Observable } from "rxjs";
 import type { CommandRegistry } from "./commands";
 
 // ── Shared types ─────────────────────────────────────────────────────────
@@ -81,12 +82,23 @@ export interface DaemonReadyPayload {
   ephemeral?: boolean;
   /** On-disk path if the notebook is file-backed. Derives the titlebar filename. */
   notebook_path?: string | null;
+  /** Canonical hosted locator for daemon-mediated cloud notebook windows. */
+  hosted_notebook_url?: string | null;
   runtime?: string;
   /** Authenticated actor label to use for Automerge writes on this connection. */
   actor_label?: string;
   /** Server-enforced connection scope for this room connection. */
   connection_scope?: string;
+  /** Daemon-authoritative CommentsDoc identity for this room. */
+  comments_doc_id?: string | null;
+  /** Daemon-authoritative notebook reference stored inside the CommentsDoc. */
+  comments_notebook_ref?: CommentsNotebookRef | null;
 }
+
+export type CommentsNotebookRef =
+  | { kind: "hosted_room"; room_locator: string }
+  | { kind: "local_path"; canonical_path: string }
+  | { kind: "local_room"; room_id: string };
 
 export interface DaemonProgressPayload {
   status: "checking" | "ready" | "failed" | string;
@@ -104,12 +116,36 @@ export type Unlisten = () => void;
 
 // ── Namespaces ───────────────────────────────────────────────────────────
 
+/**
+ * Control surface over the host's automatic reconnect loop.
+ *
+ * Present only on hosts that own such a loop (Tauri). The app latches the
+ * loop off when the daemon reports a terminal initial-load failure; the
+ * daemon closes the session right after that status, so reconnecting cannot
+ * succeed until the failure is resolved. `HostDaemon.reconnect` (the manual
+ * Retry path) drops the latch and restarts backoff before dialing.
+ */
+export interface HostAutoReconnect {
+  /** Stop automatic reconnection; `reason` renders in the terminal UI. */
+  latchFailure(reason: string): void;
+  /** Drop the latch after a live session reports a non-failed load. */
+  clearLatch(): void;
+  /**
+   * Pull the next automatic attempt forward to now (bootstrap timeout).
+   * Backoff survives a failed dial: the loop schedules the next attempt.
+   * No-op while latched; terminal failures go through the manual Retry.
+   */
+  retryNow(): void;
+  getState(): ReconnectGovernorState;
+  readonly state$: Observable<ReconnectGovernorState>;
+}
+
 /** Daemon connection state + diagnostics. */
 export interface HostDaemon {
   /** Fast synchronous-ish check; returns false when the daemon socket is down. */
   isConnected(): Promise<boolean>;
-  /** Forces a reconnect; resolves when the relay task has a fresh socket. */
-  reconnect(): Promise<void>;
+  /** Reconnects the relay; `force` drops an existing stale handle first. */
+  reconnect(options?: { force?: boolean }): Promise<void>;
   /** Daemon diagnostics for banners / debug UI. */
   getInfo(): Promise<DaemonInfo | null>;
   /**
@@ -119,6 +155,11 @@ export interface HostDaemon {
    * events aren't sticky, so the event-based path can miss the first fire.
    */
   getReadyInfo(): Promise<DaemonReadyPayload | null>;
+  /**
+   * Automatic-reconnect policy control, when this host runs such a loop.
+   * Consumers must tolerate absence (browser dev host reconnects on demand).
+   */
+  readonly autoReconnect?: HostAutoReconnect;
 }
 
 export type HostBlobRef = BlobRef;
@@ -225,6 +266,8 @@ export interface HostNotebook {
   saveAs(path: string): Promise<void>;
   /** Open an existing notebook path in a new host window. */
   openInNewWindow(path: string): Promise<void>;
+  /** Open a hosted notebook URL in a new window through the local daemon bridge. */
+  openHostedInNewWindow(url: string): Promise<void>;
   /** Fork the current notebook into a new in-memory room and open it in a new host window. */
   cloneToEphemeral(): Promise<string>;
 }
@@ -241,6 +284,8 @@ export interface HostNotebook {
 export interface HostWindow {
   getTitle(): Promise<string>;
   setTitle(title: string): Promise<void>;
+  /** Set native window theme when the host supports it. `null` follows the OS. */
+  setTheme(theme: HostNativeTheme): Promise<void>;
   onFocusChange(cb: (focused: boolean) => void): Unlisten;
 }
 
@@ -248,6 +293,7 @@ export interface HostWindow {
 export interface HostSystem {
   getGitInfo(): Promise<GitInfo | null>;
   getUsername(): Promise<string>;
+  getFontFamilies(): Promise<string[]>;
 }
 
 /** File picker. Returned paths are platform-native strings, or null if cancelled. */
@@ -319,8 +365,8 @@ export interface HostUpdaterState {
 }
 
 /**
- * Structured-log pipe shared across the frontend. Replaces the direct
- * `@tauri-apps/plugin-log` coupling in `apps/notebook/src/lib/logger.ts`.
+ * Structured-log pipe shared across the frontend. Keeps shared UI code from
+ * coupling directly to host-specific sinks such as `@tauri-apps/plugin-log`.
  *
  * Messages arrive pre-formatted (single string); callers serialize their
  * arguments in a way that matters to them. The Tauri impl forwards each
@@ -334,9 +380,51 @@ export interface HostLog {
   error(message: string): void;
 }
 
-/** Host-owned settings window. */
+export type HostNativeTheme = "light" | "dark" | null;
+
+/**
+ * Structural snapshot of host-owned synced settings.
+ *
+ * The canonical Rust schema is exported into `src/bindings`. The host package
+ * intentionally keeps a structural shape so it does not import app-level
+ * generated bindings back into the host boundary.
+ */
+export interface HostSyncedSettings {
+  theme?: unknown;
+  color_theme?: unknown;
+  editor?: {
+    code_font_family?: unknown;
+    markdown_font_family?: unknown;
+    line_numbers?: unknown;
+  };
+  default_runtime?: unknown;
+  default_python_env?: unknown;
+  uv?: { default_packages?: unknown };
+  conda?: { default_packages?: unknown };
+  pixi?: { default_packages?: unknown };
+  keep_alive_secs?: unknown;
+  install_default_data_packages?: unknown;
+  disable_nteract_launcher?: unknown;
+  enable_comments?: unknown;
+  disable_auto_format?: unknown;
+  redact_env_values_in_outputs?: unknown;
+  import_shell_environment?: unknown;
+  install_id?: unknown;
+  telemetry_enabled?: unknown;
+  telemetry_consent_recorded?: unknown;
+  telemetry_last_daemon_ping_at?: unknown;
+  telemetry_last_app_ping_at?: unknown;
+  telemetry_last_mcp_ping_at?: unknown;
+  [key: string]: unknown;
+}
+
+/** Host-owned settings window and synced-settings IPC. */
 export interface HostSettings {
   openWindow(): Promise<void>;
+  getSynced(): Promise<HostSyncedSettings>;
+  setSynced(key: string, value: unknown): Promise<void>;
+  rotateInstallId(): Promise<string>;
+  onChanged(cb: (settings: HostSyncedSettings) => void): Unlisten;
 }
 
 // ── Host ──────────────────────────────────────────────────────────────────

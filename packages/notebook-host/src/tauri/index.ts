@@ -8,8 +8,8 @@
  *
  * The transport is passed in rather than constructed here because the
  * `TauriTransport` class currently lives in `apps/notebook/src/lib/` and
- * hooks into the app's logger. A later PR will move it into this package
- * and tighten the import direction.
+ * uses the shared frontend logger. A later PR will move the transport into
+ * this package and tighten the import direction.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -24,7 +24,12 @@ import {
 } from "@tauri-apps/plugin-log";
 import { open as pluginOpenShell } from "@tauri-apps/plugin-shell";
 import { check as pluginCheckUpdate } from "@tauri-apps/plugin-updater";
-import { createHttpBlobResolver, type NotebookResponse, type NotebookTransport } from "runtimed";
+import {
+  ReconnectGovernor,
+  createHttpBlobResolver,
+  type NotebookResponse,
+  type NotebookTransport,
+} from "runtimed";
 import { createCommandRegistry } from "../commands";
 import { wireTauriMenuBridge } from "./menu-bridge";
 import { TauriTransport } from "./transport";
@@ -46,6 +51,7 @@ import type {
   HostNotebook,
   HostRelay,
   HostSettings,
+  HostSyncedSettings,
   HostSystem,
   HostTrust,
   HostUpdater,
@@ -102,13 +108,43 @@ function listenWebview<T>(eventName: string, cb: (payload: T) => void): Unlisten
 
 export function createTauriHost(opts: CreateTauriHostOptions = {}): NotebookHost {
   const transport = opts.transport ?? new TauriTransport();
-  let reconnectPromise: Promise<void> | null = null;
-  const reconnectDaemon = (): Promise<void> => {
-    if (reconnectPromise) return reconnectPromise;
-    reconnectPromise = invoke<void>("reconnect_to_daemon").finally(() => {
-      reconnectPromise = null;
+  let reconnectInFlight: { promise: Promise<void>; force: boolean } | null = null;
+  const startReconnect = (force: boolean): Promise<void> => {
+    const promise = invoke<void>("reconnect_to_daemon", { force }).finally(() => {
+      if (reconnectInFlight?.promise === promise) {
+        reconnectInFlight = null;
+      }
     });
-    return reconnectPromise;
+    reconnectInFlight = { promise, force };
+    return promise;
+  };
+  const reconnectDaemon = (force = false): Promise<void> => {
+    const active = reconnectInFlight;
+    if (!active) return startReconnect(force);
+    if (!force || active.force) return active.promise;
+
+    const escalated = active.promise.catch(() => undefined).then(() => startReconnect(true));
+    reconnectInFlight = { promise: escalated, force: true };
+    return escalated;
+  };
+
+  // The governor owns every automatic reconnect: `daemon:disconnected`
+  // triggers it exactly once per event through the host-level listeners
+  // below, so per-subscriber `onDisconnected` callbacks stay
+  // notification-only and backoff/latch policy lives in one place.
+  const reconnectGovernor = new ReconnectGovernor({
+    reconnect: () => reconnectDaemon(true),
+  });
+  _lastReconnectGovernorDispose?.();
+  const unlistenGovernorEvents = [
+    listenWebview<void>("daemon:disconnected", () => reconnectGovernor.connectionLost()),
+    listenWebview<DaemonReadyPayload>("daemon:ready", () =>
+      reconnectGovernor.connectionEstablished(),
+    ),
+  ];
+  _lastReconnectGovernorDispose = () => {
+    for (const unlisten of unlistenGovernorEvents) unlisten();
+    reconnectGovernor.dispose();
   };
 
   const daemon: HostDaemon = {
@@ -119,8 +155,14 @@ export function createTauriHost(opts: CreateTauriHostOptions = {}): NotebookHost
         return false;
       }
     },
-    async reconnect() {
-      await reconnectDaemon();
+    async reconnect(options) {
+      // Explicit user Retry only: drop any terminal latch and restart the
+      // backoff schedule, then dial once. Automatic recovery paths must use
+      // `autoReconnect.retryNow()` instead, this reset cancels the
+      // governor's pending retry and replaces it with a single dial whose
+      // failure schedules nothing.
+      reconnectGovernor.reset();
+      await reconnectDaemon(options?.force === true);
     },
     async getInfo() {
       return invoke<DaemonInfo | null>("get_daemon_info");
@@ -128,6 +170,7 @@ export function createTauriHost(opts: CreateTauriHostOptions = {}): NotebookHost
     async getReadyInfo() {
       return invoke<DaemonReadyPayload | null>("get_daemon_ready_info");
     },
+    autoReconnect: reconnectGovernor,
   };
 
   let blobResolver: HostBlobResolver | null = null;
@@ -204,11 +247,9 @@ export function createTauriHost(opts: CreateTauriHostOptions = {}): NotebookHost
       };
     },
     onProgress: (cb) => listenWebview<DaemonProgressPayload>("daemon:progress", cb),
-    onDisconnected: (cb) =>
-      listenWebview<void>("daemon:disconnected", () => {
-        cb();
-        reconnectDaemon().catch(() => {});
-      }),
+    // Notification-only: the reconnect governor's host-level listener owns
+    // the automatic redial, so N subscribers never means N reconnect loops.
+    onDisconnected: (cb) => listenWebview<void>("daemon:disconnected", () => cb()),
     onUnavailable: (cb) => listenWebview<DaemonUnavailablePayload>("daemon:unavailable", cb),
   };
 
@@ -248,6 +289,9 @@ export function createTauriHost(opts: CreateTauriHostOptions = {}): NotebookHost
     async openInNewWindow(path) {
       await invoke("open_notebook_in_new_window", { path });
     },
+    async openHostedInNewWindow(url) {
+      await invoke("open_hosted_notebook_in_new_window", { url });
+    },
     async cloneToEphemeral() {
       return invoke<string>("clone_notebook_to_ephemeral");
     },
@@ -259,6 +303,9 @@ export function createTauriHost(opts: CreateTauriHostOptions = {}): NotebookHost
     },
     async setTitle(title) {
       await getCurrentWindow().setTitle(title);
+    },
+    async setTheme(theme) {
+      await getCurrentWindow().setTheme(theme);
     },
     onFocusChange(cb) {
       let unlisten: Unlisten | null = null;
@@ -288,6 +335,9 @@ export function createTauriHost(opts: CreateTauriHostOptions = {}): NotebookHost
     },
     async getUsername() {
       return invoke<string>("get_username");
+    },
+    async getFontFamilies() {
+      return invoke<string[]>("list_font_families");
     },
   };
 
@@ -405,6 +455,18 @@ export function createTauriHost(opts: CreateTauriHostOptions = {}): NotebookHost
     async openWindow() {
       await invoke("open_settings_window");
     },
+    async getSynced() {
+      return invoke<HostSyncedSettings>("get_synced_settings");
+    },
+    async setSynced(key, value) {
+      await invoke("set_synced_setting", { key, value });
+    },
+    async rotateInstallId() {
+      return invoke<string>("rotate_install_id");
+    },
+    onChanged(cb) {
+      return listenWebview<HostSyncedSettings>("settings:changed", cb);
+    },
   };
 
   const commands = createCommandRegistry();
@@ -475,10 +537,20 @@ export function createTauriHost(opts: CreateTauriHostOptions = {}): NotebookHost
  */
 let _lastMenuBridgeDispose: (() => void) | undefined;
 
+/**
+ * Internal: disposer for the previous host's reconnect governor and its
+ * host-level daemon lifecycle listeners. Same lifecycle story as the menu
+ * bridge above: one live governor per window, reclaimed when a new host is
+ * constructed (hot reload, tests).
+ */
+let _lastReconnectGovernorDispose: (() => void) | undefined;
+
 /** @internal Test helper — forget the most recent menu bridge disposer. */
 export function _resetMenuBridgeForTests(): void {
   _lastMenuBridgeDispose?.();
   _lastMenuBridgeDispose = undefined;
+  _lastReconnectGovernorDispose?.();
+  _lastReconnectGovernorDispose = undefined;
 }
 
 export { TauriTransport } from "./transport";

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  cloudNotebookCoverUrl,
+  cloudNotebookDashboardRuntimeStatus,
   cloudNotebookDashboardOpenUrl,
   cloudNotebookDisplayTitle,
   cloudNotebookOpenUrlWithMode,
   cloudNotebookShortId,
+  isCloudNotebookListItem,
   projectCloudNotebookDashboard,
   projectCloudNotebookDashboardView,
   type CloudNotebookListItem,
@@ -42,6 +45,15 @@ describe("cloud notebook dashboard projection", () => {
       facts: [],
       identityLabel: null,
       notebook: newOwner,
+      // Deterministic per-identity color from the owner principal; owner-scope
+      // rows compute it even though the avatar renders only for shared rows.
+      ownerColor: "#7c3aed",
+      ownerContrast: "#ffffff",
+      ownerInitials: "AL",
+      // Owner-scope rows read "You" (the requester owns them); initials stay
+      // derived from the real identity so the avatar keeps meaning.
+      ownerLabel: "You",
+      runtimeStatus: "none",
     });
     assert.deepEqual(
       model.notebooks.map((item) => item.notebook_id),
@@ -475,7 +487,7 @@ describe("cloud notebook dashboard projection", () => {
         section.notebooks.map((item) => item.notebook_id),
       ]),
       [
-        ["named", "Recent work", "1 more notebook to reopen", ["workstation-notes"]],
+        ["named", "Recent work", "+1 more", ["workstation-notes"]],
         ["generated", "Generated runs", "1 notebook from smoke and debug work", ["toolbar-smoke"]],
         [
           "untitled",
@@ -627,6 +639,326 @@ describe("cloud notebook dashboard projection", () => {
     assert.equal(generatedView.sections[0]?.notebooks.length, 7);
     assert.equal(generatedView.sections[0]?.overflowAction, null);
   });
+
+  it("surfaces active notebooks from compute and editing peers", () => {
+    const active = notebook({
+      id: "topic-viz",
+      title: "Topic Visualization",
+      scope: "owner",
+      updatedAt: "2026-06-23T00:00:00.000Z",
+      latestRevisionId: null,
+      computeSession: {
+        environment_label: "Current Python",
+        last_runtime_seen_at: "2026-06-23T00:00:00.000Z",
+        notebook_id: "topic-viz",
+        owner_principal: "user:dev:alice",
+        queue_depth: 1,
+        runtime_peer_count: 1,
+        runtime_session_id: "job-1",
+        status: "active",
+        status_message: null,
+        updated_at: "2026-06-23T00:00:00.000Z",
+        working_directory: "/home/ubuntu/project",
+        workstation_display_name: "lab2 workstation",
+        workstation_id: "ws-lab2",
+      },
+    });
+    const idle = notebook({
+      id: "notes",
+      title: "Notes",
+      scope: "owner",
+      updatedAt: "2026-06-22T00:00:00.000Z",
+      latestRevisionId: null,
+    });
+    const editing = notebook({
+      id: "shared-edit",
+      title: "Shared Edit",
+      scope: "editor",
+      updatedAt: "2026-06-21T00:00:00.000Z",
+      latestRevisionId: null,
+      peers: [
+        {
+          participant_key: "user:dev:bob",
+          actor_label: "user:dev:bob/browser:tab",
+          display_name: "Bob",
+          connection_scope: "editor",
+        },
+      ],
+    });
+
+    const model = projectCloudNotebookDashboard([idle, active, editing]);
+    const computeView = projectCloudNotebookDashboardView(model, { filterId: "compute" });
+
+    assert.deepEqual(
+      model.filters.map((filter) => [filter.id, filter.count]),
+      [
+        ["all", 3],
+        ["owned", 2],
+        ["shared", 1],
+        ["compute", 2],
+      ],
+    );
+    assert.deepEqual(model.continueRow?.facts, [
+      {
+        kind: "compute",
+        label: "lab2 workstation running, 1 queued",
+        tone: "active",
+      },
+    ]);
+    assert.equal(model.continueRow?.environmentLabel, "Current Python");
+    assert.equal(model.continueRow?.runtimeStatus, "executing");
+    assert.deepEqual(
+      computeView.sections.map((section) => [
+        section.id,
+        section.title,
+        section.notebooks.map((item) => item.notebook_id),
+      ]),
+      [["compute", "Active now", ["topic-viz", "shared-edit"]]],
+    );
+  });
+
+  it("threads notebook language through list-item validation and dashboard rows", () => {
+    const deno = notebook({
+      id: "deno-notebook",
+      title: "Deno Notebook",
+      scope: "owner",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+      latestRevisionId: "published-deno",
+      composition: { code: 2, markdown: 1, raw: 0 },
+      language: "deno",
+    });
+
+    assert.equal(isCloudNotebookListItem(deno), true);
+    assert.equal(isCloudNotebookListItem({ ...deno, language: 42 }), false);
+
+    const model = projectCloudNotebookDashboard([deno]);
+
+    assert.equal(model.continueRow?.notebook.language, "deno");
+    assert.deepEqual(model.continueRow?.composition, { code: 2, markdown: 1, raw: 0 });
+  });
+
+  it("prefers the unified-profile owner display over the raw principal", () => {
+    const shared = notebook({
+      id: "shared-notebook",
+      title: "Shared Notebook",
+      scope: "viewer",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+      latestRevisionId: null,
+    });
+    const withDisplay = { ...shared, owner_display: "Mara Osei" };
+
+    assert.equal(isCloudNotebookListItem(withDisplay), true);
+    assert.equal(isCloudNotebookListItem({ ...shared, owner_display: 42 }), false);
+
+    const model = projectCloudNotebookDashboard([withDisplay]);
+    assert.equal(model.continueRow?.ownerLabel, "Mara Osei");
+    assert.equal(model.continueRow?.ownerInitials, "MO");
+
+    // Without a profile display, the principal-derived fallback still applies.
+    const fallback = projectCloudNotebookDashboard([shared]);
+    assert.notEqual(fallback.continueRow?.ownerLabel, "Mara Osei");
+  });
+
+  it("threads unified-profile owner avatars and resolved state through dashboard rows", () => {
+    const shared = notebook({
+      id: "shared-avatar-notebook",
+      title: "Shared Avatar Notebook",
+      scope: "viewer",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+      latestRevisionId: null,
+    });
+    const withAvatar = {
+      ...shared,
+      owner_avatar: "https://profiles.example/mara.png",
+      owner_display: "Mara Osei",
+      owner_resolved: true,
+    };
+
+    assert.equal(isCloudNotebookListItem(withAvatar), true);
+    assert.equal(isCloudNotebookListItem({ ...shared, owner_avatar: 42 }), false);
+    assert.equal(isCloudNotebookListItem({ ...shared, owner_resolved: "yes" }), false);
+
+    const model = projectCloudNotebookDashboard([withAvatar]);
+    assert.equal(model.continueRow?.ownerAvatar, "https://profiles.example/mara.png");
+    assert.equal(model.continueRow?.notebook.owner_resolved, true);
+  });
+
+  it("never renders an opaque owner principal as a name", () => {
+    const shared = notebook({
+      id: "opaque-owner",
+      title: "Shared Notebook",
+      scope: "viewer",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+      latestRevisionId: null,
+    });
+    const opaque = { ...shared, owner_principal: "user:oidc:b0204af7084b1c2d3e4f5a6b" };
+
+    const model = projectCloudNotebookDashboard([opaque]);
+    // The owner column shows a generic label, never the raw identifier.
+    assert.equal(model.continueRow?.ownerLabel, "Notebook owner");
+    assert.equal(model.continueRow?.ownerInitials, "NO");
+  });
+
+  it("threads room peers through list-item validation and active filtering", () => {
+    const withPeers = notebook({
+      id: "presence-notebook",
+      title: "Presence Notebook",
+      scope: "owner",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+      latestRevisionId: null,
+      peers: [
+        {
+          participant_key: "user:dev:bob",
+          actor_label: "user:dev:bob/browser:tab",
+          display_name: "Bob",
+          connection_scope: "editor",
+        },
+      ],
+    });
+
+    assert.equal(isCloudNotebookListItem(withPeers), true);
+    assert.equal(
+      isCloudNotebookListItem({
+        ...withPeers,
+        peers: [{ participant_key: "user:dev:bob", actor_label: 42, connection_scope: "editor" }],
+      }),
+      false,
+    );
+
+    const view = projectCloudNotebookDashboardView(projectCloudNotebookDashboard([withPeers]), {
+      filterId: "compute",
+    });
+    assert.deepEqual(
+      view.sections.map((section) => [section.id, section.notebooks[0]?.notebook_id]),
+      [["compute", "presence-notebook"]],
+    );
+  });
+
+  it("threads notebook cover through list-item validation and dashboard rows", () => {
+    const covered = notebook({
+      id: "covered-notebook",
+      title: "Covered Notebook",
+      scope: "owner",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+      latestRevisionId: "published-covered",
+      cover: { blob_hash: "cover-hash", mime: "image/svg+xml" },
+    });
+
+    assert.equal(isCloudNotebookListItem(covered), true);
+    assert.equal(
+      isCloudNotebookListItem({
+        ...covered,
+        cover: { blob_hash: "cover-hash", mime: "text/html" },
+      }),
+      false,
+    );
+    assert.equal(
+      isCloudNotebookListItem({ ...covered, cover: { blob_hash: 42, mime: "image/png" } }),
+      false,
+    );
+
+    const model = projectCloudNotebookDashboard([covered]);
+
+    assert.deepEqual(model.continueRow?.notebook.cover, {
+      blob_hash: "cover-hash",
+      mime: "image/svg+xml",
+    });
+    assert.equal(cloudNotebookCoverUrl(covered), "/api/n/covered-notebook/blobs/cover-hash");
+  });
+
+  it("threads notebook preview cells through list-item validation and dashboard rows", () => {
+    const previewed = notebook({
+      id: "previewed-notebook",
+      title: "Previewed Notebook",
+      scope: "owner",
+      updatedAt: "2026-06-24T00:00:00.000Z",
+      latestRevisionId: "published-previewed",
+      preview: [
+        { kind: "markdown", text: "# Model notes" },
+        { kind: "code", text: "chart = alt.Chart(df)", execution_count: 8 },
+      ],
+    });
+
+    assert.equal(isCloudNotebookListItem(previewed), true);
+    assert.equal(
+      isCloudNotebookListItem({
+        ...previewed,
+        preview: [{ kind: "markdown", text: "# Model notes", execution_count: 1 }],
+      }),
+      false,
+    );
+    assert.equal(
+      isCloudNotebookListItem({
+        ...previewed,
+        preview: [{ kind: "code", text: "run()", execution_count: "8" }],
+      }),
+      false,
+    );
+
+    const model = projectCloudNotebookDashboard([previewed]);
+
+    assert.deepEqual(model.continueRow?.notebook.preview, [
+      { kind: "markdown", text: "# Model notes" },
+      { kind: "code", text: "chart = alt.Chart(df)", execution_count: 8 },
+    ]);
+  });
+
+  it("maps compute session status to dashboard runtime status", () => {
+    const base = {
+      id: "runtime-status",
+      title: "Runtime status",
+      scope: "owner" as const,
+      updatedAt: "2026-06-23T00:00:00.000Z",
+      latestRevisionId: null,
+    };
+    const computeSession = {
+      environment_label: "Current Python",
+      last_runtime_seen_at: "2026-06-23T00:00:00.000Z",
+      notebook_id: "runtime-status",
+      owner_principal: "user:dev:alice",
+      queue_depth: 0,
+      runtime_peer_count: 1,
+      runtime_session_id: "job-1",
+      status: "active" as const,
+      status_message: null,
+      updated_at: "2026-06-23T00:00:00.000Z",
+      working_directory: "/home/ubuntu/project",
+      workstation_display_name: "lab2 workstation",
+      workstation_id: "ws-lab2",
+    };
+
+    assert.equal(cloudNotebookDashboardRuntimeStatus(notebook(base)), "none");
+    assert.equal(
+      cloudNotebookDashboardRuntimeStatus(
+        notebook({ ...base, computeSession: { ...computeSession, status: "starting" } }),
+      ),
+      "starting",
+    );
+    assert.equal(
+      cloudNotebookDashboardRuntimeStatus(
+        notebook({ ...base, computeSession: { ...computeSession, status: "stale" } }),
+      ),
+      "stale",
+    );
+    assert.equal(
+      cloudNotebookDashboardRuntimeStatus(
+        notebook({ ...base, computeSession: { ...computeSession, status: "error" } }),
+      ),
+      "error",
+    );
+    assert.equal(
+      cloudNotebookDashboardRuntimeStatus(
+        notebook({ ...base, computeSession: { ...computeSession, queue_depth: 0 } }),
+      ),
+      "ready",
+    );
+    assert.equal(
+      cloudNotebookDashboardRuntimeStatus(
+        notebook({ ...base, computeSession: { ...computeSession, queue_depth: 2 } }),
+      ),
+      "executing",
+    );
+  });
 });
 
 function notebook(input: {
@@ -635,6 +967,12 @@ function notebook(input: {
   scope: CloudNotebookListItem["scope"];
   updatedAt: string;
   latestRevisionId: string | null;
+  computeSession?: CloudNotebookListItem["compute_session"];
+  composition?: CloudNotebookListItem["composition"];
+  cover?: CloudNotebookListItem["cover"];
+  language?: string;
+  peers?: CloudNotebookListItem["peers"];
+  preview?: CloudNotebookListItem["preview"];
 }): CloudNotebookListItem {
   return {
     notebook_id: input.id,
@@ -644,6 +982,12 @@ function notebook(input: {
     created_at: "2026-05-01T00:00:00.000Z",
     updated_at: input.updatedAt,
     latest_revision_id: input.latestRevisionId,
+    compute_session: input.computeSession ?? null,
+    ...(input.composition ? { composition: input.composition } : {}),
+    ...(input.cover ? { cover: input.cover } : {}),
+    ...(input.language ? { language: input.language } : {}),
+    ...(input.peers ? { peers: input.peers } : {}),
+    ...(input.preview ? { preview: input.preview } : {}),
     viewer_url: `/n/${input.id}/notebook`,
     endpoints: {
       catalog: `/api/n/${input.id}`,

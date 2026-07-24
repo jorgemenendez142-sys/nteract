@@ -17,19 +17,28 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS as DndCSS } from "@dnd-kit/utilities";
 import { Eye, EyeOff, Plus, RotateCcw, Trash2, X } from "lucide-react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { notebookCellAnchorId, type NotebookInteractionTarget } from "runtimed";
 import { CellInsertionRibbon, type CellInsertionType } from "@/components/cell/CellInsertionRibbon";
 import { CellSkeleton } from "@/components/cell/CellSkeleton";
 import { Button } from "@/components/ui/button";
 import type { NteractEmbedHostContextPatch } from "@/components/isolated/host-context";
-import type { NotebookShellCapabilities } from "@/components/notebook";
+import {
+  captureCellDeletionScrollAnchor,
+  isNotebookTailPinned,
+  restoreScrollAnchor,
+  scrollToDocumentAnchor,
+  scrollToNotebookTail,
+  shouldTailFollowCellCountChange,
+  type NotebookScrollAnchorSnapshot,
+  type NotebookShellCapabilities,
+} from "@/components/notebook";
 import type { MarkdownHeadingAnchor } from "@/components/outputs/markdown-heading-anchors";
 import type { Runtime } from "@/hooks/useSyncedSettings";
 import { ErrorBoundary } from "@/lib/error-boundary";
 import { cn } from "@/lib/utils";
 import type { TracebackCellTarget } from "@/components/outputs/traceback-output";
-import { usePresenceContext } from "../contexts/PresenceContext";
+import { usePresenceContext } from "@/components/notebook/presence-context";
 import { EditorRegistryProvider, useEditorRegistry } from "../hooks/useEditorRegistry";
 import {
   flushCellUIState,
@@ -43,7 +52,7 @@ import {
   useOutputFocusedCellId,
 } from "@/components/notebook/state/output-focus-store";
 import { logger } from "../lib/logger";
-import { useOutputProjectionFailures } from "../lib/project-runtime-stores";
+import { useOutputProjectionFailures } from "@/components/notebook/state/runtime-store-projection";
 import { computeCanMutateCells } from "@/components/notebook/mutation-gate";
 import {
   getCellById,
@@ -60,9 +69,16 @@ import type { CodeCell as CodeCellType, NotebookCell } from "../types";
 import { CodeCell, type HiddenGroupCellSummary } from "./CodeCell";
 import { MarkdownCell } from "./MarkdownCell";
 import { RawCell } from "./RawCell";
+import type { SourceCommentThread } from "../lib/comment-highlights";
+import type {
+  OutputCommentAnchor,
+  SourceCommentSelectionRect,
+  SourceRangeCommentAnchor,
+} from "../lib/comment-source-anchor";
 
 type AddCellResult = NotebookCell | null;
 type AddCellHandler = (type: CellInsertionType, afterCellId?: string | null) => AddCellResult;
+type ChangeCellTypeHandler = (cellId: string, type: "code" | "markdown") => void;
 
 export interface NotebookViewProps {
   cellIds: string[];
@@ -73,6 +89,7 @@ export interface NotebookViewProps {
   loadError?: string | null;
   runtime?: Runtime | null;
   sessionRuntimeState?: string | null;
+  onReconnectRuntime?: () => void;
   onFocusCell: (cellId: string) => void;
   onExecuteCell: (cellId: string) => void;
   onRequestExecuteCell?: (cellId: string) => void;
@@ -81,14 +98,30 @@ export interface NotebookViewProps {
   onUpdateCellSource?: (cellId: string, source: string) => void;
   onAddCell: AddCellHandler;
   onMoveCell: (cellId: string, afterCellId?: string | null) => void;
+  onChangeCellType?: ChangeCellTypeHandler;
   onReportOutputMatchCount?: (cellId: string, count: number) => void;
   onSetCellSourceHidden?: (cellId: string, hidden: boolean) => void;
   onSetCellOutputsHidden?: (cellId: string, hidden: boolean) => void;
+  onCreateSourceComment?: (
+    anchor: SourceRangeCommentAnchor,
+    rect: SourceCommentSelectionRect | null,
+    quote?: string | null,
+  ) => void;
+  onCreateOutputComment?: (anchor: OutputCommentAnchor) => void;
+  onActivateCommentThread?: (threadId: string) => void;
+  commentThreadsByCell?: ReadonlyMap<string, readonly SourceCommentThread[]>;
+  pendingCommentAnchor?: SourceRangeCommentAnchor | null;
   markdownHeadingAnchorsByCellId?: ReadonlyMap<string, readonly MarkdownHeadingAnchor[]>;
   outputHostContext?: NteractEmbedHostContextPatch;
   deferOutputIsolatedFramesUntilVisible?: boolean;
   deferredOutputIsolatedFrameRootMargin?: string;
   autoFocusFirstCell?: boolean;
+}
+
+interface PendingNotebookScrollAnchorRestore {
+  deletedCellId: string;
+  sourceCellIds: readonly string[];
+  snapshot: NotebookScrollAnchorSnapshot;
 }
 
 const NOTEBOOK_TAIL_SPACE = "clamp(4rem, 10vh, 6rem)";
@@ -130,7 +163,7 @@ function CellErrorFallback({
             className="h-7 gap-1 px-2 text-xs"
             title="Retry rendering"
           >
-            <RotateCcw className="h-3 w-3" />
+            <RotateCcw className="size-3" />
             Retry
           </Button>
           {onDelete ? (
@@ -141,7 +174,7 @@ function CellErrorFallback({
               className="h-7 gap-1 px-2 text-xs text-destructive hover:text-destructive"
               title="Delete cell"
             >
-              <X className="h-3 w-3" />
+              <X className="size-3" />
               Delete
             </Button>
           ) : null}
@@ -349,6 +382,7 @@ function NotebookViewContent({
   loadError = null,
   runtime = "python",
   sessionRuntimeState = null,
+  onReconnectRuntime,
   onFocusCell,
   onExecuteCell,
   onRequestExecuteCell,
@@ -357,9 +391,15 @@ function NotebookViewContent({
   onUpdateCellSource,
   onAddCell,
   onMoveCell,
+  onChangeCellType,
   onReportOutputMatchCount,
   onSetCellSourceHidden,
   onSetCellOutputsHidden,
+  onCreateSourceComment,
+  onCreateOutputComment,
+  onActivateCommentThread,
+  commentThreadsByCell,
+  pendingCommentAnchor,
   markdownHeadingAnchorsByCellId,
   outputHostContext,
   deferOutputIsolatedFramesUntilVisible = false,
@@ -370,6 +410,8 @@ function NotebookViewContent({
   const containerRef = useRef<HTMLDivElement>(null);
   const tailPinnedRef = useRef(false);
   const tailScrollFrameRef = useRef<number | null>(null);
+  const previousCellCountRef = useRef(cellIds.length);
+  const pendingScrollAnchorRef = useRef<PendingNotebookScrollAnchorRestore | null>(null);
   const canEditCodeCellSources = capabilities?.canEditCells ?? !readOnly;
   const canEditMarkdownSources = capabilities?.canEditMarkdown ?? !readOnly;
   const canMutateCells = computeCanMutateCells({ canAcceptCellMutations, capabilities, readOnly });
@@ -652,6 +694,35 @@ function NotebookViewContent({
     cancelTailScrollFrame();
   }, [cancelTailScrollFrame]);
 
+  const handleDeleteCell = useCallback(
+    (cellId: string) => {
+      tailPinnedRef.current = false;
+      cancelTailScrollFrame();
+      const sourceCellIds = cellIdsRef.current;
+      const snapshot = captureCellDeletionScrollAnchor(containerRef.current, sourceCellIds, cellId);
+      pendingScrollAnchorRef.current = snapshot
+        ? {
+            deletedCellId: cellId,
+            sourceCellIds,
+            snapshot,
+          }
+        : null;
+      onDeleteCell(cellId);
+    },
+    [cancelTailScrollFrame, onDeleteCell],
+  );
+
+  useLayoutEffect(() => {
+    const pending = pendingScrollAnchorRef.current;
+    if (!pending) return;
+    if (cellIds === pending.sourceCellIds) return;
+
+    pendingScrollAnchorRef.current = null;
+    if (cellIds.includes(pending.deletedCellId)) return;
+
+    restoreScrollAnchor(containerRef.current, pending.snapshot);
+  }, [cellIds]);
+
   // Prevent horizontal scroll drift (can happen during text selection) and
   // remember whether the user is already reading at the notebook tail.
   useEffect(() => {
@@ -668,28 +739,23 @@ function NotebookViewContent({
         return;
       }
 
-      const distanceFromTail =
-        container.scrollHeight - container.clientHeight - container.scrollTop;
-      if (distanceFromTail <= NOTEBOOK_TAIL_PIN_THRESHOLD_PX) {
-        tailPinnedRef.current = true;
-        return;
-      }
-
       const lastCellId = cellIdsRef.current.at(-1);
       const lastCellEl = lastCellId
         ? container.querySelector(`[data-cell-id="${CSS.escape(lastCellId)}"]`)
         : null;
-      if (!lastCellEl) {
-        tailPinnedRef.current = false;
-        return;
-      }
-
       const containerRect = container.getBoundingClientRect();
-      const lastCellRect = lastCellEl.getBoundingClientRect();
-      tailPinnedRef.current =
-        lastCellRect.bottom >= containerRect.top &&
-        lastCellRect.top <= containerRect.bottom &&
-        lastCellRect.bottom >= containerRect.bottom - NOTEBOOK_TAIL_PIN_THRESHOLD_PX;
+      const lastCellRect = lastCellEl?.getBoundingClientRect() ?? null;
+      tailPinnedRef.current = isNotebookTailPinned({
+        cellCount: cellIdsRef.current.length,
+        containerScrollHeight: container.scrollHeight,
+        containerClientHeight: container.clientHeight,
+        containerScrollTop: container.scrollTop,
+        containerTop: containerRect.top,
+        containerBottom: containerRect.bottom,
+        lastCellTop: lastCellRect?.top ?? null,
+        lastCellBottom: lastCellRect?.bottom ?? null,
+        thresholdPx: NOTEBOOK_TAIL_PIN_THRESHOLD_PX,
+      });
     };
 
     handleScroll();
@@ -707,7 +773,7 @@ function NotebookViewContent({
       if (!tailPinnedRef.current) return;
       const currentContainer = containerRef.current;
       if (!currentContainer) return;
-      currentContainer.scrollTop = currentContainer.scrollHeight;
+      scrollToNotebookTail(currentContainer);
     });
   }, []);
 
@@ -725,19 +791,23 @@ function NotebookViewContent({
   }, [scheduleTailScrollIfPinned]);
 
   useEffect(() => {
-    scheduleTailScrollIfPinned();
+    const previousCellCount = previousCellCountRef.current;
+    previousCellCountRef.current = cellIds.length;
+    if (shouldTailFollowCellCountChange(previousCellCount, cellIds.length, tailPinnedRef.current)) {
+      scheduleTailScrollIfPinned();
+    }
   }, [cellIds.length, scheduleTailScrollIfPinned]);
 
   // Scroll the current search match cell into view
   useEffect(() => {
     if (!searchCurrentMatch) return;
-    const cellEl = containerRef.current?.querySelector(
-      `[data-cell-id="${CSS.escape(searchCurrentMatch.cellId)}"]`,
-    );
-    if (cellEl) {
-      cellEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    }
-  }, [searchCurrentMatch]);
+    tailPinnedRef.current = false;
+    cancelTailScrollFrame();
+    scrollToDocumentAnchor(containerRef.current, notebookCellAnchorId(searchCurrentMatch.cellId), {
+      block: "nearest",
+      behavior: "smooth",
+    });
+  }, [cancelTailScrollFrame, searchCurrentMatch]);
 
   useEffect(() => {
     if (!autoFocusFirstCell) return;
@@ -812,11 +882,11 @@ function NotebookViewContent({
         <button
           type="button"
           tabIndex={-1}
-          onClick={() => onDeleteCell(cell.id)}
+          onClick={() => handleDeleteCell(cell.id)}
           className="flex items-center justify-center rounded p-1 text-muted-foreground/40 transition-colors hover:text-destructive"
           title="Delete cell"
         >
-          <Trash2 className="h-3.5 w-3.5" />
+          <Trash2 className="size-3.5" />
         </button>
       ) : null;
 
@@ -843,11 +913,7 @@ function NotebookViewContent({
               )}
               title={isSourceHidden ? "Show input" : "Hide input"}
             >
-              {isSourceHidden ? (
-                <Eye className="h-3.5 w-3.5" />
-              ) : (
-                <EyeOff className="h-3.5 w-3.5" />
-              )}
+              {isSourceHidden ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />}
             </button>
           ) : null;
         const visibleDeleteButton = !isSourceHidden ? deleteButton : null;
@@ -923,17 +989,25 @@ function NotebookViewContent({
             onRequestExecute={requestExecuteCellOrHiddenGroup}
             onRequestExecuteInPlace={requestExecuteCellInPlaceOrHiddenGroup}
             onInterrupt={onInterruptKernel}
-            onDelete={canMutateCells ? () => onDeleteCell(cell.id) : undefined}
+            onDelete={canMutateCells ? () => handleDeleteCell(cell.id) : undefined}
             onFocusPrevious={onFocusPrevious}
             onFocusNext={onFocusNext}
             onNavigateToCell={onNavigateToCell}
             onInsertCellAfter={canMutateCells ? () => onAddCell("code", cell.id) : undefined}
+            onChangeCellType={
+              canMutateCells && onChangeCellType
+                ? (type: "code" | "markdown") => onChangeCellType(cell.id, type)
+                : undefined
+            }
             isLastCell={index === cellIdsRef.current.length - 1}
             dragHandleProps={dragHandleProps}
             isDragging={isDragging}
             rightGutterContent={rightGutterContent}
             readOnly={!canEditCodeCellSources}
             canExecute={canExecuteCells}
+            onCreateSourceComment={onCreateSourceComment}
+            onCreateOutputComment={onCreateOutputComment}
+            onActivateCommentThread={onActivateCommentThread}
             outputHostContext={outputHostContext}
             deferOutputIsolatedFrameUntilVisible={deferOutputIsolatedFramesUntilVisible}
             deferredOutputIsolatedFrameRootMargin={deferredOutputIsolatedFrameRootMargin}
@@ -992,7 +1066,7 @@ function NotebookViewContent({
             onFocus={() => {
               focusInteractionTarget({ kind: "editor", cellId: cell.id });
             }}
-            onDelete={canMutateCells ? () => onDeleteCell(cell.id) : undefined}
+            onDelete={canMutateCells ? () => handleDeleteCell(cell.id) : undefined}
             onUpdateSource={
               canMutateCells && canEditMarkdownSources && onUpdateCellSource
                 ? (source: string) => onUpdateCellSource(cell.id, source)
@@ -1001,12 +1075,23 @@ function NotebookViewContent({
             onFocusPrevious={onFocusPrevious}
             onFocusNext={onFocusNext}
             onInsertCellAfter={canMutateCells ? () => onAddCell("markdown", cell.id) : undefined}
+            onChangeCellType={
+              canMutateCells && onChangeCellType
+                ? (type: "code" | "markdown") => onChangeCellType(cell.id, type)
+                : undefined
+            }
             isLastCell={index === cellIdsRef.current.length - 1}
             dragHandleProps={dragHandleProps}
             isDragging={isDragging}
             rightGutterContent={rightGutterContent}
             headingAnchors={markdownHeadingAnchorsByCellId?.get(cell.id)}
+            commentThreads={commentThreadsByCell?.get(cell.id)}
+            pendingCommentAnchor={
+              pendingCommentAnchor?.cell_id === cell.id ? pendingCommentAnchor : null
+            }
             readOnly={!canEditMarkdownSources}
+            onCreateSourceComment={onCreateSourceComment}
+            onActivateCommentThread={onActivateCommentThread}
             outputHostContext={outputHostContext}
           />
         );
@@ -1020,15 +1105,22 @@ function NotebookViewContent({
           onFocus={() => {
             focusInteractionTarget({ kind: "editor", cellId: cell.id });
           }}
-          onDelete={canMutateCells ? () => onDeleteCell(cell.id) : undefined}
+          onDelete={canMutateCells ? () => handleDeleteCell(cell.id) : undefined}
           onFocusPrevious={onFocusPrevious}
           onFocusNext={onFocusNext}
           onInsertCellAfter={canMutateCells ? () => onAddCell("code", cell.id) : undefined}
+          onChangeCellType={
+            canMutateCells && onChangeCellType
+              ? (type: "code" | "markdown") => onChangeCellType(cell.id, type)
+              : undefined
+          }
           isLastCell={index === cellIdsRef.current.length - 1}
           dragHandleProps={dragHandleProps}
           isDragging={isDragging}
           rightGutterContent={rightGutterContent}
           readOnly={!canEditCodeCellSources}
+          onCreateSourceComment={onCreateSourceComment}
+          onActivateCommentThread={onActivateCommentThread}
         />
       );
     },
@@ -1038,12 +1130,18 @@ function NotebookViewContent({
       suppressTailFollowForInPlaceExecution,
       onExecuteCell,
       onInterruptKernel,
-      onDeleteCell,
+      handleDeleteCell,
       onUpdateCellSource,
       onAddCell,
+      onChangeCellType,
       onReportOutputMatchCount,
       onSetCellSourceHidden,
       onSetCellOutputsHidden,
+      onCreateSourceComment,
+      onCreateOutputComment,
+      onActivateCommentThread,
+      commentThreadsByCell,
+      pendingCommentAnchor,
       markdownHeadingAnchorsByCellId,
       canEditCodeCellSources,
       canEditMarkdownSources,
@@ -1074,8 +1172,20 @@ function NotebookViewContent({
       data-cell-count={cellIds.length}
     >
       {loadError ? (
-        <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-          Notebook failed to finish loading: {loadError}
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          <span className="min-w-0 flex-1">Notebook failed to finish loading: {loadError}</span>
+          {onReconnectRuntime ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-8 gap-1 border-destructive/30 text-destructive hover:bg-destructive/10"
+              onClick={onReconnectRuntime}
+            >
+              <RotateCcw className="size-3" />
+              Reconnect
+            </Button>
+          ) : null}
         </div>
       ) : null}
       {outputProjectionFailures.length > 0 ? (
@@ -1096,6 +1206,18 @@ function NotebookViewContent({
           <div className="flex flex-col items-center justify-center py-20 text-center text-destructive">
             <p className="text-sm font-medium">Notebook load failed</p>
             <p className="mt-1 max-w-xl text-xs text-muted-foreground">{loadError}</p>
+            {onReconnectRuntime ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="mt-4 gap-1"
+                onClick={onReconnectRuntime}
+              >
+                <RotateCcw className="size-3" />
+                Reconnect runtime
+              </Button>
+            ) : null}
           </div>
         ) : (
           <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
@@ -1110,7 +1232,7 @@ function NotebookViewContent({
                     onClick={() => onAddCell("code")}
                     className="gap-1"
                   >
-                    <Plus className="h-3 w-3" />
+                    <Plus className="size-3" />
                     Code Cell
                   </Button>
                   <Button
@@ -1119,7 +1241,7 @@ function NotebookViewContent({
                     onClick={() => onAddCell("markdown")}
                     className="gap-1"
                   >
-                    <Plus className="h-3 w-3" />
+                    <Plus className="size-3" />
                     Markdown Cell
                   </Button>
                 </div>
@@ -1147,7 +1269,7 @@ function NotebookViewContent({
                     index={index}
                     renderCell={renderCell}
                     onAddCell={onAddCell}
-                    onDeleteCell={onDeleteCell}
+                    onDeleteCell={handleDeleteCell}
                     isLastCell={index === cellIds.length - 1}
                     isHiddenInGroup={group != null && !group.isFirst}
                     canMutateCells={canMutateCells}

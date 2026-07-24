@@ -18,6 +18,10 @@ import { cloudNotebookShellCapabilities } from "./shell-capabilities";
 interface UseCloudShellCapabilitiesInput {
   accessConnectionScope?: string | null;
   authState: CloudPrototypeAuthState;
+  selfDisplay?: {
+    label?: string | null;
+    imageUrl?: string | null;
+  };
   connectionScope: string | null;
   connectionActorLabel: string | null;
   connectionPeerId: string | null;
@@ -30,6 +34,7 @@ interface UseCloudShellCapabilitiesInput {
   runtimePeerAvailable: boolean;
   runtimePeerCount: number;
   kernelStatusLabel: string | null;
+  runtimeLastSeenAt?: string | null;
   workstationAttachment: WorkstationAttachmentState | null;
   hostCapabilities: CloudViewerConfig["hostCapabilities"];
 }
@@ -50,6 +55,7 @@ export interface CloudShellCapabilities {
 export function useCloudShellCapabilities({
   accessConnectionScope = null,
   authState,
+  selfDisplay,
   connectionScope,
   connectionActorLabel,
   connectionPeerId,
@@ -62,6 +68,7 @@ export function useCloudShellCapabilities({
   runtimePeerAvailable,
   runtimePeerCount,
   kernelStatusLabel,
+  runtimeLastSeenAt = null,
   workstationAttachment,
   hostCapabilities,
 }: UseCloudShellCapabilitiesInput): CloudShellCapabilities {
@@ -109,6 +116,7 @@ export function useCloudShellCapabilities({
       cloudNotebookShellCapabilities({
         accessConnectionScope: documentAccessScope,
         authState,
+        selfDisplay,
         connectionScope,
         connectionActorLabel,
         connectionPeerLabel,
@@ -120,11 +128,14 @@ export function useCloudShellCapabilities({
         runtimeAvailable: runtimePeerAvailable,
         runtimePeerCount,
         kernelStatusLabel,
+        runtimeLastSeenAt,
         workstationAttachment,
         hostCapabilities,
       }),
     [
       authState,
+      selfDisplay?.imageUrl,
+      selfDisplay?.label,
       hasAppSession,
       documentAccessScope,
       codeCellCount,
@@ -135,6 +146,7 @@ export function useCloudShellCapabilities({
       editReadiness.canAcceptCellMutations,
       editReadiness.editAccessRequestPending,
       kernelStatusLabel,
+      runtimeLastSeenAt,
       runtimePeerCount,
       runtimePeerAvailable,
       selectedMode,

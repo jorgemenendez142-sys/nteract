@@ -5,7 +5,7 @@ import type {
 } from "./notebook-edit-access";
 import type { NotebookActorProjection } from "./notebook-actor-projection";
 import { getBoundedCacheValue, setBoundedCacheValue, stableCacheKey } from "./projection-cache";
-import type { WorkstationAttachmentState } from "./runtime-state";
+import type { WorkstationAcceleratorState, WorkstationAttachmentState } from "./runtime-state";
 
 export type {
   NotebookActorOperator,
@@ -57,6 +57,14 @@ export type NotebookShellRuntimeTargetStatus =
   | "offline"
   | "attention";
 
+export type NotebookShellRoomLinkStatus = "connected" | "reconnecting" | "lost";
+
+export interface NotebookShellRoomLinkProjection {
+  status: NotebookShellRoomLinkStatus;
+  statusLabel: string;
+  lastSeenAt: string | null;
+}
+
 export interface NotebookShellRuntimeTargetProjection {
   /**
    * Stable host-owned workstation identifier. This is intentionally not a
@@ -72,6 +80,12 @@ export interface NotebookShellRuntimeTargetProjection {
   runtimeSessionId?: string | null;
   kind: NotebookShellRuntimeTargetKind;
   status: NotebookShellRuntimeTargetStatus;
+  /**
+   * A hosted workstation attachment that is deliberately hibernated. The
+   * RuntimeStateDoc owns this fact; clients use it to label the target and let
+   * Run wake compute without treating the room link as lost.
+   */
+  attachmentIdle?: boolean;
   label: string;
   statusLabel?: string | null;
   detail?: string | null;
@@ -90,12 +104,24 @@ export interface NotebookShellRuntimeTargetProjection {
   kernelStatusLabel?: string | null;
   cpuCount?: number | null;
   memoryBytes?: number | null;
+  /**
+   * Last host-reported accelerator inventory. Missing/null means an older host
+   * did not report it; an empty array means detection found none. Readiness is
+   * runtime usability, never currently free or schedulable capacity.
+   */
+  accelerators?: readonly WorkstationAcceleratorState[] | null;
   resourceLabel?: string | null;
   /**
    * Room-observed runtime peer count for hosted workstation attachments. This
    * is presence/runtime state, not an ACL or workstation registry fact.
    */
   runtimePeerCount?: number | null;
+  /**
+   * Host-observed link between a hosted runtime/workstation peer and the room.
+   * The host projects this from durable runtime state and room presence; shared
+   * UI should not infer transport health from React-local socket state.
+   */
+  roomLink?: NotebookShellRoomLinkProjection | null;
   workingDirectoryLabel?: string | null;
 }
 
@@ -136,7 +162,15 @@ export interface ProjectNotebookRuntimeTargetFromWorkstationAttachmentOptions {
    */
   kind?: NotebookShellRuntimeTargetKind;
   kernelStatusLabel?: string | null;
+  /**
+   * Hosted rooms can observe whether the runtime peer that owns a ready/busy
+   * attachment is still present. When this is true, a ready RuntimeStateDoc
+   * attachment without a live runtime peer is a previous compute session that
+   * needs attention, not an executable runtime.
+   */
+  requireRuntimePeer?: boolean;
   runtimePeerCount?: number | null;
+  runtimeLastSeenAt?: string | null;
 }
 
 export interface NotebookShellCapabilities {
@@ -266,10 +300,31 @@ export function notebookShellWorkstationAttachmentCacheKey(
     attachment.status_message ?? null,
     attachment.cpu_count ?? null,
     attachment.memory_bytes ?? null,
+    notebookShellWorkstationAcceleratorsCacheKey(attachment.accelerators),
     attachment.working_directory ?? null,
     attachment.updated_at ?? null,
     attachment.runtime_session_id ?? null,
   ]);
+}
+
+export function notebookShellWorkstationAcceleratorsCacheKey(
+  accelerators: readonly WorkstationAcceleratorState[] | null | undefined,
+): string {
+  if (accelerators === undefined) return "undefined";
+  if (accelerators === null) return "null";
+  return stableCacheKey(
+    accelerators.map((accelerator) =>
+      stableCacheKey([
+        accelerator.kind,
+        accelerator.vendor ?? null,
+        accelerator.model ?? null,
+        accelerator.count,
+        accelerator.memory_bytes_per_device ?? null,
+        accelerator.readiness,
+        accelerator.diagnostic ?? null,
+      ]),
+    ),
+  );
 }
 
 export function projectNotebookRuntimeTargetFromWorkstationAttachment(
@@ -278,28 +333,46 @@ export function projectNotebookRuntimeTargetFromWorkstationAttachment(
 ): NotebookShellRuntimeTargetProjection | null {
   if (!attachment) return null;
 
-  const statusProjection = workstationAttachmentStatusProjection(attachment.status);
+  const runtimePeerCount = normalizePositiveInteger(options.runtimePeerCount);
+  const runtimeLastSeenAt = trimToNull(options.runtimeLastSeenAt);
+  const missingRequiredRuntimePeer =
+    Boolean(options.requireRuntimePeer) &&
+    workstationAttachmentCanExecute(attachment) &&
+    runtimePeerCount === null;
+  const statusProjection = workstationAttachmentStatusProjection(
+    attachment.status,
+    missingRequiredRuntimePeer,
+  );
   const defaultEnvironmentLabel =
     trimToNull(attachment.default_environment_label) ??
     trimToNull(attachment.environment_policy) ??
     "Notebook runtime";
-  const runtimePeerCount = normalizePositiveInteger(options.runtimePeerCount);
 
   return {
     id: trimToNull(attachment.workstation_id) ?? "attached-workstation",
     runtimeSessionId: trimToNull(attachment.runtime_session_id),
     kind: options.kind ?? "cloud_workstation",
     status: statusProjection.status,
+    ...(attachment.status === "idle" ? { attachmentIdle: true } : {}),
     label: trimToNull(attachment.display_name) ?? "Attached workstation",
     statusLabel: statusProjection.statusLabel,
-    detail: trimToNull(attachment.status_message) ?? statusProjection.detail,
+    detail: missingRequiredRuntimePeer
+      ? statusProjection.detail
+      : (trimToNull(attachment.status_message) ?? statusProjection.detail),
     providerLabel: workstationAttachmentProviderLabel(attachment.provider),
     defaultEnvironmentLabel,
     environmentLabel: defaultEnvironmentLabel,
     kernelStatusLabel: options.kernelStatusLabel ?? null,
     cpuCount: normalizePositiveInteger(attachment.cpu_count),
     memoryBytes: normalizePositiveInteger(attachment.memory_bytes),
+    accelerators: stableWorkstationAccelerators(attachment.accelerators),
     runtimePeerCount,
+    roomLink: projectRuntimeRoomLink({
+      attachmentStatus: attachment.status,
+      missingRequiredRuntimePeer,
+      runtimeLastSeenAt,
+      runtimePeerCount,
+    }),
     workingDirectoryLabel: trimToNull(attachment.working_directory),
   };
 }
@@ -309,6 +382,56 @@ export function workstationAttachmentCanExecute(
 ): boolean {
   if (!attachment) return false;
   return attachment.status === "ready" || attachment.status === "busy";
+}
+
+function projectRuntimeRoomLink({
+  attachmentStatus,
+  missingRequiredRuntimePeer,
+  runtimeLastSeenAt,
+  runtimePeerCount,
+}: {
+  attachmentStatus: string | null | undefined;
+  missingRequiredRuntimePeer: boolean;
+  runtimeLastSeenAt: string | null;
+  runtimePeerCount: number | null;
+}): NotebookShellRoomLinkProjection | null {
+  if (attachmentStatus === "idle") {
+    return null;
+  }
+
+  if (runtimePeerCount !== null) {
+    return {
+      status: "connected",
+      statusLabel: "Connected",
+      lastSeenAt: runtimeLastSeenAt,
+    };
+  }
+
+  if (missingRequiredRuntimePeer) {
+    return {
+      status: "lost",
+      statusLabel: "Lost",
+      lastSeenAt: runtimeLastSeenAt,
+    };
+  }
+
+  if (attachmentStatus === "connecting") {
+    return {
+      status: "reconnecting",
+      statusLabel: "Reconnecting",
+      lastSeenAt: runtimeLastSeenAt,
+    };
+  }
+
+  if (runtimeLastSeenAt) {
+    return {
+      status: "lost",
+      statusLabel: "Lost",
+      lastSeenAt: runtimeLastSeenAt,
+    };
+  }
+
+  return null;
 }
 
 export function workstationAttachmentIsConnected(
@@ -472,6 +595,7 @@ const NOTEBOOK_SHELL_RUNTIME_TARGET_CACHE_FIELDS = {
   id: (target) => target.id ?? null,
   kind: (target) => target.kind,
   status: (target) => target.status,
+  attachmentIdle: (target) => target.attachmentIdle ?? false,
   label: (target) => target.label,
   statusLabel: (target) => target.statusLabel ?? null,
   detail: (target) => target.detail ?? null,
@@ -481,8 +605,15 @@ const NOTEBOOK_SHELL_RUNTIME_TARGET_CACHE_FIELDS = {
   kernelStatusLabel: (target) => target.kernelStatusLabel ?? null,
   cpuCount: (target) => target.cpuCount ?? null,
   memoryBytes: (target) => target.memoryBytes ?? null,
+  accelerators: (target) => notebookShellWorkstationAcceleratorsCacheKey(target.accelerators),
   resourceLabel: (target) => target.resourceLabel ?? null,
   runtimePeerCount: (target) => target.runtimePeerCount ?? null,
+  roomLink: (target) =>
+    stableCacheKey([
+      target.roomLink?.status ?? null,
+      target.roomLink?.statusLabel ?? null,
+      target.roomLink?.lastSeenAt ?? null,
+    ]),
   workingDirectoryLabel: (target) => target.workingDirectoryLabel ?? null,
   runtimeSessionId: (target) => target.runtimeSessionId ?? null,
 } satisfies ProjectionCacheFieldReaders<NotebookShellRuntimeTargetProjection>;
@@ -764,8 +895,10 @@ function stableNotebookShellRuntimeTarget(
 
   const stableTarget = Object.freeze({
     id: target.id ?? null,
+    runtimeSessionId: target.runtimeSessionId ?? null,
     kind: target.kind,
     status: target.status,
+    ...(target.attachmentIdle ? { attachmentIdle: true } : {}),
     label: target.label,
     statusLabel: target.statusLabel ?? null,
     detail: target.detail ?? null,
@@ -775,12 +908,39 @@ function stableNotebookShellRuntimeTarget(
     kernelStatusLabel: target.kernelStatusLabel ?? null,
     cpuCount: target.cpuCount ?? null,
     memoryBytes: target.memoryBytes ?? null,
+    accelerators: stableWorkstationAccelerators(target.accelerators),
     resourceLabel: target.resourceLabel ?? null,
     runtimePeerCount: target.runtimePeerCount ?? null,
+    roomLink: target.roomLink
+      ? Object.freeze({
+          status: target.roomLink.status,
+          statusLabel: target.roomLink.statusLabel,
+          lastSeenAt: target.roomLink.lastSeenAt,
+        })
+      : null,
     workingDirectoryLabel: target.workingDirectoryLabel ?? null,
   });
   setBoundedCacheValue(SHELL_RUNTIME_TARGET_CACHE, cacheKey, stableTarget, SHELL_PART_CACHE_LIMIT);
   return stableTarget;
+}
+
+function stableWorkstationAccelerators(
+  accelerators: readonly WorkstationAcceleratorState[] | null | undefined,
+): readonly WorkstationAcceleratorState[] | null {
+  if (accelerators === null || accelerators === undefined) return null;
+  return Object.freeze(
+    accelerators.map((accelerator) =>
+      Object.freeze({
+        kind: accelerator.kind,
+        vendor: accelerator.vendor ?? null,
+        model: accelerator.model ?? null,
+        count: accelerator.count,
+        memory_bytes_per_device: accelerator.memory_bytes_per_device ?? null,
+        readiness: accelerator.readiness,
+        diagnostic: accelerator.diagnostic ?? null,
+      }),
+    ),
+  );
 }
 
 function notebookShellCapabilitiesCacheKey(capabilities: NotebookShellCapabilities): string {
@@ -846,16 +1006,33 @@ function notebookActorOperatorCacheKey(actor: NotebookActorProjection["operator"
   return projectionCacheKey(actor, NOTEBOOK_ACTOR_OPERATOR_CACHE_FIELDS);
 }
 
-function workstationAttachmentStatusProjection(status: string): {
+function workstationAttachmentStatusProjection(
+  status: string,
+  missingRequiredRuntimePeer = false,
+): {
   status: NotebookShellRuntimeTargetStatus;
   statusLabel: string;
   detail: string | null;
 } {
+  if (missingRequiredRuntimePeer) {
+    return {
+      status: "attention",
+      statusLabel: "Needs attention",
+      detail: "Room link lost: no compute session is currently attached to the room.",
+    };
+  }
+
   switch (status) {
     case "ready":
       return { status: "ready", statusLabel: "Ready", detail: null };
     case "busy":
       return { status: "attached", statusLabel: "Busy", detail: null };
+    case "idle":
+      return {
+        status: "attached",
+        statusLabel: "Idle",
+        detail: "Compute is attached and starts on the next run.",
+      };
     case "connecting":
       return {
         status: "connecting",

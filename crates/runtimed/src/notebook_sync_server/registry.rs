@@ -1,12 +1,11 @@
 //! Combined registry of resident notebook rooms.
 //!
-//! Owns both the `Uuid → Arc<NotebookRoom>` map and the path → UUID
+//! Owns both the `Uuid -> Arc<NotebookRoom>` map and the path -> UUID
 //! secondary index behind one tokio `Mutex`. Joined operations
 //! (insertion of a new room that also takes a path, removal of a room
 //! while purging its path entry, path lookup followed by UUID
 //! resolution) happen under a single lock acquisition, which closes
-//! the "rooms inserted but path index not yet, or vice versa" race
-//! that the two-lock layout exposed.
+//! partial-publication races between those maps.
 //!
 //! Lookups hand callers a `ReservationGuard` alongside the `Arc`. The
 //! room reaper's peer-less predicate is
@@ -44,10 +43,20 @@ impl InsertOutcome {
     }
 }
 
-#[derive(Default)]
 struct RegistryInner {
     rooms: HashMap<Uuid, Arc<NotebookRoom>>,
     paths: PathIndex,
+    accepting_publication: bool,
+}
+
+impl Default for RegistryInner {
+    fn default() -> Self {
+        Self {
+            rooms: HashMap::new(),
+            paths: PathIndex::default(),
+            accepting_publication: true,
+        }
+    }
 }
 
 /// Combined index of resident notebook rooms. Cheap to clone (single
@@ -66,6 +75,9 @@ impl RoomRegistry {
     /// `Arc` plus a fresh reservation guard.
     pub async fn lookup_path(&self, path: &Path) -> Option<(Arc<NotebookRoom>, ReservationGuard)> {
         let inner = self.inner.lock().await;
+        if !inner.accepting_publication {
+            return None;
+        }
         let uuid = inner.paths.lookup(path)?;
         let room = inner.rooms.get(&uuid)?.clone();
         let guard = ReservationGuard::new(room.clone());
@@ -76,6 +88,9 @@ impl RoomRegistry {
     /// fresh reservation guard.
     pub async fn lookup_uuid(&self, uuid: Uuid) -> Option<(Arc<NotebookRoom>, ReservationGuard)> {
         let inner = self.inner.lock().await;
+        if !inner.accepting_publication {
+            return None;
+        }
         let room = inner.rooms.get(&uuid)?.clone();
         let guard = ReservationGuard::new(room.clone());
         Some((room, guard))
@@ -103,6 +118,10 @@ impl RoomRegistry {
         path: Option<&Path>,
     ) -> Result<InsertOutcome, PathIndexError> {
         let mut inner = self.inner.lock().await;
+
+        if !inner.accepting_publication {
+            return Err(PathIndexError::RegistryFrozen);
+        }
 
         if let Some(existing) = inner.rooms.get(&uuid) {
             let existing = existing.clone();
@@ -133,6 +152,7 @@ impl RoomRegistry {
                         path: p.to_path_buf(),
                     });
                 }
+                Err(error) => return Err(error),
             }
         }
         inner.rooms.insert(uuid, room.clone());
@@ -145,6 +165,9 @@ impl RoomRegistry {
     /// after the room was first inserted.
     pub async fn bind_path(&self, uuid: Uuid, path: PathBuf) -> Result<(), PathIndexError> {
         let mut inner = self.inner.lock().await;
+        if !inner.accepting_publication {
+            return Err(PathIndexError::RegistryFrozen);
+        }
         inner.paths.insert(path, uuid)
     }
 
@@ -178,6 +201,9 @@ impl RoomRegistry {
         uuid: Uuid,
     ) -> Result<(), PathIndexError> {
         let mut inner = self.inner.lock().await;
+        if !inner.accepting_publication {
+            return Err(PathIndexError::RegistryFrozen);
+        }
         inner.paths.remove(old);
         inner.paths.insert(new, uuid)
     }
@@ -189,6 +215,23 @@ impl RoomRegistry {
         let mut inner = self.inner.lock().await;
         inner.paths = PathIndex::default();
         inner.rooms.drain().collect()
+    }
+
+    /// Stop new attaches/publications and return the exact resident set that
+    /// the clean-shutdown durability transaction must cover.
+    pub async fn freeze_publication_and_snapshot(&self) -> Vec<(Uuid, Arc<NotebookRoom>)> {
+        let mut inner = self.inner.lock().await;
+        inner.accepting_publication = false;
+        inner
+            .rooms
+            .iter()
+            .map(|(uuid, room)| (*uuid, room.clone()))
+            .collect()
+    }
+
+    /// Re-open publication after a clean shutdown was blocked by durability.
+    pub async fn thaw_publication(&self) {
+        self.inner.lock().await.accepting_publication = true;
     }
 
     /// Remove a room from both maps under one lock.

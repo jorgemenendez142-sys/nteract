@@ -1,16 +1,17 @@
-import initMarkdownWasm, {
-  project_markdown_json,
-} from "../../../apps/notebook/src/wasm/runtimed-wasm/runtimed_wasm.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vite-plus/test";
+import { initializeMarkdownProjectionWasm } from "../../test/runtimed-wasm";
 import {
   canRenderMarkdownProjectionInHost,
   findMarkdownProjectionAtSourcePosition,
+  markdownRunsForSourceRange,
   markdownProjectionMatchesSource,
   projectMarkdownPlan,
   resolveMarkdownProjection,
   setMarkdownProjectionProjector,
+  type MarkdownProjectionPlan,
+  type MarkdownProjectionRun,
 } from "../markdown-projection";
 
 function readMarkdownFixture(name: string): string {
@@ -20,18 +21,38 @@ function readMarkdownFixture(name: string): string {
   );
 }
 
+function testRun(
+  inlineId: string,
+  sourceSpanUtf16: readonly [number, number],
+): MarkdownProjectionRun {
+  return {
+    blockId: "block:0",
+    inlineId,
+    listItemIndex: null,
+    renderedText: inlineId,
+    renderedTextUtf16: sourceSpanUtf16,
+    semantic: "text",
+    sourceSpanByte: sourceSpanUtf16,
+    sourceSpanUtf16,
+  };
+}
+
+function testPlan(runs: readonly MarkdownProjectionRun[]): MarkdownProjectionPlan {
+  return {
+    version: 1,
+    engine: "test",
+    byteLength: 30,
+    utf16Length: 30,
+    measurement: { estimatedHeight: 24, confidence: "high", width: 720 },
+    anchors: [],
+    blocks: [],
+    runs,
+  };
+}
+
 describe("markdown projection", () => {
   beforeAll(async () => {
-    const wasmBytes = readFileSync(
-      join(process.cwd(), "apps/notebook/src/wasm/runtimed-wasm/runtimed_wasm_bg.wasm"),
-    );
-    await initMarkdownWasm({
-      module_or_path: wasmBytes.buffer.slice(
-        wasmBytes.byteOffset,
-        wasmBytes.byteOffset + wasmBytes.byteLength,
-      ),
-    });
-    setMarkdownProjectionProjector(project_markdown_json);
+    await initializeMarkdownProjectionWasm();
   });
 
   it("projects GFM task state from literal markdown source", () => {
@@ -282,6 +303,68 @@ describe("markdown projection", () => {
     ]);
   });
 
+  it("projects the Jupyter matrix and cases family as display math (#3834)", () => {
+    // #3834: MathJax's `processEnvironments` renders any bare environment, so
+    // the matrix family, `cases`, `gather`, `multline`, and `aligned` all
+    // route to the math renderer without an environment whitelist.
+    const environments = [
+      {
+        name: "cases",
+        source: [
+          "\\begin{cases}",
+          "x & \\text{if } x \\ge 0 \\\\",
+          "-x & \\text{otherwise}",
+          "\\end{cases}",
+        ].join("\n"),
+      },
+      {
+        name: "pmatrix",
+        source: [
+          "\\begin{pmatrix}",
+          "\\cos\\theta & -\\sin\\theta \\\\",
+          "\\sin\\theta & \\cos\\theta",
+          "\\end{pmatrix}",
+        ].join("\n"),
+      },
+      {
+        name: "vmatrix",
+        source: "\\begin{vmatrix}a & b \\\\ c & d\\end{vmatrix}",
+      },
+    ];
+
+    for (const { name, source } of environments) {
+      const plan = projectMarkdownPlan(source);
+      expect(plan?.blocks.map((block) => block.kind)).toEqual(["math"]);
+      expect(plan?.blocks[0]?.text).toBe(source);
+      expect(
+        plan?.runs
+          .filter((run) => run.semantic === "math-source")
+          .map((run) => run.renderedText),
+      ).toEqual([source]);
+      // Sanity: the block text actually carries the environment name.
+      expect(plan?.blocks[0]?.text).toContain(`\\begin{${name}}`);
+    }
+  });
+
+  it("projects display \\[...\\] delimiters (#3834)", () => {
+    // #3834: a standalone `\[...\]` block becomes a display math block with the
+    // inner LaTeX as its text. Inline `\(...\)` is intentionally out of scope
+    // — see issue #3834.
+    const display = projectMarkdownPlan("\\[\nx = y\nz = w\n\\]");
+    expect(display?.blocks.map((block) => block.kind)).toEqual(["math"]);
+    expect(display?.blocks[0]?.text).toBe("x = y\nz = w");
+    expect(
+      display?.runs
+        .filter((run) => run.semantic === "math-source")
+        .map((run) => run.renderedText),
+    ).toEqual(["x = y\nz = w"]);
+
+    // The #3377 constraint holds for the new delimiter: mixed prose stays a
+    // paragraph rather than being swallowed as display math.
+    const mixed = projectMarkdownPlan("before \\[ x \\] after on one line");
+    expect(mixed?.blocks.map((block) => block.kind)).toEqual(["paragraph"]);
+  });
+
   it("keeps projected raw HTML markup out of the host DOM without forcing iframe fallback", () => {
     const plan = projectMarkdownPlan("alpha <i>wow</i> omega");
 
@@ -332,5 +415,35 @@ describe("markdown projection", () => {
         }),
       }),
     );
+  });
+
+  it("returns projected runs whose source spans overlap a source range", () => {
+    const plan = testPlan([
+      testRun("before", [0, 4]),
+      testRun("left-edge", [4, 9]),
+      testRun("inside", [9, 14]),
+      testRun("right-edge", [14, 20]),
+      testRun("after", [20, 24]),
+    ]);
+
+    expect(markdownRunsForSourceRange(plan, 8, 15).map((run) => run.inlineId)).toEqual([
+      "left-edge",
+      "inside",
+      "right-edge",
+    ]);
+  });
+
+  it("returns no projected runs for null plans and empty source ranges", () => {
+    const plan = testPlan([testRun("run", [0, 5])]);
+
+    expect(markdownRunsForSourceRange(null, 0, 5)).toEqual([]);
+    expect(markdownRunsForSourceRange(plan, 3, 3)).toEqual([]);
+    expect(markdownRunsForSourceRange(plan, 5, 10)).toEqual([]);
+  });
+
+  it("normalizes reversed source ranges before matching projected runs", () => {
+    const plan = testPlan([testRun("run", [4, 9])]);
+
+    expect(markdownRunsForSourceRange(plan, 8, 2).map((run) => run.inlineId)).toEqual(["run"]);
   });
 });

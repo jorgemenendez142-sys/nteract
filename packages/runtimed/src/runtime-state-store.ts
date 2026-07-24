@@ -1,13 +1,17 @@
 /**
- * Reactive runtime-state store — framework-agnostic projections over the
+ * Reactive runtime-state store: framework-agnostic projections over the
  * daemon's RuntimeStateDoc snapshots.
  *
- * One BehaviorSubject of `RuntimeState` plus fluent, deduplicated
- * projections. Hosts (desktop bridge, cloud viewer session) push snapshots
- * with `set()`; consumers subscribe to a projection observable or read the
- * synchronous snapshot. React bindings stay in the apps — this module has
- * no framework dependency, so projections are testable headlessly and any
- * future host (CLI, MCP surface) consumes the same streams.
+ * `RuntimeStateStore` extends `ObservableStore<RuntimeState>` for the state
+ * spine (`state$`/`loaded$`/`select`/`snapshot`) and adds the runtime-specific
+ * projections and comparators. Hosts (desktop bridge, cloud viewer session)
+ * push snapshots with `set()`; consumers subscribe to a projection observable
+ * or read the synchronous snapshot. React bindings stay in the apps, so this
+ * module has no framework dependency and projections are testable headlessly.
+ * Consumers are the React shells (desktop and cloud viewer, through the shared
+ * observable binding) and runtimed-node; a non-React shell would bind these
+ * same streams directly. The MCP surface is Rust (`runt-mcp`) by design and
+ * does not consume this module.
  *
  * Why projections live here and not in `useMemo` chains: a `useMemo` on the
  * whole `RuntimeState` recomputes (and re-renders its component) on every
@@ -15,21 +19,23 @@
  * `distinctUntilChanged` projection emits only when its slice actually
  * changes, and that dedup is shared by every subscriber instead of
  * re-derived per component instance. See
- * `docs/adr/shared-store-projection-convergence.md`.
+ * `docs/memos/shared-store-projection-convergence.md`.
  */
 
 import {
-  BehaviorSubject,
   Observable,
+  type SchedulerLike,
+  combineLatest,
   defer,
   distinctUntilChanged,
   map,
   of,
+  scan,
   shareReplay,
-  startWith,
   switchMap,
   timer,
 } from "rxjs";
+import { ObservableStore } from "./observable-store";
 import {
   deriveEnvSyncState,
   deriveKernelInfo,
@@ -55,6 +61,13 @@ import {
  */
 export const BUSY_THROTTLE_MS = 60;
 
+const INITIAL_UNLOADED_STATUS_KEY = RUNTIME_STATUS.CONNECTING;
+
+interface RuntimeStatusGateState {
+  lastLoadedStatusKey: RuntimeStatusKey | null;
+  visibleStatusKey: RuntimeStatusKey;
+}
+
 /**
  * Hold back `RUNNING_BUSY` so quick execute→idle cycles never flash "busy".
  *
@@ -69,7 +82,7 @@ export const BUSY_THROTTLE_MS = 60;
  * production callers omit it.
  */
 export function throttleBusyStatus(
-  scheduler?: Parameters<typeof timer>[1],
+  scheduler?: SchedulerLike,
 ): (source: Observable<RuntimeStatusKey>) => Observable<RuntimeStatusKey> {
   return (source) =>
     source.pipe(
@@ -89,20 +102,10 @@ export function throttleBusyStatus(
  * viewer session both `set()` snapshots from `SyncEngine.runtimeState$`,
  * and both apps' React hooks subscribe to the same projections.
  */
-export class RuntimeStateStore {
-  private readonly _state$ = new BehaviorSubject<RuntimeState>(DEFAULT_RUNTIME_STATE);
-  private readonly _loaded$ = new BehaviorSubject<boolean>(false);
-
-  /** Every snapshot pushed by the host, starting with the default state. */
-  readonly state$: Observable<RuntimeState> = this._state$.asObservable();
-
-  /**
-   * Whether the daemon has pushed at least one snapshot since
-   * connect/reset. While false, the current snapshot is
-   * `DEFAULT_RUNTIME_STATE` and fields like `trust.status` must not be
-   * treated as authoritative (the default would fail-open trust gates).
-   */
-  readonly loaded$: Observable<boolean> = this._loaded$.pipe(distinctUntilChanged());
+export class RuntimeStateStore extends ObservableStore<RuntimeState> {
+  constructor() {
+    super(DEFAULT_RUNTIME_STATE);
+  }
 
   /** Kernel type + env source. Emits only when the projection changes. */
   readonly kernelInfo$: Observable<KernelInfo> = this.select(deriveKernelInfo, kernelInfoEquals);
@@ -131,22 +134,36 @@ export class RuntimeStateStore {
   );
 
   /**
+   * Runtime status for visible UI. During reconnect/reset the state snapshot
+   * returns to the default `NotStarted`, but `loaded$` is false, so that
+   * default is not authoritative. Hold the last loaded status key until a new
+   * RuntimeStateDoc snapshot opens the gate again. A first session with no
+   * prior loaded state uses a neutral connecting treatment until the first
+   * real snapshot arrives.
+   */
+  readonly visibleStatusKey$: Observable<RuntimeStatusKey> = combineLatest([
+    this.statusKey$,
+    this.loaded$,
+  ]).pipe(
+    scan(retainLastLoadedStatusKey, {
+      lastLoadedStatusKey: null,
+      visibleStatusKey: INITIAL_UNLOADED_STATUS_KEY,
+    } satisfies RuntimeStatusGateState),
+    map((state) => state.visibleStatusKey),
+    distinctUntilChanged(),
+    shareReplay({ bufferSize: 1, refCount: false }),
+  );
+
+  /**
    * Lifecycle status key with the busy flash suppressed
    * ([`throttleBusyStatus`], window [`BUSY_THROTTLE_MS`]). This is the
    * stream UI status indicators should render.
    *
    * Shared (`shareReplay`) so all subscribers ride one throttle pipeline
-   * and late subscribers get the current value synchronously. Seeded with
-   * the raw key at first subscribe — matching the old hook, a mount during
-   * a busy phase shows busy immediately; only *transitions* into busy are
-   * held back.
+   * and late subscribers get the current visible value synchronously.
    */
   readonly throttledStatusKey$: Observable<RuntimeStatusKey> = defer(() =>
-    this.statusKey$.pipe(
-      throttleBusyStatus(),
-      startWith(runtimeStatusKey(this.snapshot.kernel.lifecycle)),
-      distinctUntilChanged(),
-    ),
+    this.visibleStatusKey$.pipe(throttleBusyStatus(), distinctUntilChanged()),
   ).pipe(shareReplay({ bufferSize: 1, refCount: false }));
 
   /**
@@ -163,38 +180,14 @@ export class RuntimeStateStore {
       notebookShellWorkstationAttachmentCacheKey(b),
   );
 
-  /**
-   * Fluent projection builder: derive a slice of `RuntimeState` and emit it
-   * only when it changes. `equals` defaults to `Object.is`; pass a
-   * structural comparator when the projector allocates.
-   */
-  select<T>(
-    project: (state: RuntimeState) => T,
-    equals: (a: T, b: T) => boolean = Object.is,
-  ): Observable<T> {
-    return this._state$.pipe(map(project), distinctUntilChanged(equals));
-  }
-
-  /** Current snapshot (synchronous, non-reactive). */
-  get snapshot(): RuntimeState {
-    return this._state$.getValue();
-  }
-
-  /** Whether a real snapshot has been applied since connect/reset. */
-  get isLoaded(): boolean {
-    return this._loaded$.getValue();
-  }
-
   /** Push a new daemon snapshot. Host bridges call this. */
   set(state: RuntimeState): void {
-    this._loaded$.next(true);
-    this._state$.next(state);
+    this.setState(state);
   }
 
   /** Reset to the default state (disconnect, room change). */
   reset(): void {
-    this._loaded$.next(false);
-    this._state$.next(DEFAULT_RUNTIME_STATE);
+    this.resetState(DEFAULT_RUNTIME_STATE);
   }
 }
 
@@ -219,6 +212,28 @@ function envSyncStateEquals(a: EnvSyncState | null, b: EnvSyncState | null): boo
     arrayEquals(a.diff.added, b.diff.added) &&
     arrayEquals(a.diff.removed, b.diff.removed)
   );
+}
+
+function retainLastLoadedStatusKey(
+  previous: RuntimeStatusGateState,
+  [statusKey, loaded]: readonly [RuntimeStatusKey, boolean],
+): RuntimeStatusGateState {
+  if (loaded) {
+    return {
+      lastLoadedStatusKey: statusKey,
+      visibleStatusKey: statusKey,
+    };
+  }
+
+  const visibleStatusKey = previous.lastLoadedStatusKey ?? INITIAL_UNLOADED_STATUS_KEY;
+  if (previous.visibleStatusKey === visibleStatusKey && previous.lastLoadedStatusKey !== null) {
+    return previous;
+  }
+
+  return {
+    lastLoadedStatusKey: previous.lastLoadedStatusKey,
+    visibleStatusKey,
+  };
 }
 
 function arrayEquals(a: readonly string[], b: readonly string[]): boolean {

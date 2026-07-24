@@ -570,11 +570,13 @@ const jsonOutputFixture = {
 
 const modelCodeCell = getElementsNotebookPrimaryCodeCell();
 const [modelFeatureLine, modelFitLine, modelPredictLine] = modelCodeCell.source.split("\n");
+const tracebackLongEvalue =
+  "feature matrix contains null values after the package loader expanded the training window; check the imputed columns before retrying the model run.";
 const tracebackOutputFixture = {
   ename: "ValueError",
-  evalue: "feature matrix contains null values",
+  evalue: tracebackLongEvalue,
   language: modelCodeCell.language ?? "python",
-  text: `ValueError: feature matrix contains null values
+  text: `ValueError: ${tracebackLongEvalue}
   at cell ${modelCodeCell.id} line 3`,
   execution: {
     execution_id: modelCodeCell.executionId ?? "execution-model-run",
@@ -593,6 +595,41 @@ const tracebackOutputFixture = {
         { lineno: 1, source: modelFeatureLine ?? "" },
         { lineno: 2, source: modelFitLine ?? "" },
         { lineno: 3, source: modelPredictLine ?? "", highlight: true },
+      ],
+    },
+    {
+      filename:
+        "/Users/local/Library/Caches/runt/inline-envs/fixture/lib/python3.13/site-packages/sklearn/pipeline.py",
+      lineno: 781,
+      name: "predict",
+      library: true,
+      lines: [
+        { lineno: 779, source: "Xt = transform.transform(Xt)" },
+        {
+          lineno: 780,
+          source: "with _print_elapsed_time('Pipeline', self._log_message(len(self.steps) - 1)):",
+        },
+        {
+          lineno: 781,
+          source: "    return self.steps[-1][1].predict(Xt, **params)",
+          highlight: true,
+        },
+      ],
+    },
+    {
+      filename:
+        "/Users/local/Library/Caches/runt/inline-envs/fixture/lib/python3.13/site-packages/sklearn/ensemble/_forest.py",
+      lineno: 1084,
+      name: "predict",
+      library: true,
+      lines: [
+        { lineno: 1082, source: "check_is_fitted(self)" },
+        { lineno: 1083, source: "X = self._validate_X_predict(X)" },
+        {
+          lineno: 1084,
+          source: "return self.classes_.take(np.argmax(proba, axis=1), axis=0)",
+          highlight: true,
+        },
       ],
     },
     {
@@ -1091,9 +1128,9 @@ export const elementsNotebookScenarios: Record<
     eyebrow: "workstation fixture",
     summary:
       "A hosted owner has selected an nteract workstation backed by Outerbounds current Python.",
-    runtimeLabel: "Outerbounds workstation - current Python",
+    runtimeLabel: "Outerbounds workstation · current Python",
     runtimeStatus: "ready",
-    packageSummary: "current Python - package mutation disabled",
+    packageSummary: "current Python · package mutation disabled",
     packageSourceLabel: "provider current Python",
     syncLabel: "Workstation target ready",
     syncStatus: "synced",
@@ -1155,8 +1192,8 @@ export const elementsNotebookScenarios: Record<
     eyebrow: "operator fixture",
     summary:
       "A delegated Codex operator submits edits for Kyle through the cloud shell; the label records execution provenance, not model lineage.",
-    runtimeLabel: "Cloud notebook - delegated operator active",
-    packageSummary: "visible - 8 packages",
+    runtimeLabel: "Cloud notebook · delegated operator active",
+    packageSummary: "visible · 8 packages",
     capabilities: {
       canRead: true,
       canEditMarkdown: true,

@@ -1,4 +1,4 @@
-import { ListTree, Package, Server } from "lucide-react";
+import { ListTree, MessageSquare, Package, Server } from "lucide-react";
 import { useMemo, type DragEvent, type MouseEvent, type ReactNode } from "react";
 import {
   buildNotebookOutlineTree,
@@ -16,7 +16,7 @@ import {
 } from "@/components/rail";
 import { cn } from "@/lib/utils";
 
-export type NotebookRailPanelId = "outline" | "packages" | "workstations";
+export type NotebookRailPanelId = "outline" | "packages" | "comments" | "workstations";
 
 export const NOTEBOOK_RAIL_TAKEOVER_MEDIA_QUERY = RAIL_TAKEOVER_MEDIA_QUERY;
 export const NOTEBOOK_RAIL_TAKEOVER_STAGE_CLASS_NAME = RAIL_TAKEOVER_STAGE_CLASS_NAME;
@@ -35,6 +35,7 @@ export interface NotebookRailProps {
   selectedOutlineItemId?: string | null;
   selectedOutlineCellId?: string | null;
   packagesPanel: ReactNode;
+  commentsPanel?: ReactNode;
   workstationsPanel?: ReactNode;
   onActivePanelChange: (panelId: NotebookRailPanelId) => void;
   onCollapsedChange: (collapsed: boolean) => void;
@@ -58,6 +59,7 @@ export function NotebookRail({
   selectedOutlineItemId = null,
   selectedOutlineCellId = null,
   packagesPanel,
+  commentsPanel,
   workstationsPanel,
   onActivePanelChange,
   onCollapsedChange,
@@ -66,15 +68,23 @@ export function NotebookRail({
   getOutlineItemHref,
   className,
 }: NotebookRailProps) {
-  const railButtons = workstationsPanel
-    ? [...baseRailButtons, { id: "workstations" as const, label: "Workstations", icon: Server }]
-    : baseRailButtons;
+  const railButtons = [
+    ...baseRailButtons,
+    ...(commentsPanel
+      ? [{ id: "comments" as const, label: "Discussions", icon: MessageSquare }]
+      : []),
+    ...(workstationsPanel
+      ? [{ id: "workstations" as const, label: "Workstations", icon: Server }]
+      : []),
+  ];
   const title =
     activePanelId === "packages"
       ? "Packages"
-      : activePanelId === "workstations"
-        ? "Workstations"
-        : "Outline";
+      : activePanelId === "comments"
+        ? "Discussions"
+        : activePanelId === "workstations"
+          ? "Workstations"
+          : "Outline";
   return (
     <Rail
       activePanelId={activePanelId}
@@ -103,6 +113,8 @@ export function NotebookRail({
         />
       ) : activePanelId === "packages" ? (
         packagesPanel
+      ) : activePanelId === "comments" ? (
+        commentsPanel
       ) : (
         workstationsPanel
       )}
@@ -121,6 +133,8 @@ export interface NotebookOutlinePanelProps {
   activeItemId?: string | null;
   selectedItemId?: string | null;
   selectedCellId?: string | null;
+  ariaLabel?: string;
+  emptyMessage?: string;
   onSelectItem?: (item: NotebookOutlineItem) => void;
   onNavigateItem?: (item: NotebookOutlineItem, href: string) => boolean | void;
   getItemHref?: (item: NotebookOutlineItem) => string | null | undefined;
@@ -132,6 +146,8 @@ export function NotebookOutlinePanel({
   activeItemId = null,
   selectedItemId = null,
   selectedCellId = null,
+  ariaLabel = "Notebook outline",
+  emptyMessage = "Add Markdown headings to structure your notebook. They will appear here.",
   onSelectItem,
   onNavigateItem,
   getItemHref,
@@ -141,7 +157,7 @@ export function NotebookOutlinePanel({
   if (items.length === 0) {
     return (
       <div className="rounded-md border border-dashed px-3 py-4 text-sm text-muted-foreground">
-        Add Markdown headings to structure your notebook. They will appear here.
+        {emptyMessage}
       </div>
     );
   }
@@ -160,7 +176,7 @@ export function NotebookOutlinePanel({
 
   return (
     <nav
-      aria-label="Notebook outline"
+      aria-label={ariaLabel}
       className="-ml-1"
       data-testid="notebook-outline-panel"
       data-drag-policy="navigation-only"

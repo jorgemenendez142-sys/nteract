@@ -43,7 +43,7 @@ Project files win over inline deps because inline deps are promoted into the pro
 
 ### Deno kernels
 
-No environment pools. Get deno via `kernel_launch::tools::get_deno_path()` (PATH first, then bootstrap from conda-forge). Launch: `deno jupyter --kernel --conn <connection_file>`.
+No environment pools. Get deno via `kernel_launch::tools::get_deno_path()` (PATH first with acceptable version check, then download from Deno GitHub releases). Launch: `deno jupyter --kernel --conn <connection_file>`.
 
 ## Environment source labels
 
@@ -100,7 +100,7 @@ Pool warmer and capture step strip a base set so captured metadata records only 
 | Constant | Value |
 |----------|-------|
 | `kernel_env::uv::UV_BASE_PACKAGES` | `[ipykernel, ipywidgets, anywidget, nbformat, pyarrow>=14, uv]` |
-| `kernel_env::conda::CONDA_BASE_PACKAGES` | `[ipykernel, ipywidgets, anywidget, nbformat]` |
+| `kernel_env::conda::CONDA_BASE_PACKAGES` | `[ipykernel, ipywidgets, anywidget, pip, nbformat, pyarrow>=14]` |
 
 ## Prewarming and daemon pool
 
@@ -109,6 +109,9 @@ The daemon maintains pre-created environments (base set + user's `default_packag
 - Max age: 2 days (172800 seconds)
 - Warming loops replenish as environments are consumed
 - Pool entries named `runtimed-{uv,conda,pixi}-{uuid}`, content-free, claimable by any notebook
+
+Warm-env failures must surface in pool status with a real `error_kind` so
+onboarding does not spin forever waiting for `available > 0`.
 
 ### First-launch capture
 
@@ -123,7 +126,10 @@ After capture the notebook is indistinguishable from inline-deps. `capture_env_i
 
 ### Reopen cache-hit
 
-On subsequent launches: read metadata deps + `env_id`, recompute hash, check `unified_env_on_disk`. Cache hit → instant return. Cache miss → rebuild via inline-deps path.
+On subsequent launches: read metadata deps + `env_id`, recompute hash, and
+resolve the typed `CapturedEnvDiskState` with
+`captured_env_disk_state(...)`. `Usable` and `Partial` stay on the captured-env
+route; `Missing` falls back to the inline-deps rebuild path.
 
 ### Preserve captured envs on room eviction
 
@@ -141,15 +147,9 @@ Kernel is dead at this point so rename is safe.
 
 ## Project file discovery
 
-Unified detection in `crates/runtimed/src/`:
-
-| Module | Purpose |
-|--------|---------|
-| `project_file.rs` | `find_nearest_project_file()` — single walk-up, closest wins; handles pyproject.toml, pixi.toml, environment.yml |
-| `pixi_project.rs` | Pixi project launch helpers; offline-tolerant `pixi shell-hook` probe with frozen retry |
-| `uv_project.rs` | UV project launch helpers; `uv run` command construction for pyproject-backed kernels |
-
-Walk-up stops at `.git` boundaries and the user's home directory. Tiebreaker order within a directory: pyproject.toml > pixi.toml > environment.yml.
+Unified project-file detection walks up from the notebook, stops at `.git`
+boundaries and the user's home directory, and uses closest-wins semantics.
+Same-directory tiebreaker: pyproject.toml > pixi.toml > environment.yml.
 
 ## Notebook metadata schema
 
@@ -210,21 +210,3 @@ Ensures the app works standalone without requiring users to install tooling.
 3. Wire into daemon auto-launch helpers at the correct priority position.
 4. Add frontend projection in `packages/runtimed/src/derived-state.ts` and the appropriate hook.
 5. Add test fixture coverage in `crates/notebook/fixtures/audit-test/`.
-
-## Key files
-
-| File | Role |
-|------|------|
-| `crates/kernel-launch/src/lib.rs` | Public API for kernel launching |
-| `crates/kernel-launch/src/tools.rs` | Tool bootstrapping (deno, uv, ruff, pixi) |
-| `crates/kernel-env/src/uv.rs` | UV environment creation and caching |
-| `crates/kernel-env/src/conda.rs` | Conda environment creation and caching |
-| `crates/kernel-env/src/warmup.rs` | Pool warming logic |
-| `crates/runtimed/src/daemon.rs` | Pool management |
-| `crates/runtimed/src/notebook_sync_server/metadata.rs` | Auto-launch detection and resolution |
-| `crates/runtimed/src/runtime_agent.rs` | Per-notebook event loop |
-| `crates/runtimed/src/jupyter_kernel.rs` | Kernel process spawning |
-| `crates/runtimed/src/inline_env.rs` | Cached inline dep environments |
-| `crates/runtimed/src/project_file.rs` | Unified project file detection |
-| `crates/runt-trust/src/lib.rs` | Notebook trust extraction |
-| `crates/notebook-doc/src/metadata.rs` | Metadata schema and accessors |

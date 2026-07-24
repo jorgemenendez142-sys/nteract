@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vite-plus/test";
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vite-plus/test";
 import type { NotebookShellCapabilities } from "../capabilities";
 import {
   projectNotebookWorkstationSelection,
@@ -63,6 +63,41 @@ const localReadyCapabilities: NotebookShellCapabilities = {
     },
   },
 };
+
+const cloudPairingCommands = [
+  {
+    id: "debian-prep",
+    label: "Fresh Debian/Ubuntu only",
+    command: "sudo apt update && sudo apt install -y curl tmux",
+    optional: true,
+  },
+  {
+    id: "install",
+    label: "Install nteract headless",
+    command: "curl --proto '=https' --tlsv1.2 -sSf https://sh.nteract.io | bash -s -- --headless",
+  },
+  {
+    id: "path",
+    label: "Use installed CLI in this shell",
+    command: 'export PATH="$HOME/.local/bin:$PATH"',
+  },
+  {
+    id: "connect",
+    label: "Pair this workstation",
+    command: "runt workstation connect https://cloud.test --code ABCD-EFGH-JKMN",
+  },
+  {
+    id: "run",
+    label: "Linux user systemd service",
+    command: "runt workstation service install --start",
+  },
+  {
+    id: "foreground-run",
+    label: "macOS/non-systemd fallback",
+    command: "runt workstation run",
+    optional: true,
+  },
+];
 
 describe("NotebookWorkstationsPanel", () => {
   it("renders a local executable runtime as a workstation target", () => {
@@ -250,6 +285,111 @@ describe("NotebookWorkstationsPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Set default" }));
     expect(defaults).toEqual(["ws-offline"]);
     expect(attachButtons[1]).toBeDisabled();
+  });
+
+  it("renders accelerator capability, attention diagnostics, known-none, unknown, and offline facts", () => {
+    const gpu = {
+      kind: "gpu",
+      vendor: "NVIDIA",
+      model: "A100",
+      count: 1,
+      memory_bytes_per_device: 80 * 1024 ** 3,
+      readiness: "ready" as const,
+    };
+    const selection = projectNotebookWorkstationSelection({
+      canSelectWorkstation: true,
+      registeredWorkstations: [
+        {
+          id: "ws-gpu-ready",
+          displayName: "Usable GPU",
+          status: "online",
+          defaultEnvironmentLabel: "Current Python",
+          workingDirectory: "/workspace/ready",
+          accelerators: [gpu],
+        },
+        {
+          id: "ws-gpu-attention",
+          displayName: "GPU attention",
+          status: "online",
+          defaultEnvironmentLabel: "Current Python",
+          workingDirectory: "/workspace/attention",
+          accelerators: [
+            {
+              ...gpu,
+              readiness: "not_ready",
+              diagnostic: "NVIDIA driver is not visible to the workstation service.",
+            },
+          ],
+        },
+        {
+          id: "ws-known-none",
+          displayName: "CPU workstation",
+          status: "online",
+          defaultEnvironmentLabel: "Current Python",
+          workingDirectory: "/workspace/cpu",
+          accelerators: [],
+        },
+        {
+          id: "ws-legacy",
+          displayName: "Older agent",
+          status: "online",
+          defaultEnvironmentLabel: "Current Python",
+          workingDirectory: "/workspace/legacy",
+          accelerators: null,
+        },
+        {
+          id: "ws-offline-gpu",
+          displayName: "Offline GPU",
+          status: "offline",
+          accelerators: [gpu],
+        },
+      ],
+    });
+
+    render(
+      <NotebookWorkstationsPanel
+        capabilities={readOnlyNotebookShellCapabilities}
+        selection={selection}
+      />,
+    );
+
+    const readyRow = screen
+      .getByRole("heading", { name: "Usable GPU" })
+      .closest('[data-testid="registered-workstation"]');
+    const attentionRow = screen
+      .getByRole("heading", { name: "GPU attention" })
+      .closest('[data-testid="registered-workstation"]');
+    const knownNoneRow = screen
+      .getByRole("heading", { name: "CPU workstation" })
+      .closest('[data-testid="registered-workstation"]');
+    const legacyRow = screen
+      .getByRole("heading", { name: "Older agent" })
+      .closest('[data-testid="registered-workstation"]');
+    const offlineRow = screen
+      .getByRole("heading", { name: "Offline GPU" })
+      .closest('[data-testid="registered-workstation"]');
+
+    expect(readyRow).not.toBeNull();
+    expect(
+      within(readyRow!).getByText("1× NVIDIA A100 · 80 GiB").closest("[data-tone]"),
+    ).toHaveAttribute("data-tone", "positive");
+    expect(attentionRow).not.toBeNull();
+    expect(
+      within(attentionRow!).getByText("NVIDIA driver is not visible to the workstation service."),
+    ).toBeVisible();
+    expect(
+      within(attentionRow!).getByText("1× NVIDIA A100 · 80 GiB").closest("[data-tone]"),
+    ).toHaveAttribute("data-tone", "attention");
+    expect(knownNoneRow).not.toBeNull();
+    expect(within(knownNoneRow!).queryByText("GPU")).not.toBeInTheDocument();
+    expect(legacyRow).not.toBeNull();
+    expect(within(legacyRow!).queryByText("GPU")).not.toBeInTheDocument();
+    expect(screen.queryByText("No GPU")).not.toBeInTheDocument();
+    expect(offlineRow).not.toBeNull();
+    expect(
+      within(offlineRow!).getByText("1× NVIDIA A100 · 80 GiB").closest("[data-tone]"),
+    ).toHaveAttribute("data-tone", "neutral");
+    expect(within(offlineRow!).queryByText(/available/i)).not.toBeInTheDocument();
   });
 
   it("keeps the detached cloud target compact when registered workstations are listed", () => {
@@ -597,8 +737,8 @@ describe("NotebookWorkstationsPanel", () => {
         capabilities={localReadyCapabilities}
         pairing={{
           code: "ABCD-EFGH-JKMN",
-          connectCommand:
-            "runt workstation connect https://cloud.test --code ABCD-EFGH-JKMN && runt workstation run",
+          connectCommand: "runt workstation connect https://cloud.test --code ABCD-EFGH-JKMN",
+          commands: cloudPairingCommands,
           expiresAt: new Date(Date.now() + 9 * 60_000).toISOString(),
           status: "pending",
           workstationName: null,
@@ -607,16 +747,83 @@ describe("NotebookWorkstationsPanel", () => {
       />,
     );
 
-    expect(screen.getByTestId("workstation-pairing-command")).toHaveTextContent(
-      "runt workstation connect https://cloud.test --code ABCD-EFGH-JKMN && runt workstation run",
+    expect(screen.getByTestId("workstation-pairing-command-list")).toBeVisible();
+    expect(screen.getByText("Install nteract headless")).toBeVisible();
+    expect(screen.getByText("Use installed CLI in this shell")).toBeVisible();
+    expect(screen.getByText("Pair this workstation")).toBeVisible();
+    expect(screen.getByText("Linux user systemd service")).toBeVisible();
+    expect(screen.queryByText("Fresh Debian/Ubuntu only")).toBeNull();
+    expect(screen.queryByText("macOS/non-systemd fallback")).toBeNull();
+    const commands = screen.getAllByTestId("workstation-pairing-command");
+    expect(commands.map((command) => command.textContent)).toEqual([
+      "curl --proto '=https' --tlsv1.2 -sSf https://sh.nteract.io | bash -s -- --headless",
+      'export PATH="$HOME/.local/bin:$PATH"',
+      "runt workstation connect https://cloud.test --code ABCD-EFGH-JKMN",
+      "runt workstation service install --start",
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Show additional setup options" }));
+    const additionalCommands = within(
+      screen.getByTestId("workstation-pairing-additional-commands"),
     );
+    expect(additionalCommands.getByText("Fresh Debian/Ubuntu only")).toBeVisible();
+    expect(additionalCommands.getByText("macOS/non-systemd fallback")).toBeVisible();
+    expect(additionalCommands.getAllByText("(optional)")).toHaveLength(2);
+    expect(
+      additionalCommands
+        .getAllByTestId("workstation-pairing-command")
+        .map((command) => command.textContent),
+    ).toEqual(["sudo apt update && sudo apt install -y curl tmux", "runt workstation run"]);
     expect(screen.getByTestId("workstation-pairing-status")).toHaveTextContent(
       /Waiting for the machine to connect/,
     );
     expect(screen.getByTestId("workstation-pairing-status")).toHaveTextContent(
       /Code expires in 8:5\d/,
     );
-    expect(screen.getByRole("button", { name: "Copy connect command" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Copy Linux workstation setup commands" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Copy Pair this workstation command" }),
+    ).toBeVisible();
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    fireEvent.click(screen.getByRole("button", { name: "Copy Linux workstation setup commands" }));
+    expect(writeText).toHaveBeenCalledWith(
+      [
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.nteract.io | bash -s -- --headless",
+        'export PATH="$HOME/.local/bin:$PATH"',
+        "runt workstation connect https://cloud.test --code ABCD-EFGH-JKMN",
+        "runt workstation service install --start",
+      ].join("\n"),
+    );
+  });
+
+  it("keeps the single-command pairing fallback generic", () => {
+    render(
+      <NotebookWorkstationsPanel
+        capabilities={localReadyCapabilities}
+        pairing={{
+          code: "ABCD-EFGH-JKMN",
+          connectCommand: "runt workstation connect https://cloud.test --code ABCD-EFGH-JKMN",
+          expiresAt: new Date(Date.now() + 9 * 60_000).toISOString(),
+          status: "pending",
+          workstationName: null,
+          error: null,
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByText("Run this in a terminal on the machine you want to attach:"),
+    ).toBeVisible();
+    expect(
+      screen.getByText("Keep the command running until the workstation appears in the panel."),
+    ).toBeVisible();
+    expect(screen.queryByText(/service command/i)).toBeNull();
+    expect(
+      screen.getAllByTestId("workstation-pairing-command").map((node) => node.textContent),
+    ).toEqual(["runt workstation connect https://cloud.test --code ABCD-EFGH-JKMN"]);
   });
 
   it("announces redemption and registration, and Done dismisses", () => {
@@ -625,6 +832,7 @@ describe("NotebookWorkstationsPanel", () => {
       code: "ABCD-EFGH-JKMN",
       connectCommand: "runt workstation connect https://cloud.test --code ABCD-EFGH-JKMN",
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      commands: cloudPairingCommands,
       workstationName: null,
       error: null,
     };
@@ -647,6 +855,13 @@ describe("NotebookWorkstationsPanel", () => {
     expect(screen.getByTestId("workstation-pairing-status")).toHaveTextContent(
       "Hub devbox is connected.",
     );
+    expect(
+      screen.getByText("Finish setup with the keep-available command if you have not run it yet:"),
+    ).toBeVisible();
+    expect(screen.getByText("Linux user systemd service")).toBeVisible();
+    expect(screen.queryByText("macOS/non-systemd fallback")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show additional setup options" }));
+    expect(screen.getByText("macOS/non-systemd fallback")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Done" }));
     expect(dismissed).toHaveLength(1);
   });

@@ -758,7 +758,11 @@ impl Session {
             .await
             .map_err(to_napi_err)?;
         match response {
-            NotebookResponse::NotebookSaved { .. } => Ok(()),
+            NotebookResponse::NotebookSaved { .. }
+            | NotebookResponse::NotebookAlreadyCurrent { .. } => Ok(()),
+            NotebookResponse::NotebookSaveBlocked { reason, .. } => {
+                Err(Error::from_reason(format!("Save blocked: {reason:?}")))
+            }
             NotebookResponse::Error { error } => Err(Error::from_reason(error)),
             other => Err(Error::from_reason(format!(
                 "Unexpected response: {other:?}"
@@ -1251,15 +1255,16 @@ pub async fn create_notebook(options: Option<CreateNotebookOptions>) -> Result<S
     let package_manager = opts.package_manager.map(Into::into);
     let environment_mode = opts.environment_mode.map(Into::into);
 
-    let result = notebook_sync::connect::connect_create_with_environment_mode(
+    let result = notebook_sync::connect::connect_create(
         socket_path.clone(),
-        &runtime,
-        working_dir.clone(),
-        &actor_label,
-        /* ephemeral */ false,
-        package_manager,
-        dependencies,
-        environment_mode,
+        notebook_sync::connect::CreateNotebookSpec {
+            working_dir: working_dir.clone(),
+            actor_label: actor_label.clone(),
+            package_manager,
+            dependencies,
+            environment_mode,
+            ..notebook_sync::connect::CreateNotebookSpec::new(runtime.as_str())
+        },
     )
     .await
     .map_err(to_napi_err)?;
@@ -1478,23 +1483,7 @@ pub fn blob_store_path(socket_path: Option<String>) -> Option<String> {
 }
 
 async fn resolve_blob_paths(socket_path: &std::path::Path) -> (Option<String>, Option<PathBuf>) {
-    if let Some(parent) = socket_path.parent() {
-        let daemon_json = parent.join("daemon.json");
-        let base_url = if daemon_json.exists() {
-            tokio::fs::read_to_string(&daemon_json)
-                .await
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("blob_port").and_then(|p| p.as_u64()))
-                .map(|port| format!("http://localhost:{port}"))
-        } else {
-            None
-        };
-        let store_path = blob_store_path_for_socket_path(socket_path);
-        (base_url, store_path)
-    } else {
-        (None, None)
-    }
+    runtimed_client::daemon_paths::get_blob_paths_async(socket_path).await
 }
 
 fn blob_store_path_for_socket_path(socket_path: &Path) -> Option<PathBuf> {

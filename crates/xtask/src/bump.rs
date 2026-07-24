@@ -104,6 +104,11 @@ const TARGETS: &[Target] = &[
         matches: 1,
     },
     Target {
+        path: "crates/comments-doc/Cargo.toml",
+        format: Format::Toml,
+        matches: 1,
+    },
+    Target {
         path: "crates/notebook-doc/Cargo.toml",
         format: Format::Toml,
         matches: 1,
@@ -155,11 +160,6 @@ const TARGETS: &[Target] = &[
     },
     Target {
         path: "crates/mcp-client-branding/Cargo.toml",
-        format: Format::Toml,
-        matches: 1,
-    },
-    Target {
-        path: "crates/playdate-image/Cargo.toml",
         format: Format::Toml,
         matches: 1,
     },

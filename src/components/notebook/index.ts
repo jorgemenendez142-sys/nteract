@@ -14,6 +14,16 @@ export {
   notebookActorProjectionFromAccess,
   notebookActorProjectionFromRuntime,
 } from "./actor-projection";
+export { CrdtBridgeProvider, useCrdtBridge } from "./crdt-bridge";
+export {
+  createCrdtBridge,
+  remoteChangesFromTextAttributions,
+  type CrdtBridge,
+  type CrdtBridgeConfig,
+  type CrdtSourceHandle,
+  type RemoteChange,
+  type TextAttributionLike,
+} from "./crdt-editor-bridge";
 export {
   notebookShellRuntimeTargetSummary,
   projectNotebookLaunchEnvironment,
@@ -23,6 +33,7 @@ export {
   projectNotebookShellCapabilities,
   projectNotebookWorkstationLaunchReadiness,
   projectNotebookWorkstationSelection,
+  projectNotebookWorkstationSurface,
   readOnlyNotebookShellCapabilities,
   resolveNotebookShellRuntimeTarget,
   stabilizeNotebookShellCapabilities,
@@ -72,13 +83,34 @@ export {
   type NotebookWorkstationPanelTone,
   type NotebookWorkstationSelectionProjection,
   type NotebookWorkstationSelectionState,
+  type NotebookWorkstationSurfaceMutationProjection,
+  type NotebookWorkstationSurfaceProjection,
+  type NotebookWorkstationToolbarActionProjection,
   type ProjectNotebookCommandRuntimeActionsOptions,
   type ProjectNotebookCommandRuntimeStatusOptions,
   type ProjectNotebookLaunchEnvironmentOptions,
   type ProjectNotebookWorkstationLaunchReadinessOptions,
   type ProjectNotebookWorkstationSelectionOptions,
+  type ProjectNotebookWorkstationSurfaceOptions,
 } from "./capabilities";
+export {
+  applyExecutionViewChangeset,
+  applyOutputChangeset,
+  getOutputProjectionFailures,
+  resetRuntimeStoresProjection,
+  resolveOutputProjectionSync,
+  subscribeOutputProjectionFailures,
+  useOutputProjectionFailures,
+  type ApplyExecutionViewChangesetOptions,
+  type ApplyOutputChangesetOptions,
+} from "./state/runtime-store-projection";
 export { NotebookDocumentShell, type NotebookDocumentShellProps } from "./NotebookDocumentShell";
+export {
+  DocumentTitle,
+  type DocumentTitleClassNames,
+  type DocumentTitleDisplay,
+  type DocumentTitleProps,
+} from "./DocumentTitle";
 export { NotebookDocumentHeader, type NotebookDocumentHeaderProps } from "./NotebookDocumentHeader";
 export {
   NotebookNotice,
@@ -89,6 +121,11 @@ export {
   type NotebookNoticeStackProps,
   type NotebookNoticeTone,
 } from "./NotebookNotice";
+export {
+  NotebookAccessGate,
+  type NotebookAccessGateProps,
+  type NotebookAccessGateTone,
+} from "./NotebookAccessGate";
 export { RuntimeDecisionDialog, type RuntimeDecisionDialogProps } from "./RuntimeDecisionDialog";
 export { TrustDialog, type TrustDialogProps } from "./TrustDialog";
 export {
@@ -103,8 +140,11 @@ export {
 } from "./DaemonStatusBanner";
 export { DebugBanner, type DebugBannerProps } from "./DebugBanner";
 export {
+  ComputeDisconnectedNotice,
   KernelLaunchErrorBanner,
+  isRuntimePeerDisconnectedErrorDetails,
   shouldShowKernelLaunchErrorBanner,
+  type ComputeDisconnectedNoticeProps,
   type KernelLaunchErrorBannerProps,
 } from "./KernelLaunchErrorBanner";
 export {
@@ -140,7 +180,6 @@ export {
   type NotebookIdentityBadgeProps,
   type NotebookIdentityGroupProps,
 } from "./NotebookIdentity";
-export { NotebookPresenceStatus, type NotebookPresenceStatusProps } from "./NotebookPresenceStatus";
 export {
   NotebookConnectionIdentity,
   isRemoteNotebookContext,
@@ -172,7 +211,41 @@ export {
   type NotebookEditModeButtonProps,
   type NotebookEditModeState,
 } from "./NotebookEditModeButton";
+export {
+  NotebookContextMenu,
+  type NotebookContextMenuAction,
+  type NotebookContextMenuGroup,
+  type NotebookContextMenuProps,
+  type NotebookContextSurface,
+  type NotebookContextSurfaceKind,
+} from "./NotebookContextMenu";
 export { computeCanMutateCells } from "./mutation-gate";
+export {
+  createDocumentAnchorMap,
+  createNotebookDocumentAnchors,
+  documentAnchorForOutlineItem,
+  documentAnchorIdForOutlineItem,
+  documentMarkdownBlockAnchorId,
+  type CreateNotebookDocumentAnchorsOptions,
+  type DocumentAnchor,
+  type DocumentAnchorId,
+  type DocumentAnchorKind,
+} from "./document-anchors";
+export {
+  captureCellDeletionScrollAnchor,
+  isNotebookTailPinned,
+  restoreScrollAnchor,
+  scrollElementIntoView,
+  scrollToDocumentAnchor,
+  scrollToNotebookTail,
+  selectCellDeletionScrollAnchor,
+  selectTopVisibleCellAnchor,
+  shouldTailFollowCellCountChange,
+  type NotebookScrollAnchorCandidate,
+  type NotebookScrollAnchorSnapshot,
+  type SelectNotebookScrollAnchorOptions,
+  type TailPinnedInput,
+} from "./scroll-anchors";
 export {
   createNotebookInteractionModeProjection,
   type CreateNotebookInteractionModeProjectionOptions,
@@ -189,10 +262,20 @@ export {
 } from "./NotebookPackageSummaryPanel";
 export {
   NotebookWorkstationsPanel,
+  PairingCommandList,
+  PairingCountdown,
+  type NotebookWorkstationPairingCommandView,
+  type NotebookWorkstationPairingView,
   type NotebookWorkstationsPanelProps,
 } from "./NotebookWorkstationsPanel";
 export { NotebookDocumentRail, type NotebookDocumentRailProps } from "./NotebookDocumentRail";
 export { NotebookReadOnlyView, type NotebookReadOnlyViewProps } from "./NotebookReadOnlyView";
+export {
+  PresenceValueProvider,
+  usePresenceContext,
+  usePresenceContextRequired,
+  type PresenceContextValue,
+} from "./presence-context";
 export {
   navigateNotebookOutlineItem,
   type NavigateNotebookOutlineItemOptions,
@@ -244,18 +327,31 @@ export {
   type NotebookCellUIStateBridgeInput,
   type NotebookFindMatch,
 } from "./state/cell-ui-state";
+export { createNotebookCellId, type NotebookCellIdRandomSource } from "./state/notebook-cell-id";
+export {
+  createNotebookController,
+  type NotebookController,
+  type NotebookControllerCellType,
+  type NotebookControllerHandle,
+  type NotebookControllerMutationKind,
+  type NotebookControllerOptions,
+  type NotebookControllerSyncMode,
+} from "./state/notebook-controller";
 export {
   deleteExecutions,
   getCellExecutionId,
   getCellIdForExecutionId,
   getExecutionById,
   getNotebookQueueProjection,
+  isExecutionRuntimeOwned,
+  markExecutionsRuntimeOwned,
   resetNotebookExecutions,
   setCellExecutionPointer,
   setExecution,
   setNotebookQueueProjection,
   useCellExecutionId,
   useExecution,
+  useExecutionStructureVersion,
   useNotebookQueueProjection,
   type ExecutionSnapshot,
   type NotebookQueueProjectionSnapshot,
@@ -274,10 +370,29 @@ export {
   useOutputsVersion,
 } from "./state/output-store";
 export {
+  closeNotebookRail,
+  getNotebookRailUiState,
+  openNotebookRailPanel,
+  resetNotebookRailUiState,
+  setActiveNotebookRailPanel,
+  setNotebookRailCollapsed,
+  setSelectedNotebookOutlineItemId,
+  toggleNotebookRailPanel,
+  useNotebookRailUiState,
+  type NotebookRailUiState,
+} from "./state/rail-ui-state";
+export {
   createNotebookViewModelFromNotebookCells,
   notebookCellToViewCell,
   useNotebookViewModel,
 } from "./state/view-model-store";
+export {
+  createNotebookViewStoreProjector,
+  NotebookViewStoreProjector,
+  type NotebookViewStoreProjectionCell,
+  type NotebookViewStoreProjectorOptions,
+  type ResetNotebookViewStoreProjectionOptions,
+} from "./state/view-store-projection";
 export {
   createNotebookViewModel,
   notebookViewCellsToOutlineItems,
@@ -295,3 +410,16 @@ export {
   type NotebookViewLanguageResolver,
   type NotebookTracebackCellTarget,
 } from "./view-model";
+export {
+  type CommentAuthor,
+  NotebookCommentsPanel,
+  type NotebookCommentDraftTarget,
+  type NotebookCommentsPanelProps,
+} from "./NotebookCommentsPanel";
+export type {
+  CommentAnchor,
+  CommentMessageSnapshot,
+  CommentsProjection,
+  CommentThreadSnapshot,
+  CommentThreadStatus,
+} from "./comment-types";

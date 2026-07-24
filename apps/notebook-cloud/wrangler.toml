@@ -13,9 +13,33 @@ port = 8787
 name = "NOTEBOOK_ROOMS"
 class_name = "NotebookRoom"
 
+[[durable_objects.bindings]]
+name = "WORKSTATION_EVENTS"
+class_name = "WorkstationEvents"
+
+[[durable_objects.bindings]]
+name = "OWNER_COMPUTE_INDEX"
+class_name = "OwnerComputeIndex"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NotebookRoom"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["WorkstationEvents"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["MarkdownDocumentRoom"]
+
+[[migrations]]
+tag = "v4"
+deleted_classes = ["MarkdownDocumentRoom"]
+
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["OwnerComputeIndex"]
 
 [[d1_databases]]
 binding = "DB"
@@ -29,7 +53,10 @@ bucket_name = "nteract-notebook-cloud-prototype"
 [assets]
 directory = "./dist"
 binding = "ASSETS"
-run_worker_first = true
+
+[observability]
+enabled = true
+head_sampling_rate = 0.01
 
 [vars]
 DEPLOYMENT_ENV = "prototype"

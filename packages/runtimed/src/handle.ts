@@ -31,6 +31,14 @@ export interface SessionStatus {
   initial_load: InitialLoadPhase;
 }
 
+export type HostedBridgeStatus =
+  | "not_applicable"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "authentication_failed"
+  | "terminal_error";
+
 // ── FrameEvent ───────────────────────────────────────────────────────
 
 /** Attribution for text changes, produced by WASM sync. */
@@ -70,6 +78,62 @@ export interface CommsState {
   comms: Record<string, Record<string, unknown>>;
 }
 
+export type CommentAnchor =
+  | { kind: "notebook" }
+  | { kind: "cell"; cell_id: string; observed_cell_position?: string | null }
+  | {
+      kind: "cell_range";
+      start_cell_id: string;
+      end_cell_id: string;
+      start_position?: string | null;
+      end_position?: string | null;
+    }
+  | {
+      kind: "source_range";
+      cell_id: string;
+      start_line: number;
+      start_column: number;
+      end_line: number;
+      end_column: number;
+      prefix_quote?: string | null;
+      exact_quote?: string | null;
+      suffix_quote?: string | null;
+    }
+  | {
+      kind: "output";
+      cell_id: string;
+      execution_id?: string | null;
+      output_id?: string | null;
+    };
+
+export type CommentThreadStatus = "open" | "resolved";
+
+export interface CommentMessageSnapshot {
+  id: string;
+  position: string;
+  body: string;
+  created_at: string;
+  created_by_actor_label?: string | null;
+}
+
+export interface CommentThreadSnapshot {
+  id: string;
+  anchor: CommentAnchor;
+  position: string;
+  status: CommentThreadStatus;
+  messages: CommentMessageSnapshot[];
+  badge_cell_ids: string[];
+  created_at: string;
+  created_by_actor_label?: string | null;
+  resolved_at?: string | null;
+  resolved_by_actor_label?: string | null;
+}
+
+export interface CommentsProjection {
+  comments_doc_id: string;
+  threads: CommentThreadSnapshot[];
+}
+
 /**
  * Typed event returned by WASM `receive_frame()`.
  *
@@ -78,11 +142,14 @@ export interface CommsState {
  * - `broadcast` — Daemon broadcast (kernel status, output, etc.)
  * - `presence` — Remote peer presence update
  * - `session_control` — Connection-local readiness / bootstrap status
+ * - `hosted_bridge_status` — Daemon-to-hosted-room bridge health
  * - `runtime_state_sync_applied` — RuntimeStateDoc sync applied
  * - `comms_doc_sync_applied` — CommsDoc sync applied
+ * - `comments_doc_sync_applied` — CommentsDoc sync applied
  * - `sync_error` — Sync failed, doc rebuilt + sync state normalized, reply restarts negotiation
  * - `runtime_state_sync_error` — RuntimeState sync failed, same recovery pattern
  * - `comms_doc_sync_error` — CommsDoc sync failed, same recovery pattern
+ * - `comments_doc_sync_error` — CommentsDoc sync failed, same recovery pattern
  * - `unknown` — Unrecognized frame type
  */
 export interface FrameEvent {
@@ -96,8 +163,12 @@ export interface FrameEvent {
   payload?: unknown;
   /** RuntimeState from RuntimeStateSyncApplied. */
   state?: unknown;
+  /** CommentsProjection from CommentsDocSyncApplied. */
+  projection?: CommentsProjection;
   /** Connection-local session status from SESSION_CONTROL frames. */
   status?: SessionStatus;
+  /** Daemon-to-hosted-room bridge status from SESSION_CONTROL frames. */
+  hosted_bridge_status?: HostedBridgeStatus;
   /**
    * Per-output diff for RuntimeStateSyncApplied events. Each `changed` entry
    * is `[output_id, narrowed_manifest]` — manifests are already MIME-narrowed
@@ -176,6 +247,20 @@ export interface SyncableHandle {
   generate_comms_doc_sync_reply(): Uint8Array | null;
 
   /**
+   * Flush CommentsDoc sync message.
+   *
+   * Returns null when comments are not initialized or there is no pending
+   * sync message.
+   */
+  flush_comments_doc_sync?(): Uint8Array | null;
+
+  /** Roll back the last CommentsDoc flush. */
+  cancel_last_comments_doc_flush?(): void;
+
+  /** Generate a sync reply for the CommentsDoc. */
+  generate_comments_doc_sync_reply?(): Uint8Array | null;
+
+  /**
    * Flush PoolDoc sync message.
    *
    * Returns the message bytes, or null if there are no pending changes.
@@ -197,6 +282,13 @@ export interface SyncableHandle {
   /** Current Automerge notebook document heads as hex strings. */
   get_heads_hex(): string[];
 
+  /**
+   * Whether the local NotebookDoc has changes outside the causal history of
+   * the supplied heads. `undefined` means one or more heads have not reached
+   * this peer yet, so containment is not currently knowable.
+   */
+  has_changes_not_contained_by_heads?(heads_hex: string[]): boolean | undefined;
+
   /** Dependency metadata fingerprint covered by trust approval. */
   get_dependency_fingerprint(): string | undefined;
 
@@ -215,6 +307,43 @@ export interface SyncableHandle {
    * Optional for the same reason as `get_runtime_state`.
    */
   get_comms_state?(): unknown;
+
+  /** Read the current CommentsDoc projection from the handle. */
+  get_comments_projection?(): CommentsProjection | undefined;
+
+  /** Current CommentsDoc heads as hex strings. */
+  get_comments_doc_heads_hex?(): string[];
+
+  /** Initialize CommentsDoc sync from daemon-provided room identity. */
+  init_comments_sync_target?(commentsDocId: string): void;
+
+  /** Create a local comment thread. */
+  create_comment_thread?(
+    threadId: string,
+    messageId: string,
+    anchor: CommentAnchor,
+    body: string,
+    afterThreadId: string | null | undefined,
+    createdAt: string,
+  ): FrameEvent;
+
+  /** Demote a comment thread to a notebook-level comment. */
+  demote_comment_thread_to_notebook?(threadId: string): void;
+
+  /** Add a local reply to a comment thread. */
+  reply_comment_thread?(
+    threadId: string,
+    messageId: string,
+    body: string,
+    afterMessageId: string | null | undefined,
+    createdAt: string,
+  ): FrameEvent;
+
+  /** Resolve a comment thread. */
+  resolve_comment_thread?(threadId: string, resolvedAt: string): FrameEvent;
+
+  /** Reopen a resolved comment thread. */
+  reopen_comment_thread?(threadId: string): FrameEvent;
 
   /**
    * Resolve ContentRef values in a comm's state.
@@ -282,6 +411,11 @@ export interface SyncableHandle {
   delete_cell_with_changeset?(cell_id: string): LocalMutationResult<boolean>;
 
   clear_outputs_with_changeset?(cell_id: string): LocalMutationResult<boolean>;
+
+  set_cell_type_with_changeset?(
+    cell_id: string,
+    cell_type: "code" | "markdown" | "raw",
+  ): LocalMutationResult<boolean>;
 
   set_cell_source_hidden_with_changeset?(
     cell_id: string,

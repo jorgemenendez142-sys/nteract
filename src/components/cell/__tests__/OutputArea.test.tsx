@@ -1,6 +1,8 @@
 import { act, createEvent, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { injectPluginsForMimes, needsPlugin } from "@/components/isolated/iframe-libraries";
+import { BOKEHJS_EXEC_MIME_TYPE, BOKEHJS_LOAD_MIME_TYPE } from "@/components/outputs/bokeh-mime";
+import { PANEL_EXEC_MIME_TYPE, PANEL_LOAD_MIME_TYPE } from "@/components/outputs/panel-mime";
 import { setMarkdownProjectionProjector } from "@/lib/markdown-projection";
 import { OutputArea, type JupyterOutput } from "../OutputArea";
 
@@ -235,6 +237,111 @@ function makeMixedDocumentOutputs(): JupyterOutput[] {
             lines: [{ lineno: 4, source: "f(200)", highlight: true }],
           },
         ],
+      },
+    },
+  ];
+}
+
+function makeBokehDocumentOutputs(): JupyterOutput[] {
+  return [
+    {
+      output_id: "bokeh-loading-html",
+      output_type: "display_data",
+      data: { "text/html": '<span id="bokeh-loading">Loading BokehJS ...</span>' },
+      metadata: {},
+    },
+    {
+      output_id: "bokeh-load-js",
+      output_type: "display_data",
+      data: {
+        "application/javascript":
+          'document.getElementById("bokeh-loading").textContent = "BokehJS loaded";',
+        "application/vnd.bokehjs_load.v0+json": "",
+      },
+      metadata: {},
+    },
+    {
+      output_id: "bokeh-root-html",
+      output_type: "display_data",
+      data: { "text/html": '<div id="bokeh-root"></div>' },
+      metadata: {},
+    },
+    {
+      output_id: "bokeh-exec-js",
+      output_type: "display_data",
+      data: {
+        "application/javascript": 'document.getElementById("bokeh-root").textContent = "plot";',
+        "application/vnd.bokehjs_exec.v0+json": "",
+      },
+      metadata: {
+        "application/vnd.bokehjs_exec.v0+json": { id: "p1011" },
+      },
+    },
+  ];
+}
+
+function makeBokehShowOnlyOutputs(): JupyterOutput[] {
+  return [
+    {
+      output_id: "bokeh-show-root-html",
+      output_type: "display_data",
+      data: { "text/html": '<div id="bokeh-root"></div>' },
+      metadata: {},
+    },
+    {
+      output_id: "bokeh-show-exec-js",
+      output_type: "display_data",
+      data: {
+        "application/javascript": 'document.getElementById("bokeh-root").textContent = "plot";',
+        [BOKEHJS_EXEC_MIME_TYPE]: "",
+      },
+      metadata: {
+        [BOKEHJS_EXEC_MIME_TYPE]: { id: "p1011" },
+      },
+    },
+  ];
+}
+
+function makePanelDocumentOutputs(): JupyterOutput[] {
+  return [
+    {
+      output_id: "panel-loading-html",
+      output_type: "display_data",
+      data: { "text/html": '<span id="panel-loading">Loading Panel ...</span>' },
+      metadata: {},
+    },
+    {
+      output_id: "panel-load-js",
+      output_type: "display_data",
+      data: {
+        "application/javascript":
+          'document.getElementById("panel-loading").textContent = "Panel loaded";',
+        [PANEL_LOAD_MIME_TYPE]: "",
+      },
+      metadata: {},
+    },
+    {
+      output_id: "panel-empty-placeholder",
+      output_type: "display_data",
+      data: {},
+      metadata: {},
+    },
+    {
+      output_id: "panel-root-html",
+      output_type: "display_data",
+      data: { "text/html": '<div id="panel-root"></div>' },
+      metadata: {},
+    },
+    {
+      output_id: "panel-exec-html",
+      output_type: "display_data",
+      data: {
+        "text/html": '<div id="panel-widget"></div><script>window.__panelHtmlRan = true;</script>',
+        "application/javascript": 'document.getElementById("panel-root").textContent = "widget";',
+        [PANEL_EXEC_MIME_TYPE]: "",
+      },
+      metadata: {
+        [PANEL_EXEC_MIME_TYPE]: { id: "p1011" },
       },
     },
   ];
@@ -922,6 +1029,123 @@ describe("OutputArea iframe theme sync", () => {
         expect.objectContaining({
           mimeType: "application/vnd.apache.parquet",
           outputId: "parquet-output",
+        }),
+      ]);
+    });
+  });
+
+  it("keeps Bokeh's related HTML and JavaScript outputs in one iframe document", async () => {
+    render(<OutputArea outputs={makeBokehDocumentOutputs()} />);
+
+    const frames = screen.getAllByTestId("isolated-frame");
+    expect(frames).toHaveLength(1);
+    expect(frames[0].getAttribute("data-scroll-passthrough")).toBe("true");
+
+    await waitFor(() => {
+      expect(mockFrameHandle.renderBatch).toHaveBeenCalledWith([
+        expect.objectContaining({
+          mimeType: "text/html",
+          outputId: "bokeh-loading-html",
+          outputIndex: 0,
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            "application/javascript":
+              'document.getElementById("bokeh-loading").textContent = "BokehJS loaded";',
+            [BOKEHJS_LOAD_MIME_TYPE]: "",
+          }),
+          mimeType: BOKEHJS_LOAD_MIME_TYPE,
+          outputId: "bokeh-load-js",
+          outputIndex: 1,
+        }),
+        expect.objectContaining({
+          mimeType: "text/html",
+          outputId: "bokeh-root-html",
+          outputIndex: 2,
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            "application/javascript": 'document.getElementById("bokeh-root").textContent = "plot";',
+            [BOKEHJS_EXEC_MIME_TYPE]: "",
+          }),
+          metadata: { id: "p1011" },
+          mimeType: BOKEHJS_EXEC_MIME_TYPE,
+          outputId: "bokeh-exec-js",
+          outputIndex: 3,
+        }),
+      ]);
+    });
+  });
+
+  it("keeps show(p) root HTML with the Bokeh exec renderer payload", async () => {
+    render(<OutputArea outputs={makeBokehShowOnlyOutputs()} />);
+
+    const frames = screen.getAllByTestId("isolated-frame");
+    expect(frames).toHaveLength(1);
+    expect(frames[0].getAttribute("data-scroll-passthrough")).toBe("true");
+
+    await waitFor(() => {
+      expect(mockFrameHandle.renderBatch).toHaveBeenCalledWith([
+        expect.objectContaining({
+          mimeType: "text/html",
+          outputId: "bokeh-show-root-html",
+          outputIndex: 0,
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            "application/javascript": 'document.getElementById("bokeh-root").textContent = "plot";',
+            [BOKEHJS_EXEC_MIME_TYPE]: "",
+          }),
+          metadata: { id: "p1011" },
+          mimeType: BOKEHJS_EXEC_MIME_TYPE,
+          outputId: "bokeh-show-exec-js",
+          outputIndex: 1,
+        }),
+      ]);
+    });
+  });
+
+  it("keeps Panel's related HTML and JavaScript outputs in one iframe document", async () => {
+    render(<OutputArea outputs={makePanelDocumentOutputs()} />);
+
+    const frames = screen.getAllByTestId("isolated-frame");
+    expect(frames).toHaveLength(1);
+    expect(frames[0].getAttribute("data-scroll-passthrough")).toBe("true");
+
+    await waitFor(() => {
+      expect(mockFrameHandle.renderBatch).toHaveBeenCalledWith([
+        expect.objectContaining({
+          mimeType: "text/html",
+          outputId: "panel-loading-html",
+          outputIndex: 0,
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            "application/javascript":
+              'document.getElementById("panel-loading").textContent = "Panel loaded";',
+            [PANEL_LOAD_MIME_TYPE]: "",
+          }),
+          mimeType: PANEL_LOAD_MIME_TYPE,
+          outputId: "panel-load-js",
+          outputIndex: 1,
+        }),
+        expect.objectContaining({
+          mimeType: "text/html",
+          outputId: "panel-root-html",
+          outputIndex: 3,
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            "text/html":
+              '<div id="panel-widget"></div><script>window.__panelHtmlRan = true;</script>',
+            "application/javascript":
+              'document.getElementById("panel-root").textContent = "widget";',
+            [PANEL_EXEC_MIME_TYPE]: "",
+          }),
+          metadata: { id: "p1011" },
+          mimeType: PANEL_EXEC_MIME_TYPE,
+          outputId: "panel-exec-html",
+          outputIndex: 4,
         }),
       ]);
     });

@@ -14,7 +14,7 @@ import { DirectTransport } from "../src/direct-transport";
 import { FrameType } from "../src/transport";
 import { mergeChangesets } from "../src/cell-changeset";
 import { diffExecutions } from "../src/runtime-state";
-import type { SessionStatus, SyncableHandle, FrameEvent } from "../src/handle";
+import type { FrameEvent, HostedBridgeStatus, SessionStatus, SyncableHandle } from "../src/handle";
 import type { CellChangeset } from "../src/cell-changeset";
 import type { RuntimeState } from "../src/runtime-state";
 
@@ -103,6 +103,10 @@ function sessionStatusEvent(status: SessionStatus): FrameEvent {
   return { type: "session_control", status };
 }
 
+function hostedBridgeStatusEvent(status: HostedBridgeStatus): FrameEvent {
+  return { type: "hosted_bridge_status", hosted_bridge_status: status };
+}
+
 function pendingStatus(): SessionStatus {
   return {
     notebook_doc: "pending",
@@ -134,9 +138,11 @@ function makeRuntimeState(
     kernel: {
       lifecycle: { lifecycle: "Running", activity: "Idle" },
       error_reason: null,
+      error_details: null,
       name: "python3",
       language: "python",
       env_source: "",
+      last_seen: null,
     },
     queue: { executing: null, queued: [] },
     env: {
@@ -158,9 +164,15 @@ function makeRuntimeState(
       approved_pixi_pypi_dependencies: [],
       approved_pixi_channels: [],
     },
+    runtime_state_doc_id: null,
+    path: null,
+    project_context: { state: "Pending" },
+    workstation: null,
     last_saved: null,
+    file_checkpoint: { exported_heads: [], save_sequence: null, source_issue: null },
     executions: executions as RuntimeState["executions"],
     comms: {},
+    bokeh_sessions: {},
   };
 }
 
@@ -332,6 +344,28 @@ describe("SyncEngine", () => {
       engine.stop();
     });
 
+    it("emits deduplicated hosted bridge status snapshots", () => {
+      (handle.receive_frame as ReturnType<typeof vi.fn>)
+        .mockReturnValueOnce([hostedBridgeStatusEvent("connecting")])
+        .mockReturnValueOnce([hostedBridgeStatusEvent("connected")])
+        .mockReturnValueOnce([hostedBridgeStatusEvent("connected")])
+        .mockReturnValueOnce([hostedBridgeStatusEvent("reconnecting")]);
+
+      const engine = createEngine();
+      engine.start();
+
+      const statuses: HostedBridgeStatus[] = [];
+      engine.hostedBridgeStatus$.subscribe((status) => statuses.push(status));
+
+      transport.deliver(Array.from([FrameType.SESSION_CONTROL, 1]));
+      transport.deliver(Array.from([FrameType.SESSION_CONTROL, 2]));
+      transport.deliver(Array.from([FrameType.SESSION_CONTROL, 3]));
+      transport.deliver(Array.from([FrameType.SESSION_CONTROL, 4]));
+
+      expect(statuses).toEqual(["connecting", "connected", "reconnecting"]);
+      engine.stop();
+    });
+
     it("resetForBootstrap emits a pending status so stale ready doesn't leak across reconnect", () => {
       (handle.receive_frame as ReturnType<typeof vi.fn>).mockReturnValueOnce([
         sessionStatusEvent(interactiveStatus()),
@@ -344,7 +378,7 @@ describe("SyncEngine", () => {
       engine.sessionStatus$.subscribe((status) => statuses.push(status));
 
       // First session reaches ready.
-      transport.deliver(Array.from([0x07, 1]));
+      transport.deliver(Array.from([FrameType.SESSION_CONTROL, 1]));
       expect(statuses.at(-1)?.runtime_state).toBe("ready");
 
       // Rebootstrap (daemon:ready path). ReplaySubject(1) must now carry
@@ -357,6 +391,28 @@ describe("SyncEngine", () => {
       engine.sessionStatus$.subscribe((status) => (lateSeen = status));
       expect(lateSeen!.runtime_state).toBe("pending");
 
+      engine.stop();
+    });
+
+    it("resetForBootstrap does not replay stale connected bridge health", () => {
+      (handle.receive_frame as ReturnType<typeof vi.fn>).mockReturnValueOnce([
+        hostedBridgeStatusEvent("connected"),
+      ]);
+
+      const engine = createEngine();
+      engine.start();
+      const statuses: HostedBridgeStatus[] = [];
+      engine.hostedBridgeStatus$.subscribe((status) => statuses.push(status));
+
+      transport.deliver(Array.from([FrameType.SESSION_CONTROL, 1]));
+      expect(statuses.at(-1)).toBe("connected");
+
+      engine.resetForBootstrap();
+      expect(statuses.at(-1)).toBe("connecting");
+
+      let lateSeen: HostedBridgeStatus | null = null;
+      engine.hostedBridgeStatus$.subscribe((status) => (lateSeen = status));
+      expect(lateSeen).toBe("connecting");
       engine.stop();
     });
 
@@ -647,6 +703,49 @@ describe("SyncEngine", () => {
       engine.stop();
     });
 
+    it("emits initial file-load changesets immediately while load is streaming", () => {
+      const streamingInteractiveStatus: SessionStatus = {
+        notebook_doc: "interactive",
+        runtime_state: "syncing",
+        initial_load: { phase: "streaming" },
+      };
+      const changesets: CellChangeset[] = [
+        {
+          changed: [],
+          added: ["c1", "c2", "c3"],
+          removed: [],
+          order_changed: true,
+        },
+        {
+          changed: [],
+          added: ["c4", "c5", "c6"],
+          removed: [],
+          order_changed: true,
+        },
+      ];
+      let callCount = 0;
+      (handle.receive_frame as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return [sessionStatusEvent(streamingInteractiveStatus)];
+        }
+        return [syncAppliedEvent({ changed: true, changeset: changesets[callCount - 2] })];
+      });
+
+      const engine = createEngine();
+      engine.start();
+
+      const emissions: (CellChangeset | null)[] = [];
+      engine.cellChanges$.subscribe((cs) => emissions.push(cs));
+
+      transport.deliver(Array.from([0x07, 1]));
+      transport.deliver(Array.from([0x00, 2]));
+      transport.deliver(Array.from([0x00, 3]));
+
+      expect(emissions).toEqual(changesets);
+      engine.stop();
+    });
+
     it("emits separately for frames in different coalescing windows", () => {
       let callCount = 0;
       (handle.receive_frame as ReturnType<typeof vi.fn>).mockImplementation(() => {
@@ -739,9 +838,11 @@ describe("SyncEngine", () => {
         kernel: {
           lifecycle: { lifecycle: "Running", activity: "Busy" },
           error_reason: null,
+          error_details: null,
           name: "python3",
           language: "python",
           env_source: "",
+          last_seen: null,
         },
         queue: { executing: null, queued: [] },
         env: {
@@ -763,9 +864,15 @@ describe("SyncEngine", () => {
           approved_pixi_pypi_dependencies: [],
           approved_pixi_channels: [],
         },
+        runtime_state_doc_id: null,
+        path: null,
+        project_context: { state: "Pending" },
+        workstation: null,
         last_saved: null,
+        file_checkpoint: { exported_heads: [], save_sequence: null, source_issue: null },
         executions: {},
         comms: {},
+        bokeh_sessions: {},
       };
 
       (handle.receive_frame as ReturnType<typeof vi.fn>).mockReturnValue([
@@ -826,9 +933,11 @@ describe("SyncEngine", () => {
         kernel: {
           lifecycle: { lifecycle: "Running", activity: "Busy" },
           error_reason: null,
+          error_details: null,
           name: "python3",
           language: "python",
           env_source: "",
+          last_seen: null,
         },
         queue: { executing: null, queued: [] },
         env: {
@@ -850,7 +959,12 @@ describe("SyncEngine", () => {
           approved_pixi_pypi_dependencies: [],
           approved_pixi_channels: [],
         },
+        runtime_state_doc_id: null,
+        path: null,
+        project_context: { state: "Pending" },
+        workstation: null,
         last_saved: null,
+        file_checkpoint: { exported_heads: [], save_sequence: null, source_issue: null },
         executions: {
           "exec-1": {
             status: "running",
@@ -859,6 +973,7 @@ describe("SyncEngine", () => {
           },
         },
         comms: {},
+        bokeh_sessions: {},
       };
 
       (handle.receive_frame as ReturnType<typeof vi.fn>).mockReturnValue([
@@ -1484,6 +1599,64 @@ describe("SyncEngine", () => {
       engine.stop();
     });
 
+    it("fires delivery after a local flush is accepted", async () => {
+      (handle.flush_local_changes as ReturnType<typeof vi.fn>).mockReturnValue(
+        new Uint8Array([1, 2, 3]),
+      );
+
+      const engine = createEngine();
+      engine.start();
+
+      let deliveries = 0;
+      engine.notebookDocFlushDelivered$.subscribe(() => {
+        deliveries++;
+      });
+
+      engine.flush();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(deliveries).toBe(1);
+      engine.stop();
+    });
+
+    it("replays the latest accepted local flush to late subscribers", async () => {
+      (handle.flush_local_changes as ReturnType<typeof vi.fn>).mockReturnValue(
+        new Uint8Array([1, 2, 3]),
+      );
+
+      const engine = createEngine();
+      engine.start();
+
+      engine.flush();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      let deliveries = 0;
+      engine.notebookDocFlushDelivered$.subscribe(() => {
+        deliveries++;
+      });
+      expect(deliveries).toBe(1);
+      engine.stop();
+    });
+
+    it("does not fire delivery when a local flush fails", async () => {
+      (handle.flush_local_changes as ReturnType<typeof vi.fn>).mockReturnValue(
+        new Uint8Array([1, 2, 3]),
+      );
+      transport.simulateFailure = true;
+
+      const engine = createEngine();
+      engine.start();
+
+      let deliveries = 0;
+      engine.notebookDocFlushDelivered$.subscribe(() => {
+        deliveries++;
+      });
+
+      engine.flush();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(deliveries).toBe(0);
+      engine.stop();
+    });
+
     it("does not fire on a no-op flush", () => {
       (handle.flush_local_changes as ReturnType<typeof vi.fn>).mockReturnValue(null);
 
@@ -1539,6 +1712,24 @@ describe("SyncEngine", () => {
 
       await engine.flushAndWait();
       expect(emissions).toBe(1);
+      engine.stop();
+    });
+
+    it("fires delivery after flushAndWait succeeds", async () => {
+      (handle.flush_local_changes as ReturnType<typeof vi.fn>).mockReturnValue(
+        new Uint8Array([1, 2, 3]),
+      );
+
+      const engine = createEngine();
+      engine.start();
+
+      let deliveries = 0;
+      engine.notebookDocFlushDelivered$.subscribe(() => {
+        deliveries++;
+      });
+
+      await engine.flushAndWait();
+      expect(deliveries).toBe(1);
       engine.stop();
     });
 

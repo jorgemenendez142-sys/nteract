@@ -387,7 +387,7 @@ impl ConnectionScope {
 
     /// Whether this scope can send RuntimeStateDoc frames.
     pub const fn allows_runtime_state_write(self) -> bool {
-        matches!(self, Self::Editor | Self::RuntimePeer | Self::Owner)
+        matches!(self, Self::RuntimePeer)
     }
 
     /// Whether this scope can upload blobs (`PUT_BLOB` frames and the
@@ -405,7 +405,7 @@ impl ConnectionScope {
     /// Differs from [`Self::allows_blob_upload`] by allowing editors: local
     /// same-UID editor peers upload document-scoped attachments today, and the
     /// hosted editor exclusion exists only until reference-path validation
-    /// lands (HCA-3). Viewers are denied on both topologies (punchlist BS-12).
+    /// lands (HCA-3). Viewers are denied on both topologies.
     /// When HCA-3 stage 2 ships, hosted converges on this predicate and the
     /// two collapse into one.
     pub const fn allows_local_blob_upload(self) -> bool {
@@ -781,14 +781,14 @@ mod tests {
         assert!(!ConnectionScope::Viewer.allows_runtime_state_write());
 
         assert!(ConnectionScope::Editor.allows_notebook_write());
-        assert!(ConnectionScope::Editor.allows_runtime_state_write());
+        assert!(!ConnectionScope::Editor.allows_runtime_state_write());
         assert!(!ConnectionScope::Editor.allows_publish());
 
         assert!(!ConnectionScope::RuntimePeer.allows_notebook_write());
         assert!(ConnectionScope::RuntimePeer.allows_runtime_state_write());
 
         assert!(ConnectionScope::Owner.allows_notebook_write());
-        assert!(ConnectionScope::Owner.allows_runtime_state_write());
+        assert!(!ConnectionScope::Owner.allows_runtime_state_write());
         assert!(ConnectionScope::Owner.allows_publish());
         assert!(ConnectionScope::Owner.allows_acl_mutation());
     }

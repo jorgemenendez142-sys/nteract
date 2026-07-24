@@ -107,6 +107,19 @@ describe("hosted sharing storage", () => {
     assert.equal(env.DB.maxPrincipalProfileLookupBindCount, 50);
   });
 
+  it("threads login avatars through transport and canonical profile upserts", async () => {
+    const env = fakeEnv();
+    const avatarUrl = "https://profiles.example/alice.png";
+    const login = oidcLogin({ avatarUrl });
+    const accountPrincipal = await canonicalAccountPrincipalForProfile(login);
+    assert.ok(accountPrincipal);
+
+    await resolveNotebookInvitesForLogin(env, login, "2026-05-24T12:00:00.000Z");
+
+    assert.equal(env.DB.profiles.get(login.principal)?.avatar_url, avatarUrl);
+    assert.equal(env.DB.profiles.get(accountPrincipal)?.avatar_url, avatarUrl);
+  });
+
   it("backfills provider subject when a profile was first seen without one", async () => {
     const env = fakeEnv();
     await resolveNotebookInvitesForLogin(env, oidcLogin(), "2026-05-24T12:00:00.000Z");
@@ -1177,6 +1190,8 @@ class FakeD1Statement implements D1PreparedStatement {
         { name: "runtime_state_doc_id" },
         { name: "comms_heads_hash" },
         { name: "comms_snapshot_key" },
+        { name: "comments_heads_hash" },
+        { name: "comments_snapshot_key" },
       ] as T[]);
     }
     if (this.query.includes("FROM principal_profiles")) {

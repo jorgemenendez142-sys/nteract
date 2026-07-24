@@ -1,6 +1,6 @@
 # Cell Execution Pipeline and Control-Plane Separation
 
-**Status:** Draft, 2026-05-22.
+**Status:** Accepted, 2026-05-22.
 
 ## Context
 
@@ -82,12 +82,20 @@ blocking `.send().await` does not compile. The remaining ordering questions
 are about when lifecycle signals are drained, not about accidentally routing
 widget replay work onto the lifecycle path or blocking the reader on it.
 
-The runtime agent's `select!` loop has two arms for these channels (`crates/runtimed/src/runtime_agent.rs:592-639`):
+The runtime agent's `select!` loop includes separate arms for these channels
+(`crates/runtimed/src/runtime_agent.rs`):
 
+- The loop uses `tokio::select! { biased; ... }` so lifecycle/control work is
+  polled before the bounded output/work channel when both are ready.
 - The lifecycle arm runs whenever a lifecycle command is ready.
 - The work arm, before processing its own command, drains every pending lifecycle command via `drain_lifecycle_commands`. This prevents the work arm from being chosen while lifecycle signals sit unprocessed.
 
-The `biased;` modifier is intentionally **not** used here. The reordering is at the body level, not the arm level. Both arms compete fairly for selection, but once the work arm wins it still defers to lifecycle. A `biased;` strict-priority loop would starve work entirely whenever lifecycle signals arrive faster than they can be drained, which we don't want.
+This is the EP-10 resolution: the loop now makes polling order deterministic
+and still keeps the work-arm drain as a second guard. The strict-priority risk
+is bounded by the lifecycle channel's cardinality (`KernelIdle`,
+`ExecutionDone`, `CellError`, `KernelDied` are rare and finite per execution),
+while the failure mode of randomly choosing output work ahead of a ready
+lifecycle signal is user-visible interrupt or queue-release latency.
 
 ### Why separate channels
 
@@ -104,7 +112,7 @@ Two other bounded queues sit nearby and are easy to confuse with the work channe
 - `STREAM_COMMITTER_QUEUE_CAPACITY = 32` (`stream_committer.rs:25`) bounds the **periodic** `request_flush` mpsc inside the stream committer. Drops here are safe because the terminal buffer still holds the text and a later flush will publish it (see Decision 3).
 - `MAX_PENDING_DISPLAY_IDS = 128` (`display_update_committer.rs:24`) bounds the **distinct display IDs** queued for display-data coalescing. A 129th distinct ID is dropped; updates to already-queued IDs always coalesce (see Decision 5).
 
-The work channel, the periodic stream channel, and the display-update bound are three different lossy queues with three different sizes and reasons. EP-5 in the cleanup punchlist tracks the open question of whether these are right.
+The work channel, the periodic stream channel, and the display-update bound are three different lossy queues with three different sizes and reasons. EP-5 tracks the open question of whether these are right.
 
 ### Counterfactual: one bounded channel for everything
 
@@ -139,7 +147,7 @@ The final lifecycle signal for an execution travels through the stream committer
 ```rust
 stream_committer.flush_then_signal(
     final_stream_flushes,
-    QueueCommand::ExecutionDone { execution_id: eid },
+    LifecycleSignal::ExecutionDone { execution_id: eid },
 );
 ```
 
@@ -147,7 +155,12 @@ This is the ordering glue. The committer flushes the final stream content, then 
 
 `KernelIdle` rides the lifecycle channel directly (`jupyter_kernel.rs:1408-1430`). It releases the queue and is allowed to arrive before the final stream flush; what cannot arrive early is `ExecutionDone`.
 
-One subtle case: when `flush_then_signal` is called with an empty flushes list, it sends the lifecycle signal directly on `lifecycle_tx` instead of routing through the priority committer (`stream_committer.rs:106-118`, test `flush_then_signal_without_flushes_sends_lifecycle_immediately`). For a no-output execution, `ExecutionDone` and `KernelIdle` therefore race freely on the same lifecycle channel. Both writes are idempotent on the receiver side, but if a consumer treated `KernelIdle` as terminal it would see the queue released before `set_execution_done` ran. The cleanup punchlist tracks this as EP-11.
+The no-output case now follows the same rule. When `flush_then_signal` is
+called with an empty flush list, it still enqueues an empty priority commit
+rather than sending directly on `lifecycle_tx` (`stream_committer.rs:106-124`,
+test `flush_then_signal_without_flushes_rides_priority_queue`). That keeps a
+no-output execution's `ExecutionDone` behind any earlier priority stream commit,
+so terminal runtime state remains causally after the final stream manifest.
 
 ### Counterfactual: synchronous output writes from the IOPub reader
 
@@ -242,7 +255,7 @@ Execution spans two synced Automerge documents:
 The split is intentional and load-bearing:
 
 1. **Different write cadence.** NotebookDoc absorbs character-level edits from human typing. RuntimeStateDoc absorbs output streams from kernels. Combining them would tie editing latency to output churn.
-2. **Different writer authority.** NotebookDoc is frontend-authoritative for source and structure. RuntimeStateDoc is daemon-authoritative for outputs and lifecycle (except for the narrow `comms/*/state/*` widget-state surface). Keeping them separate lets the trust gate enforce different scopes at the frame layer (see `docs/adr/identity-and-trust.md`, Decision 5).
+2. **Different writer authority.** NotebookDoc is frontend-authoritative for source and structure. RuntimeStateDoc sync is read-only for ordinary notebook clients; validated runtime peers write runtime progress, lifecycle, outputs, and topology for accepted work, while coordinator/room-host paths own execution intent and room facts. Mutable widget values live in CommsDoc. Keeping these documents separate lets the trust gate enforce different scopes at the frame layer (see `docs/adr/identity-and-trust.md`, Decision 5).
 3. **Different persistence shapes.** NotebookDoc serializes to `.ipynb` on autosave. RuntimeStateDoc is ephemeral and recreated on daemon restart.
 4. **Different sync streams.** Both flow over the same connection but use distinct frame types and sync states. A flood on one document's stream does not stall the other.
 
@@ -286,40 +299,12 @@ If lifecycle and work shared one channel, the interrupt's `KernelIdle` would hav
 5. Stream committer flushes any final stream output, then sends `ExecutionDone`. Reader proceeds to next message.
 6. Consumers reading `executions[eid].outputs` after `status: "done"` see the latest rendered state of `"x"`, not the second-to-last.
 
-## Open Questions
-
-1. **Output sync-grace tuning under load.** `DEFAULT_OUTPUT_SYNC_GRACE = 500ms` is empirical. We don't have a measured upper bound on how long a final output manifest can take to sync under realistic load. Large DataFrames, batched plots, or congested socket scenarios may exceed it. There's no metric for "wait completed but outputs still empty" today.
-
-2. **Capacity constants are picked by judgment, not measurement.** The work channel (100), `STREAM_COMMITTER_QUEUE_CAPACITY = 32`, `MAX_PENDING_DISPLAY_IDS = 128`, and `DEFAULT_OUTPUT_SYNC_GRACE = 500ms` are all empirical defaults. None is enforced by a benchmark; none has telemetry on actual drop rates or grace-window misses. We may be silently dropping more periodic stream flushes (or capacity drops on the work channel) than we expect. Punchlist EP-5.
-
-3. **What if `set_execution_done` is never written?** A panic or task drop between the final output write and `set_execution_done` leaves the execution in `running` forever. Consumers time out. There is no per-execution timeout or watchdog at the daemon side. `KernelDied` clears the queue but only fires when IOPub disconnects or a committer task panics (see `crates/runtimed/src/stream_committer.rs:227`, `display_update_committer.rs:259`). The framing of a *fix* for this — divergence detection rather than a wall-clock watchdog, since multi-hour training jobs are legitimate — is explored in `docs/memos/execution-liveness.md`.
-
-4. ~~**The `is_lifecycle()` discipline is a runtime check.**~~ **Resolved by
-   EP-2.** `LifecycleSignal` and `WorkCommand` are now separate types, so the
-   lifecycle channel no longer accepts widget replay work. Remaining lifecycle
-   concerns are tracked as EP-10 and EP-11.
-
-5. **`required_heads` is `NotebookDoc`-only.** A request that semantically depends on a recent RuntimeStateDoc write (rare in v1, but conceivable for future request types) has no causal gate.
-
-6. **Run-all timeouts are shared, not per-cell.** Run-all (`crates/runt-mcp/src/execution.rs:249-285`) polls each queued execution against a single shared deadline rather than calling a dedicated `await_execution_terminal` helper per cell. A long-running first cell can starve the budget for later cells. There is no fairness mechanism. The cleanup punchlist tracks this as EP-9.
-
-7. **No formal model of "the IOPub reader cannot block."** It's a discipline observed by reading `jupyter_kernel.rs`. Adding a new `await` on a bounded queue inside the IOPub message-handler match arms would silently re-introduce the backpressure failure mode the priority committers exist to prevent.
-
-8. **`update_display_data` buffers are not coalesced.** The pending map keeps the *latest* `data`, `metadata`, and `buffers` per `display_id`. If two updates each carry a different binary buffer set, the earlier buffers are dropped along with the earlier data. This is correct under the semantics ("only the latest update matters"), but the contract is implicit.
-
-9. **`SendCommUpdate` drop telemetry is asymmetric.** The `Full` arm of `try_send_comm_update` logs at `debug`; the `Closed` arm logs at `warn` (`jupyter_kernel.rs:208-220`). Production daemons running with default log levels see channel-closed drops but not capacity drops. EP-4 and EP-13 in the punchlist.
-
-11. **`KernelDied` is also produced by committer-supervisor panic.** Both `start_stream_committer` and `start_display_update_committer` use `spawn_supervised`, which on panic enqueues `QueueCommand::KernelDied` on the lifecycle channel to release the queue (`display_update_committer.rs:249-262`). The ADR's coverage of `KernelDied` reads as IOPub-disconnect-only; the committer-crash path is also load-bearing. Punchlist EP-12.
-
-12. **Stale-stream-flush-after-clear is silently dropped.** If the stream buffer is cleared (terminal state reset) between a `request_flush` and its commit, the committer drops the stale write (`stale_stream_flush_after_clear_is_ignored` test at `stream_committer.rs:438`). This is relied on by the ordering-boundary clears in `jupyter_kernel.rs:1716,1923` but is not stated as an invariant.
-
-10. **No invariant test that `ExecutionDone` follows the final stream manifest in RuntimeStateDoc order.** The stream committer's `flush_then_signal_commits_stream_before_lifecycle_signal` test checks that the lifecycle signal is sent after the manifest write returns; it does not assert ordering at the `RuntimeStateDoc.changes` level. A future refactor could break the causal order without that test failing.
 
 ## References
 
 - `crates/runtimed/src/stream_committer.rs` - bounded periodic + unbounded priority paths, `flush_then_signal`, `flush_for_ordering`.
 - `crates/runtimed/src/display_update_committer.rs` - coalesced display updates, priority flush ack.
-- `crates/runtimed/src/output_prep.rs:444-501` - `QueueCommand`, `is_lifecycle`, channel construction.
+- `crates/runtimed/src/output_prep.rs:465-550` - `LifecycleSignal`, `WorkCommand`, and channel construction.
 - `crates/runtimed/src/runtime_agent.rs:592-639, 1414-1430` - lifecycle/work select arms and `drain_lifecycle_commands`.
 - `crates/runtimed/src/jupyter_kernel.rs:1394-1441, 1805-1818` - IOPub `status: idle` and `UpdateDisplayData` handling.
 - `crates/runtimed/src/kernel_state.rs:147-181` - `execution_done` and `set_execution_done`.
@@ -328,14 +313,3 @@ If lifecycle and work shared one channel, the interrupt's `KernelIdle` would hav
 - `crates/runt-mcp/src/execution.rs` - MCP consumer pattern.
 - `.agents/skills/execution-pipeline/SKILL.md` - the agent-facing summary that this ADR expands.
 - `AGENTS.md` / `CLAUDE.md` "Runtime control-plane signals are not output transport" - the load-bearing paragraph this ADR is the long-form of.
-
-## Tracked follow-ups (from the retired cleanup punchlist)
-
-These items were migrated from `docs/adr/cleanup-punchlist.md` when it was
-retired (2026-06-10). Severity: **Targeted PR** = one-or-two-file fix ready
-to implement; **Design** = needs a decision in this ADR before code moves.
-
-- **EP-3** (Design; memo `docs/memos/execution-liveness.md`): **Reframed.** Daemon view of execution state can diverge from kernel reality. A wall-clock watchdog is the wrong fix - multi-hour training jobs are legitimate Jupyter usage and nteract's resume-by-reconnect is a feature. The real signal is divergence between `RuntimeStateDoc.status` and live IOPub / heartbeat / committer state. See design memo `docs/memos/execution-liveness.md`. Code is a follow-up after the memo is reviewed.
-- **EP-5** (Design; telemetry + tuning pass): Capacity constants (`STREAM_COMMITTER_QUEUE_CAPACITY = 32`, `MAX_PENDING_DISPLAY_IDS = 128`, `DEFAULT_OUTPUT_SYNC_GRACE = 500ms`) picked by judgment. No benchmark, no drop-rate metric, no measured upper bound under load.
-- **EP-6** (Design; request handling): `required_heads` is `NotebookDoc`-only. No causal gate exists for requests that depend on recent `RuntimeStateDoc` writes.
-- **EP-9** (Design; run-all path): Run-all timeouts are shared across the batch; a long first cell starves the budget for later cells. No fairness mechanism.

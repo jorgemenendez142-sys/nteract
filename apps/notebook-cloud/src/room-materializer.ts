@@ -10,8 +10,9 @@ const ROOM_HOST_ACTOR_PRINCIPAL = "system:notebook-cloud-room";
 const CHECKPOINT_NOTEBOOK_KEY = "room-host:notebook-doc";
 const CHECKPOINT_RUNTIME_STATE_KEY = "room-host:runtime-state-doc";
 const CHECKPOINT_COMMS_DOC_KEY = "room-host:comms-doc";
+const CHECKPOINT_COMMENTS_DOC_KEY = "room-host:comments-doc";
 const CHECKPOINT_META_KEY = "room-host:checkpoint";
-const CHECKPOINT_VERSION = 5;
+const CHECKPOINT_VERSION = 6;
 
 interface RoomHostOutboundFrame {
   peer_id: string;
@@ -21,9 +22,15 @@ interface RoomHostOutboundFrame {
 
 export interface RoomHostFrameResult {
   changed: boolean;
+  ignored_stale?: boolean;
   notebook_changed: boolean;
   runtime_state_changed: boolean;
   outbound: RoomHostOutboundFrame[];
+}
+
+export interface RuntimeExecutionActivity {
+  executing: boolean;
+  queueDepth: number;
 }
 
 interface RoomCheckpointMetadata {
@@ -31,11 +38,13 @@ interface RoomCheckpointMetadata {
   notebook_heads: string[];
   runtime_state_heads: string[];
   comms_doc_heads: string[];
+  comments_doc_heads: string[];
   saved_at: string;
   published_revision_id: string | null;
   published_notebook_heads: string[] | null;
   published_runtime_state_heads: string[] | null;
   published_comms_doc_heads: string[] | null;
+  published_comments_doc_heads: string[] | null;
 }
 
 interface RoomPeer {
@@ -50,6 +59,7 @@ export class RoomMaterializer {
   private loadedPublishedNotebookHeads: string[] | null = null;
   private loadedPublishedRuntimeStateHeads: string[] | null = null;
   private loadedPublishedCommsDocHeads: string[] | null = null;
+  private loadedPublishedCommentsDocHeads: string[] | null = null;
 
   constructor(
     private readonly notebookId: string,
@@ -83,9 +93,25 @@ export class RoomMaterializer {
     return this.withHost((host) => normalizeResult(host.reconcile_runtime_peer_gone(reason)));
   }
 
+  async getRuntimeQueueDepth(): Promise<number> {
+    return this.withHost((host) => Math.max(0, Math.trunc(host.get_runtime_queue_depth())));
+  }
+
+  async getRuntimeExecutionActivity(): Promise<RuntimeExecutionActivity> {
+    return this.withHost((host) =>
+      normalizeRuntimeExecutionActivityJson(host.get_runtime_execution_activity_json()),
+    );
+  }
+
   async getWorkstationAttachment(): Promise<WorkstationAttachmentState | null> {
     return this.withHost((host) =>
       normalizeWorkstationAttachmentJson(host.get_workstation_attachment_json()),
+    );
+  }
+
+  async getCommentAuthorActorLabels(): Promise<string[]> {
+    return this.withHost((host) =>
+      commentAuthorActorLabelsFromProjection(host.get_comments_projection()),
     );
   }
 
@@ -100,7 +126,37 @@ export class RoomMaterializer {
     );
   }
 
+  async reconcileRuntimeIdleTimeout(
+    reason: string,
+    updatedAt: string,
+  ): Promise<RoomHostFrameResult> {
+    return this.withHost((host) =>
+      normalizeResult(host.reconcile_runtime_idle_timeout(reason, updatedAt)),
+    );
+  }
+
   async receiveFrame(peer: RoomPeer, frame: TypedFrame): Promise<RoomHostFrameResult> {
+    try {
+      return await this.receiveFrameWithCurrentHost(peer, frame);
+    } catch (error) {
+      if (!shouldRecoverReceiveFrame(frame, error)) {
+        throw error;
+      }
+      const recovered = await this.recoverHostFromLatestPublishedSnapshot(
+        `receive_${frameTypeNameForRecovery(frame.type)}`,
+        error,
+      );
+      if (!recovered) {
+        throw error;
+      }
+      return this.syncPeerWithCurrentHost(peer);
+    }
+  }
+
+  private async receiveFrameWithCurrentHost(
+    peer: RoomPeer,
+    frame: TypedFrame,
+  ): Promise<RoomHostFrameResult> {
     const canWriteAllNotebookChanges = peer.identity.scope === "owner";
     const encoded = encodeTypedFrame(frame.type, frame.payload);
     return this.withHost((host) =>
@@ -120,26 +176,30 @@ export class RoomMaterializer {
   async checkpoint(): Promise<void> {
     const startedAt = Date.now();
     await this.withHost(async (host) => {
-      const [notebookBytes, runtimeStateBytes, commsDocBytes] = [
+      const [notebookBytes, runtimeStateBytes, commsDocBytes, commentsDocBytes] = [
         toStoredArrayBuffer(host.save_notebook()),
         toStoredArrayBuffer(host.save_runtime_state_doc()),
         toStoredArrayBuffer(host.save_comms_doc()),
+        toStoredArrayBuffer(host.save_comments_doc()),
       ];
       const metadata: RoomCheckpointMetadata = {
         version: CHECKPOINT_VERSION,
         notebook_heads: Array.from(host.get_heads_hex()),
         runtime_state_heads: Array.from(host.get_runtime_state_heads_hex()),
         comms_doc_heads: Array.from(host.get_comms_doc_heads_hex()),
+        comments_doc_heads: Array.from(host.get_comments_doc_heads_hex()),
         saved_at: new Date().toISOString(),
         published_revision_id: this.loadedPublishedRevisionId,
         published_notebook_heads: this.loadedPublishedNotebookHeads,
         published_runtime_state_heads: this.loadedPublishedRuntimeStateHeads,
         published_comms_doc_heads: this.loadedPublishedCommsDocHeads,
+        published_comments_doc_heads: this.loadedPublishedCommentsDocHeads,
       };
       await Promise.all([
         this.state.storage.put(CHECKPOINT_NOTEBOOK_KEY, notebookBytes),
         this.state.storage.put(CHECKPOINT_RUNTIME_STATE_KEY, runtimeStateBytes),
         this.state.storage.put(CHECKPOINT_COMMS_DOC_KEY, commsDocBytes),
+        this.state.storage.put(CHECKPOINT_COMMENTS_DOC_KEY, commentsDocBytes),
         this.state.storage.put(CHECKPOINT_META_KEY, metadata),
       ]);
       cloudLog("debug", "room.materializer.checkpoint.saved", {
@@ -148,9 +208,11 @@ export class RoomMaterializer {
         notebook_byte_length: notebookBytes.byteLength,
         runtime_state_byte_length: runtimeStateBytes.byteLength,
         comms_doc_byte_length: commsDocBytes.byteLength,
+        comments_doc_byte_length: commentsDocBytes.byteLength,
         notebook_head_count: metadata.notebook_heads.length,
         runtime_state_head_count: metadata.runtime_state_heads.length,
         comms_doc_head_count: metadata.comms_doc_heads.length,
+        comments_doc_head_count: metadata.comments_doc_heads.length,
         counter: "materializer_checkpoints_saved",
         counter_delta: 1,
       });
@@ -199,6 +261,7 @@ export class RoomMaterializer {
               checkpoint.notebookBytes,
               checkpoint.runtimeStateBytes,
               checkpoint.commsDocBytes,
+              checkpoint.commentsDocBytes,
             );
             cloudLog("info", "room.materializer.loaded", {
               notebook_id: this.notebookId,
@@ -219,6 +282,7 @@ export class RoomMaterializer {
             latestPublished.notebookBytes,
             latestPublished.runtimeStateBytes,
             latestPublished.commsDocBytes,
+            latestPublished.commentsDocBytes,
           );
           this.markLoadedPublishedSnapshot(latestPublished.revisionId, host);
           cloudLog("info", "room.materializer.loaded", {
@@ -241,6 +305,7 @@ export class RoomMaterializer {
           checkpoint.notebookBytes,
           checkpoint.runtimeStateBytes,
           checkpoint.commsDocBytes,
+          checkpoint.commentsDocBytes,
         );
         cloudLog("info", "room.materializer.loaded", {
           notebook_id: this.notebookId,
@@ -261,6 +326,7 @@ export class RoomMaterializer {
           published.notebookBytes,
           published.runtimeStateBytes,
           published.commsDocBytes,
+          published.commentsDocBytes,
         );
         this.markLoadedPublishedSnapshot(published.revisionId, host);
         cloudLog("info", "room.materializer.loaded", {
@@ -284,6 +350,7 @@ export class RoomMaterializer {
       this.loadedPublishedNotebookHeads = null;
       this.loadedPublishedRuntimeStateHeads = null;
       this.loadedPublishedCommsDocHeads = null;
+      this.loadedPublishedCommentsDocHeads = null;
       const host = await createEmptyRoomHost(this.notebookId, roomHostActorLabel(this.notebookId));
       host.seed_initial_code_cell_if_empty(initialHostedCellId(this.notebookId));
       cloudLog("info", "room.materializer.loaded", {
@@ -311,6 +378,7 @@ export class RoomMaterializer {
       notebookBytes: Uint8Array;
       runtimeStateBytes: Uint8Array;
       commsDocBytes?: Uint8Array;
+      commentsDocBytes?: Uint8Array;
       metadata: RoomCheckpointMetadata;
     } | null;
     error: unknown | null;
@@ -350,15 +418,7 @@ export class RoomMaterializer {
     const startedAt = Date.now();
     const published = await this.loadLatestPublishedSnapshotPairForCheckpoint();
     if (!published) {
-      cloudLog("warn", "room.materializer.recovery_skipped", {
-        notebook_id: this.notebookId,
-        operation,
-        reason: "latest_published_snapshot_unavailable",
-        error: errorMessage(cause),
-        counter: "materializer_recovery_skipped",
-        counter_delta: 1,
-      });
-      return false;
+      return this.recoverHostFromCheckpointNow(operation, cause, startedAt);
     }
 
     try {
@@ -366,6 +426,7 @@ export class RoomMaterializer {
         published.notebookBytes,
         published.runtimeStateBytes,
         published.commsDocBytes,
+        published.commentsDocBytes,
       );
       this.markLoadedPublishedSnapshot(published.revisionId, host);
       await this.clearCheckpoint().catch((clearError: unknown) => {
@@ -406,11 +467,80 @@ export class RoomMaterializer {
     }
   }
 
+  private async recoverHostFromCheckpointNow(
+    operation: string,
+    cause: unknown,
+    startedAt: number,
+  ): Promise<boolean> {
+    let checkpoint: Awaited<ReturnType<RoomMaterializer["loadCheckpoint"]>>;
+    try {
+      checkpoint = await this.loadCheckpoint();
+    } catch (error) {
+      cloudLog("warn", "room.materializer.checkpoint_reload_lookup_failed", {
+        notebook_id: this.notebookId,
+        operation,
+        duration_ms: durationMs(startedAt),
+        error: errorMessage(error),
+        original_error: errorMessage(cause),
+        counter: "materializer_checkpoint_reload_lookup_failures",
+        counter_delta: 1,
+      });
+      return false;
+    }
+    if (!checkpoint) {
+      cloudLog("warn", "room.materializer.recovery_skipped", {
+        notebook_id: this.notebookId,
+        operation,
+        reason: "latest_published_snapshot_and_checkpoint_unavailable",
+        error: errorMessage(cause),
+        counter: "materializer_recovery_skipped",
+        counter_delta: 1,
+      });
+      return false;
+    }
+
+    try {
+      const host = await loadRoomHostSnapshot(
+        checkpoint.notebookBytes,
+        checkpoint.runtimeStateBytes,
+        checkpoint.commsDocBytes,
+        checkpoint.commentsDocBytes,
+      );
+      this.markLoadedCheckpoint(checkpoint.metadata);
+      this.hostReady = Promise.resolve(host);
+      cloudLog("warn", "room.materializer.recovered_from_checkpoint_reload", {
+        notebook_id: this.notebookId,
+        operation,
+        duration_ms: durationMs(startedAt),
+        notebook_byte_length: checkpoint.notebookBytes.byteLength,
+        runtime_state_byte_length: checkpoint.runtimeStateBytes.byteLength,
+        comms_doc_byte_length: checkpoint.commsDocBytes?.byteLength ?? 0,
+        comments_doc_byte_length: checkpoint.commentsDocBytes?.byteLength ?? 0,
+        error: errorMessage(cause),
+        counter: "materializer_recovered_from_checkpoint_reload",
+        counter_delta: 1,
+      });
+      return true;
+    } catch (recoveryError) {
+      cloudLog("warn", "room.materializer.checkpoint_reload_failed", {
+        notebook_id: this.notebookId,
+        operation,
+        duration_ms: durationMs(startedAt),
+        error: errorMessage(recoveryError),
+        original_error: errorMessage(cause),
+        counter: "materializer_checkpoint_reload_failures",
+        counter_delta: 1,
+      });
+      return false;
+    }
+  }
+
   private async clearCheckpoint(): Promise<void> {
     await Promise.all([
       this.state.storage.delete(CHECKPOINT_NOTEBOOK_KEY),
       this.state.storage.delete(CHECKPOINT_RUNTIME_STATE_KEY),
       this.state.storage.delete(CHECKPOINT_COMMS_DOC_KEY),
+      this.state.storage.delete(CHECKPOINT_COMMENTS_DOC_KEY),
       this.state.storage.delete(CHECKPOINT_META_KEY),
     ]);
   }
@@ -419,12 +549,14 @@ export class RoomMaterializer {
     notebookBytes: Uint8Array;
     runtimeStateBytes: Uint8Array;
     commsDocBytes?: Uint8Array;
+    commentsDocBytes?: Uint8Array;
     metadata: RoomCheckpointMetadata;
   } | null> {
-    const [notebookBytes, runtimeStateBytes, commsDocBytes] = await Promise.all([
+    const [notebookBytes, runtimeStateBytes, commsDocBytes, commentsDocBytes] = await Promise.all([
       this.state.storage.get<ArrayBuffer>(CHECKPOINT_NOTEBOOK_KEY),
       this.state.storage.get<ArrayBuffer>(CHECKPOINT_RUNTIME_STATE_KEY),
       this.state.storage.get<ArrayBuffer>(CHECKPOINT_COMMS_DOC_KEY),
+      this.state.storage.get<ArrayBuffer>(CHECKPOINT_COMMENTS_DOC_KEY),
     ]);
     const metadata =
       await this.state.storage.get<Partial<RoomCheckpointMetadata>>(CHECKPOINT_META_KEY);
@@ -434,17 +566,22 @@ export class RoomMaterializer {
       (metadata?.version !== 2 &&
         metadata?.version !== 3 &&
         metadata?.version !== 4 &&
+        metadata?.version !== 5 &&
         metadata?.version !== CHECKPOINT_VERSION)
     ) {
       return null;
     }
-    if (metadata.version === CHECKPOINT_VERSION && !commsDocBytes) {
+    if (metadata.version >= 5 && !commsDocBytes) {
+      return null;
+    }
+    if (metadata.version === CHECKPOINT_VERSION && !commentsDocBytes) {
       return null;
     }
     return {
       notebookBytes: new Uint8Array(notebookBytes),
       runtimeStateBytes: new Uint8Array(runtimeStateBytes),
       commsDocBytes: commsDocBytes ? new Uint8Array(commsDocBytes) : undefined,
+      commentsDocBytes: commentsDocBytes ? new Uint8Array(commentsDocBytes) : undefined,
       metadata: {
         version: typeof metadata.version === "number" ? metadata.version : CHECKPOINT_VERSION,
         notebook_heads: Array.isArray(metadata.notebook_heads) ? metadata.notebook_heads : [],
@@ -452,6 +589,9 @@ export class RoomMaterializer {
           ? metadata.runtime_state_heads
           : [],
         comms_doc_heads: Array.isArray(metadata.comms_doc_heads) ? metadata.comms_doc_heads : [],
+        comments_doc_heads: Array.isArray(metadata.comments_doc_heads)
+          ? metadata.comments_doc_heads
+          : [],
         saved_at: typeof metadata.saved_at === "string" ? metadata.saved_at : "",
         published_revision_id:
           typeof metadata.published_revision_id === "string"
@@ -466,6 +606,9 @@ export class RoomMaterializer {
         published_comms_doc_heads: Array.isArray(metadata.published_comms_doc_heads)
           ? metadata.published_comms_doc_heads
           : null,
+        published_comments_doc_heads: Array.isArray(metadata.published_comments_doc_heads)
+          ? metadata.published_comments_doc_heads
+          : null,
       },
     };
   }
@@ -476,6 +619,7 @@ export class RoomMaterializer {
     notebookBytes: Uint8Array;
     runtimeStateBytes: Uint8Array;
     commsDocBytes?: Uint8Array;
+    commentsDocBytes?: Uint8Array;
   } | null> {
     try {
       return await this.loadLatestPublishedSnapshotPair();
@@ -495,6 +639,7 @@ export class RoomMaterializer {
     this.loadedPublishedNotebookHeads = metadata.published_notebook_heads;
     this.loadedPublishedRuntimeStateHeads = metadata.published_runtime_state_heads;
     this.loadedPublishedCommsDocHeads = metadata.published_comms_doc_heads;
+    this.loadedPublishedCommentsDocHeads = metadata.published_comments_doc_heads;
   }
 
   private markLoadedPublishedSnapshot(revisionId: string, host: RoomHostHandle): void {
@@ -502,6 +647,7 @@ export class RoomMaterializer {
     this.loadedPublishedNotebookHeads = Array.from(host.get_heads_hex());
     this.loadedPublishedRuntimeStateHeads = Array.from(host.get_runtime_state_heads_hex());
     this.loadedPublishedCommsDocHeads = Array.from(host.get_comms_doc_heads_hex());
+    this.loadedPublishedCommentsDocHeads = Array.from(host.get_comments_doc_heads_hex());
   }
 
   private async loadLatestPublishedSnapshotPair(): Promise<{
@@ -510,6 +656,7 @@ export class RoomMaterializer {
     notebookBytes: Uint8Array;
     runtimeStateBytes: Uint8Array;
     commsDocBytes?: Uint8Array;
+    commentsDocBytes?: Uint8Array;
   } | null> {
     if (!this.env.DB || !this.env.NOTEBOOK_SNAPSHOTS) {
       return null;
@@ -523,17 +670,26 @@ export class RoomMaterializer {
       return null;
     }
 
-    const [notebookObject, runtimeObject, commsObject] = await Promise.all([
+    const [notebookObject, runtimeObject, commsObject, commentsObject] = await Promise.all([
       this.env.NOTEBOOK_SNAPSHOTS.get(latest.snapshot_key),
       this.env.NOTEBOOK_SNAPSHOTS.get(latest.runtime_snapshot_key),
       latest.comms_snapshot_key ? this.env.NOTEBOOK_SNAPSHOTS.get(latest.comms_snapshot_key) : null,
+      latest.comments_snapshot_key
+        ? this.env.NOTEBOOK_SNAPSHOTS.get(latest.comments_snapshot_key)
+        : null,
     ]);
-    if (!notebookObject || !runtimeObject || (latest.comms_snapshot_key && !commsObject)) {
+    if (
+      !notebookObject ||
+      !runtimeObject ||
+      (latest.comms_snapshot_key && !commsObject) ||
+      (latest.comments_snapshot_key && !commentsObject)
+    ) {
       cloudLog("warn", "room.materializer.snapshot_pair_missing", {
         notebook_id: this.notebookId,
         notebook_snapshot_missing: !notebookObject,
         runtime_state_snapshot_missing: !runtimeObject,
         comms_doc_snapshot_missing: Boolean(latest.comms_snapshot_key && !commsObject),
+        comments_doc_snapshot_missing: Boolean(latest.comments_snapshot_key && !commentsObject),
         counter: "materializer_snapshot_pair_missing",
         counter_delta: 1,
       });
@@ -546,6 +702,9 @@ export class RoomMaterializer {
       notebookBytes: new Uint8Array(await notebookObject.arrayBuffer()),
       runtimeStateBytes: new Uint8Array(await runtimeObject.arrayBuffer()),
       commsDocBytes: commsObject ? new Uint8Array(await commsObject.arrayBuffer()) : undefined,
+      commentsDocBytes: commentsObject
+        ? new Uint8Array(await commentsObject.arrayBuffer())
+        : undefined,
     };
   }
 }
@@ -570,6 +729,45 @@ function stableRoomKey(value: string): string {
   return hash.toString(16).padStart(16, "0");
 }
 
+function shouldRecoverReceiveFrame(frame: TypedFrame, error: unknown): boolean {
+  if (!isMaterializedSyncFrameForRecovery(frame.type)) {
+    return false;
+  }
+  return isRecoverableAutomergeSyncBoundaryError(errorMessage(error));
+}
+
+function isMaterializedSyncFrameForRecovery(type: FrameTypeValue): boolean {
+  return (
+    type === FrameType.AUTOMERGE_SYNC ||
+    type === FrameType.RUNTIME_STATE_SYNC ||
+    type === FrameType.COMMS_DOC_SYNC ||
+    type === FrameType.COMMENTS_DOC_SYNC
+  );
+}
+
+function isRecoverableAutomergeSyncBoundaryError(message: string): boolean {
+  return (
+    /recursive use of an object detected which would lead to unsafe aliasing/i.test(message) ||
+    /\bPatchLogMismatch\b/i.test(message) ||
+    /patch logs cannot be shared between documents/i.test(message)
+  );
+}
+
+function frameTypeNameForRecovery(type: FrameTypeValue): string {
+  switch (type) {
+    case FrameType.AUTOMERGE_SYNC:
+      return "notebook_sync";
+    case FrameType.RUNTIME_STATE_SYNC:
+      return "runtime_state_sync";
+    case FrameType.COMMS_DOC_SYNC:
+      return "comms_doc_sync";
+    case FrameType.COMMENTS_DOC_SYNC:
+      return "comments_doc_sync";
+    default:
+      return `frame_${type}`;
+  }
+}
+
 export function isMaterializedSyncFrame(type: FrameTypeValue): boolean {
   // REQUEST routes through the room host too: an authorized ExecuteCell request
   // is turned into queued execution intent by the one peer that may create it.
@@ -578,6 +776,7 @@ export function isMaterializedSyncFrame(type: FrameTypeValue): boolean {
     type === FrameType.AUTOMERGE_SYNC ||
     type === FrameType.RUNTIME_STATE_SYNC ||
     type === FrameType.COMMS_DOC_SYNC ||
+    type === FrameType.COMMENTS_DOC_SYNC ||
     type === FrameType.REQUEST
   );
 }
@@ -590,6 +789,7 @@ function normalizeResult(value: unknown): RoomHostFrameResult {
   const result = value as Partial<RoomHostFrameResult> | undefined;
   return {
     changed: result?.changed ?? false,
+    ignored_stale: result?.ignored_stale ?? false,
     notebook_changed: result?.notebook_changed ?? false,
     runtime_state_changed: result?.runtime_state_changed ?? false,
     outbound: result?.outbound ?? [],
@@ -602,6 +802,60 @@ function normalizeWorkstationAttachmentJson(value: string): WorkstationAttachmen
     return parsed;
   }
   throw new Error("RoomHostHandle returned an invalid workstation attachment");
+}
+
+function normalizeRuntimeExecutionActivityJson(value: string): RuntimeExecutionActivity {
+  const parsed = JSON.parse(value) as unknown;
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("RoomHostHandle returned invalid runtime execution activity");
+  }
+  const record = parsed as Record<string, unknown>;
+  const queueDepth = record.queue_depth;
+  if (
+    typeof record.executing !== "boolean" ||
+    typeof queueDepth !== "number" ||
+    !Number.isSafeInteger(queueDepth) ||
+    queueDepth < 0
+  ) {
+    throw new Error("RoomHostHandle returned invalid runtime execution activity");
+  }
+  return {
+    executing: record.executing,
+    queueDepth,
+  };
+}
+
+function commentAuthorActorLabelsFromProjection(projection: unknown): string[] {
+  if (!projection || typeof projection !== "object") {
+    return [];
+  }
+  const labels = new Set<string>();
+  const threads = (projection as Record<string, unknown>).threads;
+  if (!Array.isArray(threads)) {
+    return [];
+  }
+  for (const thread of threads) {
+    if (!thread || typeof thread !== "object") {
+      continue;
+    }
+    const record = thread as Record<string, unknown>;
+    addActorLabel(labels, record.created_by_actor_label);
+    addActorLabel(labels, record.resolved_by_actor_label);
+    if (Array.isArray(record.messages)) {
+      for (const message of record.messages) {
+        if (message && typeof message === "object") {
+          addActorLabel(labels, (message as Record<string, unknown>).created_by_actor_label);
+        }
+      }
+    }
+  }
+  return Array.from(labels);
+}
+
+function addActorLabel(labels: Set<string>, value: unknown): void {
+  if (typeof value === "string" && value.trim()) {
+    labels.add(value);
+  }
 }
 
 function isWorkstationAttachmentState(value: unknown): value is WorkstationAttachmentState {
@@ -636,7 +890,8 @@ function hasUnpublishedCheckpointChanges(metadata: RoomCheckpointMetadata): bool
   return (
     headsChanged(metadata.notebook_heads, metadata.published_notebook_heads) ||
     headsChanged(metadata.runtime_state_heads, metadata.published_runtime_state_heads) ||
-    headsChanged(metadata.comms_doc_heads, metadata.published_comms_doc_heads)
+    headsChanged(metadata.comms_doc_heads, metadata.published_comms_doc_heads) ||
+    headsChanged(metadata.comments_doc_heads, metadata.published_comments_doc_heads)
   );
 }
 

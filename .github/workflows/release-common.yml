@@ -106,7 +106,6 @@ jobs:
             apps/notebook/src/wasm/runtimed-wasm/
             crates/sift-wasm/pkg/
             packages/sift/public/wasm/
-            crates/runt-mcp/assets/plugins/
             apps/notebook/src/renderer-plugins/
             target/xtask/*.fingerprint
 
@@ -151,6 +150,7 @@ jobs:
       - uses: ./.github/actions/build-runtime-artifacts
         with:
           skip-wasm: true
+          include-mcp-widget: true
 
       - name: Set version in Cargo.toml
         run: |
@@ -158,10 +158,6 @@ jobs:
           echo "Setting version to: ${VERSION}"
           sed -i "s/^version = .*/version = \"${VERSION}\"/" crates/runt/Cargo.toml
           sed -i "s/^version = .*/version = \"${VERSION}\"/" crates/runtimed/Cargo.toml
-
-      # Build MCP output widget HTML (needed by runt-mcp's include_str!)
-      - name: Build MCP output widget
-        run: pnpm --filter nteract-mcp-app install --frozen-lockfile && pnpm exec vp run nteract-mcp-app#build
 
       - name: Build for Linux x64
         run: cargo build --release --target x86_64-unknown-linux-gnu -p runt -p runtimed -p nteract-mcp
@@ -215,6 +211,7 @@ jobs:
       - uses: ./.github/actions/build-runtime-artifacts
         with:
           skip-wasm: true
+          include-mcp-widget: true
 
       - name: Set version in Cargo.toml
         run: |
@@ -222,10 +219,6 @@ jobs:
           echo "Setting version to: ${VERSION}"
           sed -i '' "s/^version = .*/version = \"${VERSION}\"/" crates/runt/Cargo.toml
           sed -i '' "s/^version = .*/version = \"${VERSION}\"/" crates/runtimed/Cargo.toml
-
-      # Build MCP output widget HTML (needed by runt-mcp's include_str!)
-      - name: Build MCP output widget
-        run: pnpm --filter nteract-mcp-app install --frozen-lockfile && pnpm exec vp run nteract-mcp-app#build
 
       - name: Build for macOS ARM64
         run: cargo build --release --target aarch64-apple-darwin -p runt
@@ -276,6 +269,7 @@ jobs:
       - uses: ./.github/actions/build-runtime-artifacts
         with:
           skip-wasm: true
+          include-mcp-widget: true
 
       - name: Build frontend
         run: pnpm build
@@ -339,10 +333,6 @@ jobs:
             ICON_SOURCE="crates/notebook/icons/source-nightly.png"
           fi
           cargo xtask icons "$ICON_SOURCE"
-
-      # Build MCP output widget HTML (needed by runt-mcp's include_str!)
-      - name: Build MCP output widget
-        run: pnpm --filter nteract-mcp-app install --frozen-lockfile && pnpm exec vp run nteract-mcp-app#build
 
       - name: Build external binaries
         run: |
@@ -450,6 +440,7 @@ jobs:
       - uses: ./.github/actions/build-runtime-artifacts
         with:
           skip-wasm: true
+          include-mcp-widget: true
 
       - name: Build frontend
         run: pnpm build
@@ -513,10 +504,6 @@ jobs:
             ICON_SOURCE="crates/notebook/icons/source-nightly.png"
           fi
           cargo xtask icons "$ICON_SOURCE"
-
-      # Build MCP output widget HTML (needed by runt-mcp's include_str!)
-      - name: Build MCP output widget
-        run: pnpm --filter nteract-mcp-app install --frozen-lockfile && pnpm exec vp run nteract-mcp-app#build
 
       - name: Build external binaries
         run: |
@@ -628,6 +615,7 @@ jobs:
       - uses: ./.github/actions/build-runtime-artifacts
         with:
           skip-wasm: true
+          include-mcp-widget: true
 
       - name: Build frontend
         run: pnpm build
@@ -681,10 +669,6 @@ jobs:
             $iconSource = "crates/notebook/icons/source-nightly.png"
           }
           cargo xtask icons $iconSource
-
-      # Build MCP output widget HTML (needed by runt-mcp's include_str!)
-      - name: Build MCP output widget
-        run: pnpm --filter nteract-mcp-app install --frozen-lockfile && pnpm exec vp run nteract-mcp-app#build
 
       - name: Build external binaries
         shell: bash
@@ -808,6 +792,7 @@ jobs:
       - uses: ./.github/actions/build-runtime-artifacts
         with:
           skip-wasm: true
+          include-mcp-widget: true
 
       - name: Build frontend
         run: pnpm build
@@ -843,10 +828,6 @@ jobs:
             ICON_SOURCE="crates/notebook/icons/source-nightly.png"
           fi
           cargo xtask icons "$ICON_SOURCE"
-
-      # Build MCP output widget HTML (needed by runt-mcp's include_str!)
-      - name: Build MCP output widget
-        run: pnpm --filter nteract-mcp-app install --frozen-lockfile && pnpm exec vp run nteract-mcp-app#build
 
       - name: Build external binaries
         run: |
@@ -1420,6 +1401,9 @@ jobs:
           VERSION_SUFFIX: ${{ inputs.version_suffix }}
           COMMIT_SHA: ${{ github.sha }}
           RELEASE_INTRO: ${{ inputs.release_intro }}
+          RELEASE_REPO: ${{ github.repository }}
+          BASE_VERSION: ${{ needs.compute-version.outputs.base_version }}
+          TAG_NAME: v${{ needs.compute-version.outputs.version }}
         run: |
           CLI_NAME="runt"
           DAEMON_NAME="runtimed"
@@ -1429,18 +1413,36 @@ jobs:
             DAEMON_NAME="runtimed-nightly"
             MCP_NAME="nteract-mcp-nightly"
           fi
+          INSTALLER_URL="https://github.com/${RELEASE_REPO}/releases/download/${TAG_NAME}/install-linux-release"
+
+          RELEASE_SERIES="${BASE_VERSION%.*}"
+          HIGHLIGHTS_FILE=""
+          for candidate in \
+            ".github/release-notes/${BASE_VERSION}.md" \
+            ".github/release-notes/${RELEASE_SERIES}.md" \
+            ".github/release-notes/${VERSION_SUFFIX}.md"
+          do
+            if [ -f "$candidate" ]; then
+              HIGHLIGHTS_FILE="$candidate"
+              break
+            fi
+          done
+
+          if [ -n "$HIGHLIGHTS_FILE" ]; then
+            cp "$HIGHLIGHTS_FILE" release-highlights.md
+          else
+            {
+              echo "No curated highlights were provided for this release."
+              echo "See the generated changelog below for the complete commit summary."
+            } > release-highlights.md
+          fi
+
           {
             echo "$RELEASE_INTRO"
             echo ''
-            echo "## What's Changed"
+            echo '## Install'
             echo ''
-            cat changelog-section.md
-            echo ''
-            echo '---'
-            echo ''
-            echo "**Commit:** \`${COMMIT_SHA}\`"
-            echo ''
-            echo '## nteract (desktop app)'
+            echo '### nteract (desktop app)'
             echo ''
             echo '| Platform | Architecture | Download |'
             echo '|----------|--------------|----------|'
@@ -1451,15 +1453,43 @@ jobs:
             echo ''
             echo "macOS and Windows builds are signed. macOS builds are also notarized. Linux AppImage: \`chmod +x\` and run. DEB/RPM packages are not currently supported because runtimed is a per-user daemon managed by the app and CLI, not by system package-manager scripts."
             echo ''
-            echo "For Linux shell installs, download \`install-linux-release\` from this release or run:"
+            echo '### Shell installer for Linux/macOS'
+            echo ''
+            echo 'Pinned to this release:'
             echo ''
             echo '```bash'
-            echo 'curl -fsSL https://sh.nteract.io | bash'
+            echo "curl -fsSL ${INSTALLER_URL} | bash"
             echo '```'
             echo ''
+            if [ "$VERSION_SUFFIX" = "nightly" ]; then
+              echo 'Headless workstation install:'
+              echo ''
+              echo '```bash'
+              echo "curl -fsSL ${INSTALLER_URL} | bash -s -- --headless"
+              echo '```'
+              echo ''
+            fi
+            if [ "$VERSION_SUFFIX" != "nightly" ]; then
+              echo 'Latest stable shortcut:'
+              echo ''
+              echo '```bash'
+              echo 'curl -fsSL https://sh.nteract.io | bash'
+              echo '```'
+              echo ''
+            fi
             echo 'This release includes auto-update support. Existing installations will be notified of this update automatically.'
             echo ''
-            echo "## ${CLI_NAME} (CLI)"
+            echo '### runtimed (Python — macOS, Linux, Windows)'
+            echo ''
+            echo '```bash'
+            if [ "$VERSION_SUFFIX" = "nightly" ]; then
+              echo 'pip install --pre runtimed'
+            else
+              echo 'pip install runtimed'
+            fi
+            echo '```'
+            echo ''
+            echo "### ${CLI_NAME} (CLI)"
             echo ''
             echo 'Also bundled inside the desktop app. Standalone binaries:'
             echo ''
@@ -1471,15 +1501,22 @@ jobs:
             echo "| macOS | ARM64 | \`${CLI_NAME}-darwin-arm64\` |"
             echo "| macOS | x64 (Intel) | \`${CLI_NAME}-darwin-x64\` |"
             echo ''
-            echo '## runtimed (Python — macOS, Linux, Windows)'
+            echo '## Release highlights'
             echo ''
-            echo '```bash'
-            if [ "$VERSION_SUFFIX" = "nightly" ]; then
-              echo 'pip install --pre runtimed'
-            else
-              echo 'pip install runtimed'
-            fi
-            echo '```'
+            cat release-highlights.md
+            echo ''
+            echo '## Full generated changelog'
+            echo ''
+            echo '<details>'
+            echo '<summary>Open the raw git-cliff changelog</summary>'
+            echo ''
+            cat changelog-section.md
+            echo ''
+            echo '</details>'
+            echo ''
+            echo '---'
+            echo ''
+            echo "**Commit:** \`${COMMIT_SHA}\`"
           } > release-body.md
 
       - name: Create GitHub Release

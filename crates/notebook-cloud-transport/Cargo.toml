@@ -1,6 +1,6 @@
 [package]
 name = "notebook-cloud-transport"
-version = "0.1.0"
+version = "0.2.3"
 edition.workspace = true
 description = "Cloud-WebSocket FrameTransport for the runtime agent (dials a hosted notebook room as a runtime peer)"
 repository.workspace = true
@@ -9,15 +9,25 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Machine-local cloud domain registry (routing + credential references).
+registry = ["dep:serde", "dep:toml", "dep:url", "dep:dirs", "dep:uuid", "dep:runt-workspace"]
+
 [dependencies]
 anyhow = { workspace = true }
-futures-util = "0.3"
+dirs = { workspace = true, optional = true }
+futures-util = { workspace = true }
 notebook-protocol = { path = "../notebook-protocol" }
 notebook-wire = { path = "../notebook-wire" }
+runt-workspace = { path = "../runt-workspace", optional = true }
+serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
-tracing = "0.1"
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+toml = { workspace = true, optional = true }
+tracing = { workspace = true }
+url = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

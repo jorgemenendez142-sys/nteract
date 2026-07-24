@@ -1,8 +1,9 @@
 //! RuntimeStateDoc — per-notebook ephemeral Automerge document for runtime state.
 //!
-//! Daemon-authoritative. One per notebook room. Describes the kernel, execution
-//! queue, and environment state. Clients sync read-only via the Automerge sync
-//! protocol — the daemon strips any client-side changes.
+//! Runtime-authoritative. One per notebook room. Describes the kernel,
+//! execution queue, environment state, outputs, and runtime topology. Regular
+//! notebook clients sync it read-only; runtime peers and room/coordinator code
+//! use the validated writable path for policy-allowed runtime state.
 //!
 //! Schema:
 //! ```text
@@ -59,11 +60,15 @@
 //!       extras: Str           (JSON-encoded ProjectFileExtras)
 //!   workstation/            Map|null (room-host-owned current compute attachment)
 //!     workstation_id: Str
+//!     accelerators: List[Map]|null (null/missing = unknown; [] = known none)
 //!     display_name: Str
 //!     provider: Str
 //!     default_environment_label: Str
 //!     environment_policy: Str
-//!     status: Str             ("disconnected" | "connecting" | "ready" | "busy" | "error")
+//!     status: Str             ("disconnected" | "connecting" | "ready" | "busy" | "idle" | "error")
+//!                             "disconnected" means compute was lost and can resume on execution.
+//!                             "idle" means attached compute is stopped and can resume on execution.
+//!                             "error" means startup or attachment failed and needs attention.
 //!     status_message: Str|null
 //!     cpu_count: Uint|null
 //!     memory_bytes: Uint|null
@@ -82,6 +87,21 @@
 //!       outputs: List[Map] (inline manifests, OutputModel only)
 //!       seq: Int           (insertion order)
 //!       capture_msg_id: Str (Output widget capture routing, "" if not capturing)
+//!   bokeh_sessions/        Map (keyed by session_id; additive after v2 genesis)
+//!     {session_id}/        Map
+//!       output_id: Str
+//!       cell_id: Str
+//!       execution_id: Str
+//!       kernel_id: Str
+//!       status: Str         ("connected" | "disconnected" | "closed" | "error")
+//!       head_revision: Uint
+//!       checkpoint: Map|null (blob-backed full document checkpoint)
+//!       patch_tail: List[Map] (bounded blob-backed transactions after checkpoint)
+//!   file_checkpoint/       Map (additive; absent in frozen schema v2 genesis)
+//!     exported_heads: List[Str] (NotebookDoc Automerge heads in hex)
+//!     save_sequence: Uint|null  (monotonic committed file replacement sequence)
+//!     source_issue_kind: Str    ("" | "conflict" | "degraded")
+//!     source_issue_reason: Str  (human-readable diagnostic; "" when clear)
 //!   runtime_state_doc_id: Str|null
 //!   last_saved: Str|null   (ISO timestamp of last save)
 //! ```
@@ -102,9 +122,12 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+use crate::{BokehSessionCheckpoint, BokehSessionContentRef, BokehSessionPatchRef};
 use crate::{
-    KernelActivity, KernelErrorReason, ProjectContext, ProjectFile, ProjectFileExtras,
-    ProjectFileKind, ProjectFileParsed, RuntimeLifecycle, StreamOutputState,
+    BokehSessionState, BokehSessionStatus, KernelActivity, KernelErrorReason, ProjectContext,
+    ProjectFile, ProjectFileExtras, ProjectFileKind, ProjectFileParsed, RuntimeLifecycle,
+    StreamOutputState,
 };
 
 #[cfg(test)]
@@ -341,6 +364,26 @@ fn default_empty_state() -> serde_json::Value {
 /// workstation registry/control plane can provide richer host-owned data, but
 /// this snapshot is what late joiners and collaborators read through
 /// RuntimeStateDoc while deciding whether the room can execute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkstationAcceleratorState {
+    /// Extensible accelerator class. The initial detector publishes `gpu`.
+    pub kind: String,
+    #[serde(default)]
+    pub vendor: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Number of identical devices represented by this entry.
+    pub count: u64,
+    /// Physical memory on each device, not currently free memory.
+    #[serde(default)]
+    pub memory_bytes_per_device: Option<u64>,
+    /// `ready` means the workstation runtime verified device access. It does
+    /// not claim the devices are idle, free, or schedulable.
+    pub readiness: String,
+    #[serde(default)]
+    pub diagnostic: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkstationAttachmentState {
     pub workstation_id: String,
@@ -355,6 +398,11 @@ pub struct WorkstationAttachmentState {
     pub cpu_count: Option<u64>,
     #[serde(default)]
     pub memory_bytes: Option<u64>,
+    /// `None` is an older/unknown inventory; `Some([])` means detection ran and
+    /// found no accelerators. Known facts remain attached while a workstation
+    /// is offline so late joiners can distinguish hardware from liveness.
+    #[serde(default)]
+    pub accelerators: Option<Vec<WorkstationAcceleratorState>>,
     #[serde(default)]
     pub working_directory: Option<String>,
     #[serde(default)]
@@ -364,6 +412,49 @@ pub struct WorkstationAttachmentState {
     /// RuntimeStateDocs omit it.
     #[serde(default)]
     pub runtime_session_id: Option<String>,
+}
+
+/// Why the file-backed source cannot currently be treated as healthy.
+///
+/// A conflict means both the journal-backed live document and an externally
+/// changed `.ipynb` must be preserved for explicit reconciliation. Degraded
+/// covers other durability failures where the room remains resident and must
+/// not claim a successful checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileSourceIssue {
+    Conflict { reason: String },
+    Degraded { reason: String },
+}
+
+impl FileSourceIssue {
+    fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Conflict { .. } => "conflict",
+            Self::Degraded { .. } => "degraded",
+        }
+    }
+
+    fn reason(&self) -> &str {
+        match self {
+            Self::Conflict { reason } | Self::Degraded { reason } => reason,
+        }
+    }
+}
+
+/// Causal file state projected to RuntimeStateDoc readers.
+///
+/// This map is additive and intentionally absent from the frozen v2 genesis.
+/// Missing data therefore reads as no committed checkpoint and no source
+/// issue, keeping older RuntimeStateDoc snapshots backward-compatible.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileCheckpointState {
+    #[serde(default)]
+    pub exported_heads: Vec<String>,
+    #[serde(default)]
+    pub save_sequence: Option<u64>,
+    #[serde(default)]
+    pub source_issue: Option<FileSourceIssue>,
 }
 
 /// Full runtime state snapshot.
@@ -378,6 +469,10 @@ pub struct RuntimeState {
     pub env: EnvState,
     pub trust: TrustRuntimeState,
     pub last_saved: Option<String>,
+    /// Last causally committed `.ipynb` checkpoint and current source health.
+    /// Missing fields in older RuntimeStateDocs project to the default state.
+    #[serde(default)]
+    pub file_checkpoint: FileCheckpointState,
     /// Path to the notebook's `.ipynb` on the daemon's disk.
     /// `None` for untitled notebooks; daemon writes this on save / save-as.
     pub path: Option<String>,
@@ -387,6 +482,9 @@ pub struct RuntimeState {
     /// Active comm channels keyed by comm_id.
     #[serde(default)]
     pub comms: HashMap<String, CommDocEntry>,
+    /// Kernel-owned Bokeh document sessions keyed by session_id.
+    #[serde(default)]
+    pub bokeh_sessions: HashMap<String, BokehSessionState>,
     /// Daemon-observed project file context (see [`ProjectContext`]).
     /// Flows through the normal sync path so WASM / Python / MCP
     /// consumers read it alongside the rest of runtime state.
@@ -454,11 +552,13 @@ impl RuntimeStateDoc {
         })
     }
 
-    /// Create a bootstrap `RuntimeStateDoc` for read-only clients.
+    /// Create a bootstrap `RuntimeStateDoc` with a random local actor.
     ///
     /// The document starts from the canonical schema seed, not from an empty
     /// AutoCommit, so the first RuntimeStateSync frame can merge into the
     /// shared root scaffold instead of replacing local encoding/actor state.
+    /// This is used by read-only replicas and by hosted/runtime-peer surfaces
+    /// that validate writes before applying them.
     pub fn try_new_empty() -> Result<Self, RuntimeStateError> {
         let mut doc = Self::schema_seed_doc()?;
         doc.set_actor(ActorId::random());
@@ -656,6 +756,8 @@ impl RuntimeStateDoc {
     /// The closure is invoked exactly once. Prepare non-deterministic values
     /// before calling this method if they need to be reused outside the
     /// transaction; the helper does not retry conflicts by re-running `f`.
+    /// Mutations and derived output-order cache entries are rolled back when
+    /// the closure returns an error.
     pub fn transact_at_heads_recovering<F, T>(
         &mut self,
         heads: &[automerge::ChangeHash],
@@ -669,6 +771,7 @@ impl RuntimeStateDoc {
         use std::cell::Cell;
 
         let original_actor = self.doc.get_actor().clone();
+        let output_order_cache_before = self.output_order_cache.clone();
         let isolated = Cell::new(false);
         let mut recovery_panic = None;
 
@@ -679,6 +782,11 @@ impl RuntimeStateDoc {
             self.doc.isolate(heads);
             isolated.set(true);
             let result = f(self);
+            if result.is_err() {
+                self.doc.rollback();
+                self.output_order_cache
+                    .clone_from(&output_order_cache_before);
+            }
             self.doc.integrate();
             isolated.set(false);
             result
@@ -686,6 +794,8 @@ impl RuntimeStateDoc {
 
         if isolated.get() {
             if let Err(err) = catch_automerge_panic(format!("{label}:integrate"), || {
+                self.doc.rollback();
+                self.output_order_cache.clear();
                 self.doc.integrate();
             }) {
                 recovery_panic = Some(err);
@@ -840,6 +950,66 @@ impl RuntimeStateDoc {
             .unwrap_or_default()
     }
 
+    fn read_str_conflicts(&self, obj: &automerge::ObjId, key: &str) -> Vec<String> {
+        self.doc
+            .get_all(obj, key)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(value, _)| match value {
+                Value::Scalar(s) => match s.as_ref() {
+                    ScalarValue::Str(s) => Some(s.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn resolve_kernel_lifecycle(&self, kernel: &automerge::ObjId) -> RuntimeLifecycle {
+        let lifecycle_key = self.read_str(kernel, "lifecycle");
+        let activity_key = self.read_str(kernel, "activity");
+        // Pre-typed docs (captured fixtures, `from_doc` with external bytes)
+        // only have the string shape. resolve_lifecycle falls back to it when
+        // the typed keys are missing.
+        let stored_status = self.read_str(kernel, "status");
+        let stored_starting_phase = self.read_str(kernel, "starting_phase");
+        let lifecycle = crate::types::resolve_lifecycle(
+            &lifecycle_key,
+            &activity_key,
+            &stored_status,
+            &stored_starting_phase,
+        );
+
+        let lifecycle_conflicts = self.read_str_conflicts(kernel, "lifecycle");
+        if lifecycle_conflicts.iter().any(|value| value == "Error") {
+            return RuntimeLifecycle::Error;
+        }
+
+        if !matches!(
+            lifecycle,
+            RuntimeLifecycle::NotStarted | RuntimeLifecycle::Shutdown
+        ) {
+            return lifecycle;
+        }
+
+        if !lifecycle_conflicts.iter().any(|value| value == "Running") {
+            return lifecycle;
+        }
+
+        let activity_conflicts = self.read_str_conflicts(kernel, "activity");
+        let activity = if KernelActivity::parse(&activity_key).is_some() {
+            KernelActivity::parse(&activity_key).unwrap_or(KernelActivity::Unknown)
+        } else if activity_conflicts.iter().any(|value| value == "Idle") {
+            KernelActivity::Idle
+        } else if activity_conflicts.iter().any(|value| value == "Busy") {
+            KernelActivity::Busy
+        } else {
+            KernelActivity::Unknown
+        };
+
+        RuntimeLifecycle::Running(activity)
+    }
+
     /// Read an optional string (null → None) from a map object.
     fn read_opt_str(&self, obj: &automerge::ObjId, key: &str) -> Option<String> {
         self.doc
@@ -980,6 +1150,17 @@ impl RuntimeStateDoc {
             }
         }
         out
+    }
+
+    fn read_workstation_accelerators(
+        &self,
+        workstation: &automerge::ObjId,
+    ) -> Option<Vec<WorkstationAcceleratorState>> {
+        let value = automunge::read_json_value(&self.doc, workstation, "accelerators")?;
+        if !value.is_array() {
+            return None;
+        }
+        serde_json::from_value(value).ok()
     }
 
     // ── Granular setters (daemon calls these individually) ──────────
@@ -1150,7 +1331,7 @@ impl RuntimeStateDoc {
         Ok(())
     }
 
-    /// Update just the kernel activity. The hot path for IOPub idle/busy,
+    /// Update the kernel activity. The hot path for IOPub idle/busy,
     /// called on every kernel status message.
     ///
     /// A no-op when the stored value already matches the requested value,
@@ -1158,21 +1339,21 @@ impl RuntimeStateDoc {
     /// `Busy → Busy` writes. This is the throttle that keeps sync traffic
     /// bounded during heavy execution.
     ///
-    /// Callers are expected to have set `lifecycle = Running(...)` first
-    /// (typically via [`set_lifecycle`]). This method does NOT verify
-    /// that invariant: writing activity while lifecycle is something
-    /// else produces a doc that [`read_state`] will report as
-    /// `Running(<activity>)` because the lifecycle CRDT key takes
-    /// precedence. Use the type-safe entry point [`set_lifecycle`] for
-    /// state transitions; reserve this method for the idle/busy flip.
+    /// A real idle/busy signal also re-publishes
+    /// `lifecycle = Running(<activity>)`. That keeps the live kernel branch
+    /// newer than any concurrent terminal lifecycle retained by a read-only
+    /// replica after room wake.
     pub fn set_activity(&mut self, activity: KernelActivity) -> Result<(), RuntimeStateError> {
         let kernel = self.scaffold_map("kernel")?;
+        let current_lifecycle = self.read_str(&kernel, "lifecycle");
         let current_activity = self.read_str(&kernel, "activity");
         // Short-circuit only when the typed activity already matches
-        // AND the legacy keys are already cleared. Otherwise a
-        // pre-typed doc hydrated via from_doc would stay stuck on
-        // stale `status="starting"` + `starting_phase="connecting"`
-        // after the first IOPub activity update.
+        // AND the lifecycle already reads as Running AND the legacy keys
+        // are already cleared. Otherwise a pre-typed doc hydrated via
+        // from_doc would stay stuck on stale `status="starting"` +
+        // `starting_phase="connecting"` after the first IOPub activity
+        // update, and a read-only replica can keep a concurrent
+        // `lifecycle = Shutdown` branch after room wake.
         let has_stale_legacy = self.doc.get(&kernel, "status").ok().flatten().is_some()
             || self
                 .doc
@@ -1180,10 +1361,15 @@ impl RuntimeStateDoc {
                 .ok()
                 .flatten()
                 .is_some();
-        if current_activity == activity.as_str() && !has_stale_legacy {
+        let lifecycle_needs_running_republish = current_lifecycle != "Running";
+        if current_activity == activity.as_str()
+            && !lifecycle_needs_running_republish
+            && !has_stale_legacy
+        {
             return Ok(());
         }
-        if current_activity != activity.as_str() {
+        if lifecycle_needs_running_republish || current_activity != activity.as_str() {
+            self.doc.put(&kernel, "lifecycle", "Running")?;
             self.doc.put(&kernel, "activity", activity.as_str())?;
         }
         if has_stale_legacy {
@@ -2398,6 +2584,118 @@ impl RuntimeStateDoc {
         Ok(())
     }
 
+    /// Read the last causally committed file checkpoint and source health.
+    ///
+    /// Frozen v2 genesis documents and older persisted snapshots do not have
+    /// this additive map, so absence projects to [`FileCheckpointState::default`].
+    pub fn file_checkpoint(&self) -> FileCheckpointState {
+        let Some(checkpoint) = self.get_map("file_checkpoint") else {
+            return FileCheckpointState::default();
+        };
+        let source_issue = match self.read_str(&checkpoint, "source_issue_kind").as_str() {
+            "conflict" => Some(FileSourceIssue::Conflict {
+                reason: self.read_str(&checkpoint, "source_issue_reason"),
+            }),
+            "degraded" => Some(FileSourceIssue::Degraded {
+                reason: self.read_str(&checkpoint, "source_issue_reason"),
+            }),
+            _ => None,
+        };
+        FileCheckpointState {
+            exported_heads: self.read_str_list(&checkpoint, "exported_heads"),
+            save_sequence: self.read_opt_u64(&checkpoint, "save_sequence"),
+            source_issue,
+        }
+    }
+
+    /// Publish a committed `.ipynb` checkpoint at exact NotebookDoc heads.
+    ///
+    /// Callers must invoke this only after durable file replacement succeeds.
+    /// Source health is intentionally left unchanged; reconciliation owns that
+    /// independent axis.
+    pub fn set_file_checkpoint(
+        &mut self,
+        exported_heads: &[String],
+        save_sequence: u64,
+    ) -> Result<bool, RuntimeStateError> {
+        let current = self.file_checkpoint();
+        if current
+            .save_sequence
+            .is_some_and(|current_sequence| current_sequence >= save_sequence)
+        {
+            // Async save completion can arrive after a newer checkpoint has
+            // already committed. RuntimeStateDoc is a causal projection, so a
+            // stale completion must not regress exported heads (or let its
+            // caller regress last_saved metadata).
+            return Ok(false);
+        }
+
+        let checkpoint = self.get_or_create_root_map("file_checkpoint")?;
+        let heads = match self.doc.get(&checkpoint, "exported_heads").ok().flatten() {
+            Some((Value::Object(ObjType::List), heads)) => heads,
+            _ => self
+                .doc
+                .put_object(&checkpoint, "exported_heads", ObjType::List)?,
+        };
+        for index in (0..self.doc.length(&heads)).rev() {
+            self.doc.delete(&heads, index)?;
+        }
+        for (index, head) in exported_heads.iter().enumerate() {
+            self.doc.insert(&heads, index, head.as_str())?;
+        }
+        self.doc.put(
+            &checkpoint,
+            "save_sequence",
+            ScalarValue::Uint(save_sequence),
+        )?;
+        Ok(true)
+    }
+
+    /// Clear committed checkpoint metadata without changing source health.
+    pub fn clear_file_checkpoint(&mut self) -> Result<(), RuntimeStateError> {
+        let current = self.file_checkpoint();
+        if current.exported_heads.is_empty() && current.save_sequence.is_none() {
+            return Ok(());
+        }
+
+        let checkpoint = self.get_or_create_root_map("file_checkpoint")?;
+        if let Some((Value::Object(ObjType::List), heads)) =
+            self.doc.get(&checkpoint, "exported_heads").ok().flatten()
+        {
+            for index in (0..self.doc.length(&heads)).rev() {
+                self.doc.delete(&heads, index)?;
+            }
+        }
+        self.doc
+            .put(&checkpoint, "save_sequence", ScalarValue::Null)?;
+        Ok(())
+    }
+
+    /// Publish or clear a source conflict/degradation diagnostic.
+    pub fn set_file_source_issue(
+        &mut self,
+        issue: Option<&FileSourceIssue>,
+    ) -> Result<(), RuntimeStateError> {
+        if self.file_checkpoint().source_issue.as_ref() == issue {
+            return Ok(());
+        }
+
+        let checkpoint = self.get_or_create_root_map("file_checkpoint")?;
+        match issue {
+            Some(issue) => {
+                self.doc
+                    .put(&checkpoint, "source_issue_kind", issue.kind_str())?;
+                self.doc
+                    .put(&checkpoint, "source_issue_reason", issue.reason())?;
+            }
+            None => {
+                self.doc.put(&checkpoint, "source_issue_kind", "")?;
+                self.doc.put(&checkpoint, "source_issue_reason", "")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Set the `last_saved` timestamp.
     pub fn set_last_saved(&mut self, timestamp: Option<&str>) -> Result<(), RuntimeStateError> {
         self.set_optional_str("last_saved", timestamp)
@@ -2437,6 +2735,7 @@ impl RuntimeStateDoc {
             status_message: self.read_opt_str(&workstation, "status_message"),
             cpu_count: self.read_opt_u64(&workstation, "cpu_count"),
             memory_bytes: self.read_opt_u64(&workstation, "memory_bytes"),
+            accelerators: self.read_workstation_accelerators(&workstation),
             working_directory: self.read_opt_str(&workstation, "working_directory"),
             updated_at: self.read_opt_str(&workstation, "updated_at"),
             runtime_session_id: self.read_opt_str(&workstation, "runtime_session_id"),
@@ -2491,6 +2790,26 @@ impl RuntimeStateDoc {
         )?;
         self.put_optional_u64_at(&workstation, "cpu_count", state.cpu_count)?;
         self.put_optional_u64_at(&workstation, "memory_bytes", state.memory_bytes)?;
+        let accelerators = match state.accelerators.as_ref() {
+            Some(accelerators) => serde_json::Value::Array(
+                accelerators
+                    .iter()
+                    .map(|accelerator| {
+                        serde_json::json!({
+                            "kind": accelerator.kind,
+                            "vendor": accelerator.vendor,
+                            "model": accelerator.model,
+                            "count": accelerator.count,
+                            "memory_bytes_per_device": accelerator.memory_bytes_per_device,
+                            "readiness": accelerator.readiness,
+                            "diagnostic": accelerator.diagnostic,
+                        })
+                    })
+                    .collect(),
+            ),
+            None => serde_json::Value::Null,
+        };
+        automunge::update_json_at_key(&mut self.doc, &workstation, "accelerators", &accelerators)?;
         self.put_optional_str_at(
             &workstation,
             "working_directory",
@@ -2746,13 +3065,11 @@ impl RuntimeStateDoc {
         Ok(())
     }
 
-    /// Replace the full state for an existing comm.
+    /// Set a single property in the legacy RuntimeStateDoc comm-state slot.
     ///
-    /// Set a single property in a comm's state map.
-    ///
-    /// Writes directly to `comms/{comm_id}/state/{key}` as a native
-    /// Automerge value. This is the per-property write path used by
-    /// the frontend for CRDT-based widget updates.
+    /// RuntimeStateDoc still preserves this embedded state map for topology
+    /// snapshots and compatibility reads, but frontend CRDT widget writes go
+    /// through CommsDoc.
     pub fn set_comm_state_property(
         &mut self,
         comm_id: &str,
@@ -2925,6 +3242,72 @@ impl RuntimeStateDoc {
         comms
     }
 
+    // ── Bokeh document sessions ─────────────────────────────────────
+
+    /// Insert or atomically replace one Bokeh document session record.
+    ///
+    /// Large document and patch bytes must already be in blob storage. This
+    /// method writes only topology and replay references into RuntimeStateDoc.
+    pub fn put_bokeh_session(
+        &mut self,
+        session_id: &str,
+        session: &BokehSessionState,
+    ) -> Result<(), RuntimeStateError> {
+        let sessions = self.get_or_create_root_map("bokeh_sessions")?;
+        let value = serde_json::to_value(session).map_err(|error| {
+            RuntimeStateError::InvalidBokehSession(format!(
+                "failed to serialize Bokeh session {session_id}: {error}"
+            ))
+        })?;
+        automunge::put_json_at_key_batched(&mut self.doc, &sessions, session_id, &value)?;
+        Ok(())
+    }
+
+    /// Read one Bokeh document session record.
+    pub fn get_bokeh_session(&self, session_id: &str) -> Option<BokehSessionState> {
+        let sessions = self.get_map("bokeh_sessions")?;
+        let value = automunge::read_json_value(&self.doc, &sessions, session_id)?;
+        serde_json::from_value(value).ok()
+    }
+
+    /// Read all Bokeh document session records without projecting other state.
+    pub fn get_bokeh_sessions(&self) -> HashMap<String, BokehSessionState> {
+        let Some(sessions) = self.get_map("bokeh_sessions") else {
+            return HashMap::new();
+        };
+
+        self.doc
+            .keys(&sessions)
+            .filter_map(|session_id| {
+                self.get_bokeh_session(&session_id)
+                    .map(|session| (session_id, session))
+            })
+            .collect()
+    }
+
+    /// Freeze every connected session owned by a kernel that has gone away.
+    ///
+    /// Checkpoint and patch references are retained so mounted and remounting
+    /// clients can continue to display the last authoritative document state.
+    pub fn disconnect_bokeh_sessions_for_kernel(
+        &mut self,
+        kernel_id: &str,
+    ) -> Result<usize, RuntimeStateError> {
+        let sessions: Vec<(String, BokehSessionState)> = self
+            .get_bokeh_sessions()
+            .into_iter()
+            .filter(|(_, session)| {
+                session.kernel_id == kernel_id && session.status == BokehSessionStatus::Connected
+            })
+            .collect();
+        let count = sessions.len();
+        for (session_id, mut session) in sessions {
+            session.status = BokehSessionStatus::Disconnected;
+            self.put_bokeh_session(&session_id, &session)?;
+        }
+        Ok(count)
+    }
+
     /// Append an output manifest to a comm's outputs list (OutputModel widgets).
     ///
     /// Returns `false` if the comm doesn't exist.
@@ -2982,20 +3365,9 @@ impl RuntimeStateDoc {
         let kernel_state = kernel
             .as_ref()
             .map(|k| {
-                let lifecycle_key = self.read_str(k, "lifecycle");
-                let activity_key = self.read_str(k, "activity");
-                // Pre-typed docs (captured fixtures, `from_doc` with
-                // external bytes) only have the string shape.
-                // resolve_lifecycle falls back to it when the typed keys
-                // are missing.
+                let lifecycle = self.resolve_kernel_lifecycle(k);
                 let stored_status = self.read_str(k, "status");
                 let stored_starting_phase = self.read_str(k, "starting_phase");
-                let lifecycle = crate::types::resolve_lifecycle(
-                    &lifecycle_key,
-                    &activity_key,
-                    &stored_status,
-                    &stored_starting_phase,
-                );
                 // Project the resolved lifecycle back to the string
                 // shape for source-compat with pre-migration consumers.
                 // Always derive from the resolved lifecycle rather than
@@ -3096,6 +3468,7 @@ impl RuntimeStateDoc {
             .unwrap_or_default();
 
         let last_saved = self.read_opt_str(&ROOT, "last_saved");
+        let file_checkpoint = self.file_checkpoint();
         let path = self.read_opt_str(&ROOT, "path");
         let runtime_state_doc_id = self.runtime_state_doc_id();
         let workstation = self.workstation_attachment();
@@ -3116,6 +3489,7 @@ impl RuntimeStateDoc {
             .unwrap_or_default();
 
         let comms = self.get_comms();
+        let bokeh_sessions = self.get_bokeh_sessions();
 
         RuntimeState {
             runtime_state_doc_id,
@@ -3124,9 +3498,11 @@ impl RuntimeStateDoc {
             env: env_state,
             trust: trust_state,
             last_saved,
+            file_checkpoint,
             path,
             executions,
             comms,
+            bokeh_sessions,
             project_context: self.project_context(),
             workstation,
         }
@@ -3238,9 +3614,9 @@ impl RuntimeStateDoc {
 
     /// Receive a sync message with change stripping (read-only enforcement).
     ///
-    /// The daemon is the sole authority for runtime state. Any changes a
-    /// client embeds in its sync message are stripped — only the heads/need/have
-    /// handshake is processed so the client can catch up.
+    /// Regular notebook clients do not author RuntimeStateDoc changes over
+    /// sync. Any changes embedded in this path are stripped; only the
+    /// heads/need/have handshake is processed so the peer can catch up.
     pub fn receive_sync_message(
         &mut self,
         peer_state: &mut sync::State,
@@ -3305,11 +3681,13 @@ impl RuntimeStateDoc {
         )
     }
 
-    /// Receive a sync message accepting client writes.
+    /// Receive a sync message accepting policy-validated runtime writes.
     ///
-    /// Unlike `receive_sync_message()` which strips client changes, this
-    /// accepts the full message including any mutations the client made
-    /// (e.g., widget state updates written to `comms/*/state/*`).
+    /// Unlike `receive_sync_message()` which strips peer changes, this accepts
+    /// the full message after the caller has established that the peer is
+    /// allowed to author RuntimeStateDoc state, such as a `runtime_peer`
+    /// updating lifecycle/progress/output/topology for accepted work. Mutable
+    /// widget values belong to CommsDoc, not RuntimeStateDoc.
     ///
     /// Returns `true` if the document heads changed (i.e., client sent
     /// new changes, not just a handshake).
@@ -3888,6 +4266,30 @@ mod tests {
         })
     }
 
+    fn test_bokeh_session(status: BokehSessionStatus) -> BokehSessionState {
+        BokehSessionState {
+            output_id: "output-bokeh-1".to_string(),
+            cell_id: "cell-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            kernel_id: "kernel-1".to_string(),
+            status,
+            head_revision: 0,
+            producer_name: "panel".to_string(),
+            producer_version: "1.9.3".to_string(),
+            bokeh_version: "3.9.1".to_string(),
+            root_ids: vec!["p1001".to_string()],
+            checkpoint: Some(BokehSessionCheckpoint {
+                revision: 0,
+                content_ref: BokehSessionContentRef {
+                    blob: "checkpoint-0".to_string(),
+                    size: 512,
+                    media_type: "application/vnd.nteract.bokeh-checkpoint.v1+json".to_string(),
+                },
+            }),
+            patch_tail: Vec::new(),
+        }
+    }
+
     fn actor_label_from_id(actor: &ActorId) -> String {
         std::str::from_utf8(actor.to_bytes())
             .map(|s| s.to_string())
@@ -3905,6 +4307,15 @@ mod tests {
             status_message: Some("kernel attached".to_string()),
             cpu_count: Some(8),
             memory_bytes: Some(32 * 1024 * 1024 * 1024),
+            accelerators: Some(vec![WorkstationAcceleratorState {
+                kind: "gpu".to_string(),
+                vendor: Some("NVIDIA".to_string()),
+                model: Some("A100".to_string()),
+                count: 1,
+                memory_bytes_per_device: Some(80 * 1024 * 1024 * 1024),
+                readiness: "ready".to_string(),
+                diagnostic: None,
+            }]),
             working_directory: Some("/home/ubuntu/notebooks".to_string()),
             updated_at: Some("2026-06-07T21:00:00Z".to_string()),
             runtime_session_id: Some("job-123".to_string()),
@@ -3920,6 +4331,31 @@ mod tests {
             .filter(|change| actor_label_from_id(change.actor_id()) == actor_label)
             .map(|change| change.hash())
             .collect()
+    }
+
+    fn sync_runtime_docs(
+        a: &mut RuntimeStateDoc,
+        a_state: &mut sync::State,
+        b: &mut RuntimeStateDoc,
+        b_state: &mut sync::State,
+    ) {
+        for _ in 0..20 {
+            let a_msg = a.generate_sync_message(a_state);
+            if let Some(message) = a_msg.clone() {
+                b.receive_sync_message_with_changes(b_state, message)
+                    .expect("b receive runtime sync");
+            }
+
+            let b_msg = b.generate_sync_message(b_state);
+            if let Some(message) = b_msg.clone() {
+                a.receive_sync_message_with_changes(a_state, message)
+                    .expect("a receive runtime sync");
+            }
+
+            if a_msg.is_none() && b_msg.is_none() {
+                break;
+            }
+        }
     }
 
     #[test]
@@ -4163,6 +4599,106 @@ mod tests {
     }
 
     #[test]
+    fn file_checkpoint_defaults_for_frozen_v2_genesis() {
+        let doc = RuntimeStateDoc::new();
+
+        assert_eq!(doc.file_checkpoint(), FileCheckpointState::default());
+        assert_eq!(
+            doc.read_state().file_checkpoint,
+            FileCheckpointState::default()
+        );
+        assert!(doc.doc().get(ROOT, "file_checkpoint").unwrap().is_none());
+    }
+
+    #[test]
+    fn file_checkpoint_and_source_issue_round_trip_independently() {
+        let mut doc = RuntimeStateDoc::new();
+        let exported_heads = vec!["aa11".to_string(), "bb22".to_string()];
+
+        doc.set_file_checkpoint(&exported_heads, 7).unwrap();
+        assert_eq!(
+            doc.read_state().file_checkpoint,
+            FileCheckpointState {
+                exported_heads: exported_heads.clone(),
+                save_sequence: Some(7),
+                source_issue: None,
+            }
+        );
+
+        let conflict = FileSourceIssue::Conflict {
+            reason: "disk fingerprint changed while journal heads were unsaved".to_string(),
+        };
+        doc.set_file_source_issue(Some(&conflict)).unwrap();
+        assert_eq!(
+            doc.read_state().file_checkpoint.source_issue,
+            Some(conflict)
+        );
+
+        let degraded = FileSourceIssue::Degraded {
+            reason: "recovery journal flush failed".to_string(),
+        };
+        doc.set_file_source_issue(Some(&degraded)).unwrap();
+        doc.clear_file_checkpoint().unwrap();
+        assert_eq!(
+            doc.read_state().file_checkpoint,
+            FileCheckpointState {
+                exported_heads: Vec::new(),
+                save_sequence: None,
+                source_issue: Some(degraded),
+            }
+        );
+
+        doc.set_file_source_issue(None).unwrap();
+        assert_eq!(
+            doc.read_state().file_checkpoint,
+            FileCheckpointState::default()
+        );
+    }
+
+    #[test]
+    fn file_checkpoint_rejects_stale_async_completion() {
+        let mut doc = RuntimeStateDoc::new();
+        assert!(doc
+            .set_file_checkpoint(&["new-head".to_string()], 9)
+            .unwrap());
+        assert!(!doc
+            .set_file_checkpoint(&["old-head".to_string()], 8)
+            .unwrap());
+        assert_eq!(
+            doc.file_checkpoint(),
+            FileCheckpointState {
+                exported_heads: vec!["new-head".to_string()],
+                save_sequence: Some(9),
+                source_issue: None,
+            }
+        );
+    }
+
+    #[test]
+    fn file_checkpoint_serializes_to_the_client_runtime_state_shape() {
+        let mut doc = RuntimeStateDoc::new();
+        doc.set_file_checkpoint(&["cafebabe".to_string()], 12)
+            .unwrap();
+        doc.set_file_source_issue(Some(&FileSourceIssue::Conflict {
+            reason: "source and journal diverged".to_string(),
+        }))
+        .unwrap();
+
+        let value = serde_json::to_value(doc.read_state()).unwrap();
+        assert_eq!(
+            value.get("file_checkpoint"),
+            Some(&serde_json::json!({
+                "exported_heads": ["cafebabe"],
+                "save_sequence": 12,
+                "source_issue": {
+                    "kind": "conflict",
+                    "reason": "source and journal diverged",
+                },
+            }))
+        );
+    }
+
+    #[test]
     fn last_seen_defaults_to_none_on_a_fresh_doc() {
         // Not part of the frozen genesis scaffold: a fresh doc has no
         // last_seen, so viewers/the watchdog see "no peer has reported in".
@@ -4207,7 +4743,7 @@ mod tests {
     fn last_seen_is_runtime_peer_writable_but_blocked_for_editor() {
         // last_seen lives under `state.kernel`, so the existing kernel-ownership
         // policy governs it: a runtime_peer may write it, an editor/owner sync
-        // may not (it is part of the daemon/runtime-owned kernel snapshot). This
+        // may not (it is part of the runtime-authored kernel snapshot). This
         // pins that a liveness stamp can't be forged over an editor sync.
         use crate::policy::{
             runtime_state_policy_snapshot, validate_runtime_state_sync_scope,
@@ -4272,6 +4808,23 @@ mod tests {
         doc.set_workstation_attachment(None).unwrap();
         assert_eq!(doc.workstation_attachment(), None);
         assert_eq!(doc.read_state().workstation, None);
+    }
+
+    #[test]
+    fn workstation_accelerators_preserve_unknown_and_known_none() {
+        let mut doc = RuntimeStateDoc::new();
+        let mut attachment = workstation_attachment_fixture();
+
+        attachment.accelerators = None;
+        doc.set_workstation_attachment(Some(&attachment)).unwrap();
+        assert_eq!(doc.workstation_attachment().unwrap().accelerators, None);
+
+        attachment.accelerators = Some(Vec::new());
+        doc.set_workstation_attachment(Some(&attachment)).unwrap();
+        assert_eq!(
+            doc.workstation_attachment().unwrap().accelerators,
+            Some(Vec::new())
+        );
     }
 
     #[test]
@@ -4351,6 +4904,159 @@ mod tests {
         // Underlying activity key is cleared to "".
         let kernel = doc.get_map("kernel").unwrap();
         assert_eq!(doc.read_str(&kernel, "activity"), "");
+    }
+
+    #[test]
+    fn activity_republish_heals_stale_shutdown_after_wake_on_execute() {
+        let mut room =
+            RuntimeStateDoc::try_new_with_actor("owner@example.com/room-host:before").unwrap();
+        room.set_lifecycle(&RuntimeLifecycle::Running(KernelActivity::Idle))
+            .unwrap();
+        room.set_kernel_info("python", "python", "uv:current_python")
+            .unwrap();
+        room.set_runtime_agent_id("owner@example.com/runtime:kernel:old")
+            .unwrap();
+
+        let mut viewer = RuntimeStateDoc::try_new_with_actor("viewer@example.com/app:web").unwrap();
+        let mut room_viewer_state = sync::State::new();
+        let mut viewer_room_state = sync::State::new();
+        sync_runtime_docs(
+            &mut room,
+            &mut room_viewer_state,
+            &mut viewer,
+            &mut viewer_room_state,
+        );
+
+        let checkpoint_before_teardown = room.doc_mut().save();
+        for second in 0..30 {
+            room.set_last_seen(Some(&format!("2026-07-09T21:00:{second:02}Z")))
+                .unwrap();
+        }
+        room.set_queue(None, &[]).unwrap();
+        room.set_lifecycle(&RuntimeLifecycle::Shutdown).unwrap();
+        sync_runtime_docs(
+            &mut room,
+            &mut room_viewer_state,
+            &mut viewer,
+            &mut viewer_room_state,
+        );
+        assert_eq!(
+            viewer.read_state().kernel.lifecycle,
+            RuntimeLifecycle::Shutdown
+        );
+
+        let rehydrated = AutoCommit::load(&checkpoint_before_teardown).unwrap();
+        let mut room = RuntimeStateDoc::from_doc(rehydrated);
+        room.set_actor("owner@example.com/room-host:after");
+        let mut room_viewer_state = sync::State::new();
+        let mut viewer_room_state = sync::State::new();
+
+        let exec_id = "exec-after-wake";
+        room.create_execution_with_source_provenance(
+            exec_id,
+            "print('hi')",
+            1,
+            Some("owner@example.com/app:web"),
+            Some("cell-1"),
+        )
+        .unwrap();
+        room.set_queue(
+            None,
+            &[QueueEntry {
+                execution_id: exec_id.to_string(),
+            }],
+        )
+        .unwrap();
+
+        let mut agent =
+            RuntimeStateDoc::try_new_with_actor("owner@example.com/agent:runt:new").unwrap();
+        agent.set_last_seen(Some("2026-07-09T22:00:00Z")).unwrap();
+        let mut room_agent_state = sync::State::new();
+        let mut agent_room_state = sync::State::new();
+        sync_runtime_docs(
+            &mut room,
+            &mut room_agent_state,
+            &mut agent,
+            &mut agent_room_state,
+        );
+
+        agent.set_lifecycle(&RuntimeLifecycle::Launching).unwrap();
+        agent
+            .set_kernel_info("python", "python", "uv:current_python")
+            .unwrap();
+        agent
+            .set_runtime_agent_id("owner@example.com/runtime:kernel:new")
+            .unwrap();
+        agent
+            .set_lifecycle(&RuntimeLifecycle::Running(KernelActivity::Idle))
+            .unwrap();
+        agent.set_execution_running(exec_id).unwrap();
+        agent
+            .set_queue(
+                Some(&QueueEntry {
+                    execution_id: exec_id.to_string(),
+                }),
+                &[],
+            )
+            .unwrap();
+        agent.set_activity(KernelActivity::Busy).unwrap();
+        agent.set_execution_done(exec_id, true).unwrap();
+        agent.set_queue(None, &[]).unwrap();
+        agent.set_activity(KernelActivity::Idle).unwrap();
+
+        sync_runtime_docs(
+            &mut room,
+            &mut room_agent_state,
+            &mut agent,
+            &mut agent_room_state,
+        );
+        sync_runtime_docs(
+            &mut room,
+            &mut room_viewer_state,
+            &mut viewer,
+            &mut viewer_room_state,
+        );
+
+        let viewer_state = viewer.read_state();
+        assert_eq!(
+            viewer_state.kernel.lifecycle,
+            RuntimeLifecycle::Running(KernelActivity::Idle)
+        );
+        assert_eq!(
+            viewer_state
+                .executions
+                .get(exec_id)
+                .map(|execution| execution.status.as_str()),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn lifecycle_conflict_with_error_keeps_launch_failure_loud() {
+        let mut base = RuntimeStateDoc::new();
+        let mut failed = base.fork_with_actor("owner@example.com/runtime:kernel:failed");
+        let mut running = base.fork_with_actor("owner@example.com/runtime:kernel:running");
+
+        failed
+            .set_lifecycle_with_error_details(
+                &RuntimeLifecycle::Error,
+                None,
+                Some("Failed to launch kernel: missing ipykernel"),
+            )
+            .unwrap();
+        running
+            .set_lifecycle(&RuntimeLifecycle::Running(KernelActivity::Idle))
+            .unwrap();
+
+        base.merge(&mut running).unwrap();
+        base.merge(&mut failed).unwrap();
+
+        let state = base.read_state();
+        assert_eq!(state.kernel.lifecycle, RuntimeLifecycle::Error);
+        assert_eq!(
+            state.kernel.error_details.as_deref(),
+            Some("Failed to launch kernel: missing ipykernel")
+        );
     }
 
     #[test]
@@ -5374,6 +6080,50 @@ mod tests {
     }
 
     #[test]
+    fn isolated_transaction_error_rolls_back_document_and_output_cache() {
+        let mut doc = RuntimeStateDoc::new();
+        doc.create_execution("exec-1").unwrap();
+        doc.append_output("exec-1", &test_display("h1")).unwrap();
+        let heads = doc.get_heads();
+
+        let result: Result<(), RuntimeStateError> = doc.transact_at_heads_recovering(
+            &heads,
+            Some("rt:kernel:shared"),
+            "test-runtime-transaction-rollback",
+            |doc| {
+                doc.append_output("exec-1", &test_display("h2"))?;
+                doc.put_bokeh_session(
+                    "session-1",
+                    &test_bokeh_session(BokehSessionStatus::Connected),
+                )?;
+                Err(RuntimeStateError::InvalidBokehSession(
+                    "injected failure".to_string(),
+                ))
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(RuntimeStateError::InvalidBokehSession(_))
+        ));
+        assert_eq!(doc.get_outputs("exec-1"), vec![test_display("h1")]);
+        assert!(doc.get_bokeh_session("session-1").is_none());
+        assert_eq!(
+            doc.output_order_cache
+                .get("exec-1")
+                .expect("output order cache")
+                .next_seq,
+            1
+        );
+
+        doc.append_output("exec-1", &test_display("h3")).unwrap();
+        assert_eq!(
+            doc.get_outputs("exec-1"),
+            vec![test_display("h1"), test_display("h3")]
+        );
+    }
+
+    #[test]
     fn isolated_transaction_panic_restores_actor_and_keeps_doc_usable() {
         let mut doc = RuntimeStateDoc::new();
         doc.set_actor("runtime:original");
@@ -5892,6 +6642,98 @@ mod tests {
         let doc = RuntimeStateDoc::new();
         // No execution entry → empty outputs
         assert!(doc.get_outputs("nope").is_empty());
+    }
+
+    // ── Bokeh document session tests ─────────────────────────────
+
+    #[test]
+    fn bokeh_session_roundtrips_through_runtime_state() {
+        let mut doc = RuntimeStateDoc::new();
+        let session = test_bokeh_session(BokehSessionStatus::Connected);
+        doc.put_bokeh_session("session-1", &session).unwrap();
+
+        assert_eq!(doc.get_bokeh_session("session-1"), Some(session.clone()));
+        assert_eq!(
+            doc.read_state().bokeh_sessions.get("session-1"),
+            Some(&session)
+        );
+    }
+
+    #[test]
+    fn bokeh_session_replay_update_replaces_one_atomic_record() {
+        let mut doc = RuntimeStateDoc::new();
+        let mut session = test_bokeh_session(BokehSessionStatus::Connected);
+        doc.put_bokeh_session("session-1", &session).unwrap();
+
+        session.head_revision = 1;
+        session.patch_tail.push(BokehSessionPatchRef {
+            base_revision: 0,
+            revision: 1,
+            content_ref: BokehSessionContentRef {
+                blob: "patch-1".to_string(),
+                size: 128,
+                media_type: "application/vnd.nteract.bokeh-patch.v1+json".to_string(),
+            },
+        });
+        doc.put_bokeh_session("session-1", &session).unwrap();
+
+        assert_eq!(doc.get_bokeh_session("session-1"), Some(session));
+        assert_eq!(doc.get_bokeh_sessions().len(), 1);
+    }
+
+    #[test]
+    fn disconnect_bokeh_sessions_preserves_replay_state() {
+        let mut doc = RuntimeStateDoc::new();
+        let session = test_bokeh_session(BokehSessionStatus::Connected);
+        doc.put_bokeh_session("session-1", &session).unwrap();
+        doc.put_bokeh_session(
+            "session-other",
+            &BokehSessionState {
+                kernel_id: "kernel-2".to_string(),
+                ..session.clone()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            doc.disconnect_bokeh_sessions_for_kernel("kernel-1")
+                .unwrap(),
+            1
+        );
+        let disconnected = doc.get_bokeh_session("session-1").unwrap();
+        assert_eq!(disconnected.status, BokehSessionStatus::Disconnected);
+        assert_eq!(disconnected.checkpoint, session.checkpoint);
+        assert_eq!(disconnected.patch_tail, session.patch_tail);
+        assert_eq!(
+            doc.get_bokeh_session("session-other").unwrap().status,
+            BokehSessionStatus::Connected
+        );
+    }
+
+    #[test]
+    fn bokeh_sessions_sync_to_a_late_peer() {
+        let mut daemon = RuntimeStateDoc::new();
+        let session = test_bokeh_session(BokehSessionStatus::Connected);
+        daemon.put_bokeh_session("session-1", &session).unwrap();
+
+        let mut peer = RuntimeStateDoc::new_empty();
+        let mut daemon_sync = sync::State::new();
+        let mut peer_sync = sync::State::new();
+        for _ in 0..10 {
+            if let Some(message) = daemon.generate_sync_message(&mut daemon_sync) {
+                peer.doc_mut()
+                    .sync()
+                    .receive_sync_message(&mut peer_sync, message)
+                    .unwrap();
+            }
+            if let Some(message) = peer.generate_sync_message(&mut peer_sync) {
+                daemon
+                    .receive_sync_message(&mut daemon_sync, message)
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(peer.get_bokeh_session("session-1"), Some(session));
     }
 
     // ── Comm tests ────────────────────────────────────────────────
@@ -7196,22 +8038,18 @@ mod tests {
     }
 
     #[test]
-    fn set_activity_without_preceding_lifecycle_leaves_activity_stranded(
-    ) -> Result<(), RuntimeStateError> {
-        // set_activity does not transition the lifecycle — callers must
-        // have set Running(_) first. If they haven't, the CRDT ends up
-        // with lifecycle = "NotStarted" and activity = "Busy", which
-        // resolve_lifecycle reads as NotStarted (activity is ignored for
-        // non-Running variants). This is fine: the stranded activity is
-        // harmless, and the next set_lifecycle writes the correct state.
+    fn set_activity_republishes_running_lifecycle() -> Result<(), RuntimeStateError> {
+        // A real idle/busy signal is live-kernel evidence. It must publish the
+        // typed lifecycle as Running so read-only replicas can converge away
+        // from any retained terminal branch after room wake.
         let mut doc = RuntimeStateDoc::new();
         doc.set_activity(KernelActivity::Busy)?;
 
         let k = doc.read_state().kernel;
         assert_eq!(
             k.lifecycle,
-            RuntimeLifecycle::NotStarted,
-            "activity without a Running lifecycle has no effect on the typed read"
+            RuntimeLifecycle::Running(KernelActivity::Busy),
+            "activity must publish the running lifecycle"
         );
         Ok(())
     }

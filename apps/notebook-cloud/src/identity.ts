@@ -6,7 +6,11 @@ import {
   isConnectionScope,
   type ConnectionScope,
 } from "./auth-shared.ts";
-import { isLoopbackWorkerRequest, trustsLoopbackRequestHeaders } from "./loopback.ts";
+import {
+  isLoopbackHostname,
+  isLoopbackWorkerRequest,
+  trustsLoopbackRequestHeaders,
+} from "./loopback.ts";
 
 export {
   BEARER_AUTH_TOKEN_PROTOCOL_PREFIX,
@@ -59,11 +63,13 @@ export interface AuthenticatedConnectionMetadata {
     | "dev-token-header"
     | "dev-token-subprotocol"
     | "api-key-bearer"
+    | "host-session-cookie"
     | "oidc-bearer"
     | "oidc-subprotocol"
     | "workstation-credential-header";
   principalNamespace: string;
   displayName?: string;
+  avatarUrl?: string;
   email?: string;
   emailVerified?: boolean;
   workstationCredentialId?: string;
@@ -152,8 +158,10 @@ interface JwtPayload {
   iss?: string;
   name?: string;
   nbf?: number;
+  picture?: string;
   preferred_username?: string;
   sub?: string;
+  token_use?: string;
   ver?: string;
 }
 
@@ -161,7 +169,7 @@ const JWT_CLOCK_TOLERANCE_SECONDS = 60;
 const JWKS_CACHE_TTL_MS = 5 * 60 * 1000;
 const ANACONDA_API_KEY_CACHE_MAX_ENTRIES = 256;
 const ANACONDA_API_KEY_CACHE_TTL_MS = 60 * 1000;
-const OIDC_SUBJECT_MAX_LENGTH = 256;
+export const IDENTITY_SUBJECT_MAX_LENGTH = 256;
 const jwksCache = new Map<
   string,
   {
@@ -283,7 +291,7 @@ export async function authenticateOidcRequest(
   if (!subject) {
     throw new AuthError("OIDC token is missing sub", 401);
   }
-  if (subject.length > OIDC_SUBJECT_MAX_LENGTH) {
+  if (subject.length > IDENTITY_SUBJECT_MAX_LENGTH) {
     throw new AuthError("OIDC token sub is too long", 401);
   }
 
@@ -307,6 +315,7 @@ export async function authenticateOidcRequest(
       transport: credential.transport,
       principalNamespace: config.principalNamespace,
       ...(profile.displayName ? { displayName: profile.displayName } : {}),
+      ...(profile.avatarUrl ? { avatarUrl: profile.avatarUrl } : {}),
       ...(profile.email ? { email: profile.email } : {}),
       ...(profile.email ? { emailVerified: payload.email_verified === true } : {}),
     },
@@ -318,9 +327,11 @@ export async function authenticateOidcRequest(
 
 function profileFromOidcPayload(payload: JwtPayload): {
   displayName?: string;
+  avatarUrl?: string;
   email?: string;
 } {
   const email = payload.email?.trim() || undefined;
+  const avatarUrl = payload.picture?.trim() || undefined;
   const displayName =
     payload.name?.trim() ||
     [payload.given_name, payload.family_name]
@@ -332,6 +343,7 @@ function profileFromOidcPayload(payload: JwtPayload): {
 
   return {
     ...(displayName ? { displayName } : {}),
+    ...(avatarUrl ? { avatarUrl } : {}),
     ...(email ? { email } : {}),
   };
 }
@@ -461,7 +473,7 @@ async function fetchAnacondaApiKeyUserInfo(
   if (!subject) {
     throw new AuthError("Anaconda API key userinfo is missing user_id", 401);
   }
-  if (subject.length > OIDC_SUBJECT_MAX_LENGTH) {
+  if (subject.length > IDENTITY_SUBJECT_MAX_LENGTH) {
     throw new AuthError("Anaconda API key user_id is too long", 401);
   }
 
@@ -609,10 +621,11 @@ export function parseScope(value: string): ConnectionScope {
   throw new Error(`unknown connection scope: ${value}`);
 }
 
-// Capability predicates re-exported from the generated lattice
-// (`packages/runtimed/src/scope-capabilities.ts`); the daemon enforces the
-// same predicates from `nteract_identity::ConnectionScope`, so the hosted
-// room and the daemon cannot drift (punchlist HCA-2 / BS-12).
+// Capability predicates re-exported from the generated hosted-room lattice
+// (`packages/runtimed/src/scope-capabilities.ts`). The daemon shares the same
+// scope model but uses a local-only blob-upload predicate so same-UID editor
+// attachments can keep working until hosted editor uploads ship with
+// reference-path validation.
 export {
   allowsBlobUpload,
   allowsExecutionRequestSubmit,
@@ -770,6 +783,7 @@ function isMetadataTransport(value: string): value is AuthenticatedConnectionMet
     value === "dev-token-header" ||
     value === "dev-token-subprotocol" ||
     value === "api-key-bearer" ||
+    value === "host-session-cookie" ||
     value === "oidc-bearer" ||
     value === "oidc-subprotocol" ||
     value === "workstation-credential-header"
@@ -999,7 +1013,24 @@ function oidcAudiencesFromEnv(value: string | undefined, clientId: string): stri
 }
 
 function normalizeOidcIssuer(value: string): string {
-  return normalizeHttpsUrl(value, "OIDC issuer");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new AuthError("OIDC issuer must be a valid URL", 503);
+  }
+  // A real IdP is https and never loopback. Loopback issuers are the dev-only
+  // local OIDC issuer (packages/local-oidc, mounted under
+  // NOTEBOOK_CLOUD_LOCAL_OIDC) served over the http wrangler dev origin, so
+  // permit http there. Production config, which points at an https non-loopback
+  // issuer, is unaffected.
+  const loopbackHttp = url.protocol === "http:" && isLoopbackHostname(url.hostname);
+  if (url.protocol !== "https:" && !loopbackHttp) {
+    throw new AuthError("OIDC issuer must use https", 503);
+  }
+  url.hash = "";
+  url.search = "";
+  return url.href.replace(/\/+$/, "");
 }
 
 function normalizeHttpsUrl(value: string, label: string): string {
@@ -1166,6 +1197,14 @@ async function verifyWithAnySigningKey(
 function validateOidcJwtClaims(payload: JwtPayload, config: OidcConfig): void {
   if (payload.iss !== config.issuer) {
     throw new AuthError("OIDC token issuer is invalid", 401);
+  }
+
+  // A refresh token must not stand in for an access token. Providers that stamp
+  // `token_use` (including the local dev issuer) mark refresh tokens explicitly;
+  // a real access token carries "access" or omits the claim, so this only
+  // rejects a token that declares itself a refresh token.
+  if (payload.token_use === "refresh") {
+    throw new AuthError("OIDC token is not an access token", 401);
   }
 
   const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];

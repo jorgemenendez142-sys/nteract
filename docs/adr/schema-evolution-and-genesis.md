@@ -1,6 +1,6 @@
 # Notebook Schema Evolution and the Frozen Genesis
 
-**Status:** Draft, 2026-05-30.
+**Status:** Accepted, 2026-05-30; recovery boundary amended 2026-07-13.
 
 ## Context
 
@@ -31,7 +31,7 @@ zeroed the file. The fixes that landed:
 
 - #3134: `cargo xtask verify-genesis` + `wasm-ensure` assert the built wasm
   embeds the current seed bytes. The drift guard that keeps daemon and frontend
-  seeds matched. See [Automerge Fork Patches](automerge-fork-patches.md) for the
+  seeds matched. See [Automerge Fork Patches](../memos/automerge-fork-patches.md) for the
   related validation work.
 - #3179: autosave-zeroing data-loss guard (`load_failed` set-on-hazard). The
   safety net for failed loads.
@@ -126,8 +126,7 @@ host. Three behaviors then matter, demonstrated by tests in
    `schema_version()` accessor and the load-time classifier — instead resolve
    over the full conflict set (`get_all`) and take the max, so the observed
    version is monotonic. The fix is read-side: the CRDT still records the LWW
-   pick, so there is no write-back and no op-history growth. This was **SE-1**;
-   resolved as SE-1 in the retired cleanup punchlist (fix/se1-schema-version-monotonic-read).
+   pick, so there is no write-back and no op-history growth.
 
 3. **Divergent genesis breaks sync.** The original incident, at the sync layer.
    Guarded by #3134 (build-time drift) and #3192 (host hash-pinning). Any future
@@ -147,9 +146,15 @@ dropped at the `.ipynb` boundary. Additive cell data must live under
 4. A v5 build must tolerate a v6 doc (no downgrade, no migrate, no `.corrupt`).
    The bump cannot ship until that reader has propagated through the fleet.
 5. Structural change uses a sidecar, never an in-place reshape of the root.
-6. `.ipynb` is the truth on disk for saved notebooks; the `.automerge` is the
-   sole copy for untitled notebooks and the live sync substrate.
-7. `schema_version` is read through conflict-set max resolution, never a bare
+6. `.ipynb` is the user-visible exported truth for saved file-backed
+   checkpoints. A file-backed Automerge recovery journal is durable truth for
+   acknowledged heads not yet covered by `exported_heads`; it is never a
+   disposable import cache. Automerge remains the sole copy for untitled
+   notebooks and the live sync substrate for both kinds.
+7. File-backed recovery journals and staged imports must descend from the same
+   frozen genesis and retain their recorded change hashes; recovery must reject
+   a divergent root instead of merging it into the room.
+8. `schema_version` is read through conflict-set max resolution, never a bare
    `get`. A new read site must use `schema_version()` (or the same `get_all` +
    max), or a concurrent stale write can be read as a backward stamp.
 
@@ -169,5 +174,6 @@ merge point injects a daemon-authored change that desynchronizes peer sync state
 Host auth needs a room-host concept that does not exist yet and does nothing for
 desktop or already-diverged docs. Read-side max is deterministic (the conflict
 set is identical across converged peers), needs no auth, heals already-diverged
-docs on read, and never writes. The `.am` binary keeps the conflict; that is
-harmless because `.ipynb` is the on-disk truth and every reader resolves the max.
+docs on read, and never writes. Automerge recovery state keeps the conflict;
+that is harmless because every reader resolves the max and a committed
+`.ipynb` export records the resolved value at its causal `exported_heads`.

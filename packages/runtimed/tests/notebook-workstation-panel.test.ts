@@ -127,6 +127,138 @@ describe("projectNotebookWorkstationPanel", () => {
     expect(first.facts.find((fact) => fact.kind === "execution_state")?.tone).toBe("positive");
   });
 
+  it("projects accelerator readiness and invalidates the panel cache on GPU-only changes", () => {
+    const target = {
+      id: "gpu-box",
+      kind: "cloud_workstation" as const,
+      status: "ready" as const,
+      label: "GPU box",
+      statusLabel: "Ready",
+      providerLabel: "Workstation",
+      defaultEnvironmentLabel: "Current Python",
+      accelerators: [
+        {
+          kind: "gpu",
+          vendor: "NVIDIA",
+          model: "A100",
+          count: 1,
+          memory_bytes_per_device: 80 * 1024 ** 3,
+          readiness: "ready" as const,
+        },
+      ],
+    };
+    const ready = projectNotebookWorkstationPanel(
+      capabilities({ runtimeOverrides: { source: "cloud", target } }),
+    );
+    const notReady = projectNotebookWorkstationPanel(
+      capabilities({
+        runtimeOverrides: {
+          source: "cloud",
+          target: {
+            ...target,
+            accelerators: target.accelerators.map((accelerator) => ({
+              ...accelerator,
+              readiness: "not_ready" as const,
+              diagnostic: "NVIDIA driver is not visible to the workstation service.",
+            })),
+          },
+        },
+      }),
+    );
+
+    expect(ready.facts).toContainEqual({
+      detail: null,
+      kind: "accelerator",
+      label: "GPU",
+      subtle: false,
+      tone: "positive",
+      value: "1× NVIDIA A100 · 80 GiB",
+    });
+    expect(notReady).not.toBe(ready);
+    expect(notReady.facts).toContainEqual({
+      detail: "NVIDIA driver is not visible to the workstation service.",
+      kind: "accelerator",
+      label: "GPU",
+      subtle: false,
+      tone: "attention",
+      value: "1× NVIDIA A100 · 80 GiB",
+    });
+  });
+
+  it("retains neutral accelerator hardware facts for an offline target", () => {
+    const projection = projectNotebookWorkstationPanel(
+      capabilities({
+        runtimeOverrides: {
+          connected: false,
+          executionAvailable: false,
+          source: "cloud",
+          target: {
+            id: "gpu-box",
+            kind: "cloud_workstation",
+            status: "offline",
+            label: "GPU box",
+            statusLabel: "Offline",
+            providerLabel: "Workstation",
+            defaultEnvironmentLabel: "Current Python",
+            accelerators: [
+              {
+                kind: "gpu",
+                vendor: "NVIDIA",
+                model: "A100",
+                count: 1,
+                memory_bytes_per_device: 80 * 1024 ** 3,
+                readiness: "ready",
+              },
+            ],
+          },
+        },
+      }),
+    );
+
+    expect(projection.facts).toContainEqual({
+      detail: null,
+      kind: "accelerator",
+      label: "GPU",
+      subtle: false,
+      tone: "neutral",
+      value: "1× NVIDIA A100 · 80 GiB",
+    });
+  });
+
+  it("retains accelerator attention while a target is connecting", () => {
+    const projection = projectNotebookWorkstationPanel(
+      capabilities({
+        runtimeOverrides: {
+          connected: false,
+          executionAvailable: false,
+          source: "cloud",
+          target: {
+            id: "gpu-box",
+            kind: "cloud_workstation",
+            status: "connecting",
+            label: "GPU box",
+            statusLabel: "Connecting",
+            providerLabel: "Workstation",
+            defaultEnvironmentLabel: "Current Python",
+            accelerators: [
+              {
+                kind: "gpu",
+                vendor: "NVIDIA",
+                model: "A100",
+                count: 1,
+                readiness: "not_ready",
+              },
+            ],
+          },
+        },
+      }),
+    );
+
+    expect(projection.facts.find((fact) => fact.kind === "accelerator")).toMatchObject({
+      tone: "attention",
+    });
+  });
+
   it("projects missing cloud workstations as offline without identity facts", () => {
     const projection = projectNotebookWorkstationPanel(
       capabilities({
@@ -218,10 +350,14 @@ describe("projectNotebookWorkstationPanel", () => {
       status: "attention" as const,
       label: "Lab2",
       statusLabel: "Needs attention",
-      detail:
-        "runtime peer disconnected: runtime peer left the room and did not return within the grace window",
+      detail: "Room link lost: no compute session is currently attached to the room.",
       providerLabel: "Workstation",
       defaultEnvironmentLabel: "Current Python",
+      roomLink: {
+        status: "lost" as const,
+        statusLabel: "Lost",
+        lastSeenAt: "2026-06-07T21:02:00Z",
+      },
     };
     const ownerProjection = projectNotebookWorkstationPanel(
       capabilities({
@@ -257,6 +393,39 @@ describe("projectNotebookWorkstationPanel", () => {
     );
     expect(ownerProjection.detail).not.toContain("runtime peer");
     expect(viewerProjection.detail).not.toContain("grace window");
+    expect(ownerProjection.facts.map((fact) => [fact.kind, fact.label, fact.value])).toContainEqual(
+      ["room_link", "Room link", "Lost - last seen 2026-06-07T21:02:00Z"],
+    );
     expect(ownerProjection).not.toBe(viewerProjection);
+  });
+
+  it("projects compute-disconnected attachment details as friendly stale copy", () => {
+    const projection = projectNotebookWorkstationPanel(
+      capabilities({
+        accessOverrides: { level: "owner", source: "cloud" },
+        authOverrides: { canUseAuthenticatedIdentity: true },
+        runtimeOverrides: {
+          canWriteRuntimeState: false,
+          connected: false,
+          executionAvailable: false,
+          source: "cloud",
+          target: {
+            id: "ws-lab2",
+            kind: "cloud_workstation",
+            status: "attention",
+            label: "Lab2",
+            statusLabel: "Needs attention",
+            detail: "compute disconnected: expired pending attach job",
+            providerLabel: "Workstation",
+            defaultEnvironmentLabel: "Current Python",
+          },
+        },
+      }),
+    );
+
+    expect(projection.detail).toBe(
+      "Compute from Lab2 is no longer connected to this notebook. Start compute again from an available workstation.",
+    );
+    expect(projection.detail).not.toContain("expired pending attach job");
   });
 });

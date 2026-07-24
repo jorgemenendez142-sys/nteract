@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use runtimed::client::PoolClient;
 use runtimed::daemon::{Daemon, DaemonConfig};
 use runtimed::service::ServiceManager;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "runtimed")]
@@ -190,13 +190,18 @@ enum Commands {
         /// jobs pass their job id here so the room can fence stale peers.
         #[arg(long)]
         runtime_session_id: Option<String>,
+        /// Whether the initial current-Python launch runs on attach or waits for
+        /// synced execution intent.
+        #[arg(long, value_parser = ["attach", "execute"], default_value = "attach")]
+        launch_mode: String,
     },
 
     /// Serve this machine as a workstation for a hosted nteract cloud:
-    /// register/heartbeat, poll attach jobs, and spawn one
-    /// `cloud-runtime-agent` runtime peer per job. The workstation credential
-    /// is read from RUNT_CLOUD_TOKEN (never argv); `runt workstation connect`
-    /// stores it and `runt workstation run` launches this subcommand.
+    /// register/heartbeat, keep a hibernatable attach-job wakeup socket open, and
+    /// spawn one `cloud-runtime-agent` runtime peer per job. Polling remains
+    /// the fallback path. The workstation credential is read from
+    /// RUNT_CLOUD_TOKEN (never argv); `runt workstation connect` stores it and
+    /// `runt workstation run` launches this subcommand.
     #[command(name = "workstation-agent")]
     WorkstationAgent {
         /// Base URL of the notebook cloud (https/http).
@@ -555,6 +560,7 @@ async fn main() -> anyhow::Result<()> {
             workstation_id,
             workstation_display_name,
             runtime_session_id,
+            launch_mode,
         }) => {
             let cli_args = runtimed::workstation::CloudAgentArgs {
                 cloud_url,
@@ -609,19 +615,32 @@ async fn main() -> anyhow::Result<()> {
                         operator,
                         workstation: Some(workstation_metadata),
                     };
+                    let launch_trigger = match launch_mode.as_str() {
+                        "execute" => runtimed::runtime_agent::LaunchTrigger::OnFirstExecution,
+                        "attach" => runtimed::runtime_agent::LaunchTrigger::OnAttach,
+                        _ => unreachable!("clap validates launch-mode"),
+                    };
                     runtimed::workstation::allocate_current_python_runtime(
-                        target,
-                        config.auth,
-                        python_path,
-                        notebook_path,
-                        launch_working_dir,
-                        std::collections::HashMap::new(),
-                        blob_root,
+                        runtimed::workstation::CurrentPythonLaunchSpec {
+                            target,
+                            auth: config.auth,
+                            python_path,
+                            notebook_path,
+                            working_dir: launch_working_dir,
+                            env_vars: std::collections::HashMap::new(),
+                            blob_root,
+                            launch_trigger,
+                        },
                     )
                     .await
                 }
                 // Attach-only: wait for an inbound launch (req #5, deferred).
                 None => {
+                    if launch_mode == "execute" {
+                        warn!(
+                            "[cloud-runtime-agent] --launch-mode execute ignored without --python-path; attaching without an initial launch template"
+                        );
+                    }
                     runtimed::runtime_agent::run_cloud_runtime_agent(
                         config, operator, blob_root, None,
                     )
@@ -778,15 +797,22 @@ async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             // Signal registration failure is a fundamental OS issue with no recovery
             let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT");
 
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    early_log("Received SIGTERM, initiating shutdown");
+            loop {
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        early_log("Received SIGTERM, initiating shutdown");
+                    }
+                    _ = sigint.recv() => {
+                        early_log("Received SIGINT, initiating shutdown");
+                    }
                 }
-                _ = sigint.recv() => {
-                    early_log("Received SIGINT, initiating shutdown");
+                match shutdown_daemon.trigger_shutdown().await {
+                    Ok(()) => break,
+                    Err(error) => early_log(&format!(
+                        "Clean shutdown blocked; daemon remains available for recovery: {error}"
+                    )),
                 }
             }
-            shutdown_daemon.trigger_shutdown().await;
         });
     }
 
@@ -857,8 +883,7 @@ async fn status(json: bool) -> anyhow::Result<()> {
     let manager = ServiceManager::default();
     let installed = manager.is_installed();
 
-    // Check if daemon is running — socket-first with `daemon.json`
-    // fallback so custom `--socket` daemons stay discoverable.
+    // Check if daemon is running by querying live metadata over the socket.
     let daemon_info =
         runtimed_client::singleton::query_daemon_info(runt_workspace::default_socket_path()).await;
     let running = if daemon_info.is_some() {

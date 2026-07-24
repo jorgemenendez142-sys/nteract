@@ -220,6 +220,89 @@ test("cloud shell capabilities prefer RuntimeStateDoc workstation attachment ove
   assert.equal(capabilities.canExecute, true);
 });
 
+test("cloud shell capabilities require live runtime peer presence for executable attachments", () => {
+  const capabilities = cloudNotebookShellCapabilities({
+    authState: authState("oidc", "owner"),
+    connectionScope: "owner",
+    hasCodeCells: true,
+    selectedMode: "edit",
+    runtimeAvailable: false,
+    runtimePeerCount: 0,
+    runtimeLastSeenAt: "2026-06-07T21:02:00Z",
+    workstationAttachment: {
+      workstation_id: "ws-lab2",
+      display_name: "Lab 2",
+      provider: "local_daemon",
+      default_environment_label: "Current Python",
+      environment_policy: "current_python",
+      status: "ready",
+      status_message: null,
+      cpu_count: 8,
+      memory_bytes: 32 * 1024 ** 3,
+      working_directory: "/home/ubuntu/notebooks",
+      updated_at: "2026-06-07T21:00:00Z",
+    },
+  });
+
+  assert.equal(capabilities.runtime.connected, true);
+  assert.equal(capabilities.runtime.executionAvailable, false);
+  assert.equal(capabilities.runtime.target?.id, "ws-lab2");
+  assert.equal(capabilities.runtime.target?.label, "Lab 2");
+  assert.equal(capabilities.runtime.target?.status, "attention");
+  assert.equal(capabilities.runtime.target?.statusLabel, "Needs attention");
+  assert.equal(
+    capabilities.runtime.target?.detail,
+    "Room link lost: no compute session is currently attached to the room.",
+  );
+  assert.equal(capabilities.runtime.target?.runtimePeerCount, null);
+  assert.deepEqual(capabilities.runtime.target?.roomLink, {
+    status: "lost",
+    statusLabel: "Lost",
+    lastSeenAt: "2026-06-07T21:02:00Z",
+  });
+  assert.equal(capabilities.canExecute, false);
+});
+
+test("cloud shell capabilities let owners run to wake an idle attachment without claiming connectivity", () => {
+  const capabilities = cloudNotebookShellCapabilities({
+    authState: authState("oidc", "owner"),
+    connectionScope: "owner",
+    hasCodeCells: true,
+    selectedMode: "edit",
+    runtimeAvailable: false,
+    runtimePeerCount: 0,
+    runtimeLastSeenAt: "2026-06-07T21:02:00Z",
+    workstationAttachment: {
+      workstation_id: "ws-lab2",
+      display_name: "Lab 2",
+      provider: "local_daemon",
+      default_environment_label: "Current Python",
+      environment_policy: "current_python",
+      status: "idle",
+      status_message: null,
+      cpu_count: 8,
+      memory_bytes: 32 * 1024 ** 3,
+      working_directory: "/home/ubuntu/notebooks",
+      updated_at: "2026-06-07T21:00:00Z",
+    },
+  });
+
+  assert.equal(capabilities.runtime.connected, false);
+  assert.equal(capabilities.runtime.executionAvailable, true);
+  assert.equal(capabilities.runtime.target?.id, "ws-lab2");
+  assert.equal(capabilities.runtime.target?.label, "Lab 2");
+  assert.equal(capabilities.runtime.target?.status, "attached");
+  assert.equal(capabilities.runtime.target?.attachmentIdle, true);
+  assert.equal(capabilities.runtime.target?.statusLabel, "Idle");
+  assert.equal(
+    capabilities.runtime.target?.detail,
+    "Compute is attached and starts on the next run.",
+  );
+  assert.equal(capabilities.runtime.target?.runtimePeerCount, null);
+  assert.equal(capabilities.runtime.target?.roomLink, null);
+  assert.equal(capabilities.canExecute, true);
+});
+
 test("cloud shell capabilities surface RuntimeStateDoc kernel status on workstation targets", () => {
   const capabilities = cloudNotebookShellCapabilities({
     authState: authState("oidc", "owner"),
@@ -336,6 +419,7 @@ test("cloud shell capabilities hide execution in view mode even for owners with 
     connectionScope: "owner",
     hasCodeCells: true,
     selectedMode: "view",
+    runtimePeerCount: 1,
     workstationAttachment: {
       workstation_id: "ws-lab2",
       display_name: "Lab 2",
@@ -355,6 +439,7 @@ test("cloud shell capabilities hide execution in view mode even for owners with 
     connectionScope: "owner",
     hasCodeCells: true,
     selectedMode: "edit",
+    runtimePeerCount: 1,
     workstationAttachment: {
       workstation_id: "ws-lab2",
       display_name: "Lab 2",
@@ -674,6 +759,55 @@ test("cloud shell capabilities prefer OIDC display names and pictures over raw e
   assert.equal(capabilities.access.actor?.principal.imageUrl, "https://profiles.example/alice.png");
 });
 
+test("cloud shell capabilities prefer store-resolved self display over auth claims", () => {
+  const capabilities = cloudNotebookShellCapabilities({
+    authState: authState("oidc", "owner", {
+      sub: "anaconda-user-123",
+      email: "alice@example.com",
+      email_verified: true,
+      name: "Alice Claims",
+      picture: "https://profiles.example/claims.png",
+    }),
+    selfDisplay: {
+      label: "Alice Profile",
+      imageUrl: "https://profiles.example/profile.png",
+    },
+    connectionScope: "owner",
+    connectionActorLabel: "user:anaconda:alice/browser:tab",
+    hasCodeCells: false,
+  });
+
+  assert.equal(capabilities.access.identityLabel, "Alice Profile");
+  assert.equal(capabilities.access.actor?.principal.label, "Alice Profile");
+  assert.equal(
+    capabilities.access.actor?.principal.imageUrl,
+    "https://profiles.example/profile.png",
+  );
+});
+
+test("cloud shell capabilities fall back to auth display when self display is absent", () => {
+  const capabilities = cloudNotebookShellCapabilities({
+    authState: authState("oidc", "editor", {
+      sub: "anaconda-user-123",
+      email: "alice@example.com",
+      email_verified: true,
+      name: "Alice Claims",
+      picture: "https://profiles.example/claims.png",
+    }),
+    connectionScope: "editor",
+    connectionActorLabel: "user:anaconda:alice/browser:tab",
+    hasCodeCells: false,
+    selectedMode: "edit",
+  });
+
+  assert.equal(capabilities.access.identityLabel, "Alice Claims");
+  assert.equal(capabilities.access.actor?.principal.label, "Alice Claims");
+  assert.equal(
+    capabilities.access.actor?.principal.imageUrl,
+    "https://profiles.example/claims.png",
+  );
+});
+
 test("cloud shell capabilities return stable frozen objects for equivalent inputs", () => {
   const oidcClaims = {
     sub: "anaconda-user-123",
@@ -684,6 +818,10 @@ test("cloud shell capabilities return stable frozen objects for equivalent input
   };
   const first = cloudNotebookShellCapabilities({
     authState: authState("oidc", "owner", oidcClaims),
+    selfDisplay: {
+      label: "Alice Profile",
+      imageUrl: "https://profiles.example/profile.png",
+    },
     connectionScope: "owner",
     connectionActorLabel: "user:anaconda:alice/browser:tab",
     hasCodeCells: true,
@@ -693,6 +831,10 @@ test("cloud shell capabilities return stable frozen objects for equivalent input
   });
   const second = cloudNotebookShellCapabilities({
     authState: authState("oidc", "owner", { ...oidcClaims }),
+    selfDisplay: {
+      label: "Alice Profile",
+      imageUrl: "https://profiles.example/profile.png",
+    },
     connectionScope: "owner",
     connectionActorLabel: "user:anaconda:alice/browser:tab",
     hasCodeCells: true,

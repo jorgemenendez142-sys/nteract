@@ -3,10 +3,16 @@ import { describe, it } from "node:test";
 
 import type { CloudPrototypeAuthState } from "../viewer/collaborator-auth";
 import {
+  CLOUD_WORKSTATION_DEBIAN_PREP_COMMAND,
+  CLOUD_WORKSTATION_HEADLESS_INSTALL_COMMAND,
+  CLOUD_WORKSTATION_PATH_EXPORT_COMMAND,
   CLOUD_WORKSTATIONS_ACTIVE_REFRESH_INTERVAL_MS,
   CLOUD_WORKSTATIONS_ATTACH_REFRESH_INTERVAL_MS,
   cloudWorkstationConnectCommand,
+  cloudWorkstationPairingCommands,
   cloudWorkstationRefreshIntervalMs,
+  cloudWorkstationRunCommand,
+  cloudWorkstationServiceInstallCommand,
   fetchCloudWorkstationPairingStatus,
   fetchCloudWorkstations,
   mintCloudWorkstationPairingCode,
@@ -40,6 +46,10 @@ describe("cloud workstations client", () => {
             provider: "runtime_peer",
             provider_label: "Runtime peer",
             status: "online",
+            installed_build: "0.1.0+abc123",
+            channel: "nightly",
+            latest_build: "0.2.0-nightly.202607091009",
+            is_outdated: true,
             default_environment_label: "Current Python",
             environment_policy: "current_python",
             working_directory: "/home/ubuntu/project",
@@ -69,11 +79,16 @@ describe("cloud workstations client", () => {
       providerLabel: "Runtime peer",
       status: "online",
       statusMessage: null,
+      installedBuild: "0.1.0+abc123",
+      channel: "nightly",
+      latestBuild: "0.2.0-nightly.202607091009",
+      isOutdated: true,
       defaultEnvironmentLabel: "Current Python",
       environmentPolicy: "current_python",
       workingDirectory: "/home/ubuntu/project",
       cpuCount: 8,
       memoryBytes: 16000000000,
+      accelerators: null,
       updatedAt: null,
       environments: [
         {
@@ -88,6 +103,79 @@ describe("cloud workstations client", () => {
       ],
     });
     assert.equal(Object.hasOwn(state.workstations[0], "owner_principal"), false);
+  });
+
+  it("preserves usable, not-ready, known-none, and older-agent accelerator semantics", async (t) => {
+    t.mock.method(globalThis, "fetch", async () =>
+      jsonResponse({
+        workstations: [
+          {
+            workstation_id: "ws-gpu",
+            display_name: "GPU box",
+            accelerators: [
+              {
+                kind: "gpu",
+                vendor: "NVIDIA",
+                model: "A100",
+                count: 2,
+                memory_bytes_per_device: 80 * 1024 ** 3,
+                readiness: "ready",
+              },
+            ],
+          },
+          {
+            workstation_id: "ws-attention",
+            display_name: "Driver attention",
+            accelerators: [
+              {
+                kind: "gpu",
+                vendor: "AMD",
+                model: "MI300X",
+                count: 1,
+                readiness: "not_ready",
+                diagnostic: "ROCm runtime is not available to the workstation service.",
+              },
+            ],
+          },
+          {
+            workstation_id: "ws-cpu",
+            display_name: "CPU box",
+            accelerators: [],
+          },
+          {
+            workstation_id: "ws-legacy",
+            display_name: "Older agent",
+          },
+        ],
+      }),
+    );
+
+    const state = await fetchCloudWorkstations("/api/workstations", devAuth);
+
+    assert.deepEqual(state.workstations[0]?.accelerators, [
+      {
+        kind: "gpu",
+        vendor: "NVIDIA",
+        model: "A100",
+        count: 2,
+        memory_bytes_per_device: 80 * 1024 ** 3,
+        readiness: "ready",
+        diagnostic: null,
+      },
+    ]);
+    assert.deepEqual(state.workstations[1]?.accelerators, [
+      {
+        kind: "gpu",
+        vendor: "AMD",
+        model: "MI300X",
+        count: 1,
+        memory_bytes_per_device: null,
+        readiness: "not_ready",
+        diagnostic: "ROCm runtime is not available to the workstation service.",
+      },
+    ]);
+    assert.deepEqual(state.workstations[2]?.accelerators, []);
+    assert.equal(state.workstations[3]?.accelerators, null);
   });
 
   it("sends default workstation selection through the configured endpoint", async (t) => {
@@ -112,6 +200,7 @@ describe("cloud workstations client", () => {
       return jsonResponse({
         job: {
           job_id: "job-1",
+          workstation_id: "ws-lab2",
           status: "pending",
         },
       });
@@ -123,7 +212,7 @@ describe("cloud workstations client", () => {
         devAuth,
         "ws-lab2",
       ),
-      { jobId: "job-1", status: "pending" },
+      { jobId: "job-1", status: "pending", workstationId: "ws-lab2" },
     );
   });
 
@@ -139,6 +228,7 @@ describe("cloud workstations client", () => {
       return jsonResponse({
         job: {
           job_id: "job-restart",
+          workstation_id: "ws-lab2",
           status: "pending",
         },
       });
@@ -151,7 +241,7 @@ describe("cloud workstations client", () => {
         "ws-lab2",
         { replaceExisting: true },
       ),
-      { jobId: "job-restart", status: "pending" },
+      { jobId: "job-restart", status: "pending", workstationId: "ws-lab2" },
     );
   });
 
@@ -261,10 +351,50 @@ describe("cloud workstations client", () => {
     );
   });
 
-  it("builds the connect one-liner from origin and code", () => {
+  it("builds the workstation pairing command from origin and code", () => {
     assert.equal(
       cloudWorkstationConnectCommand("https://preview.runt.run", "ABCD-EFGH-JKMN"),
-      "runt workstation connect https://preview.runt.run --code ABCD-EFGH-JKMN && runt workstation run",
+      "runt workstation connect https://preview.runt.run --code ABCD-EFGH-JKMN",
+    );
+  });
+
+  it("builds copyable workstation setup commands from origin and code", () => {
+    assert.deepEqual(
+      cloudWorkstationPairingCommands("https://preview.runt.run", "ABCD-EFGH-JKMN"),
+      [
+        {
+          id: "debian-prep",
+          label: "Fresh Debian/Ubuntu only",
+          command: CLOUD_WORKSTATION_DEBIAN_PREP_COMMAND,
+          optional: true,
+        },
+        {
+          id: "install",
+          label: "Install nteract headless",
+          command: CLOUD_WORKSTATION_HEADLESS_INSTALL_COMMAND,
+        },
+        {
+          id: "path",
+          label: "Use installed CLI in this shell",
+          command: CLOUD_WORKSTATION_PATH_EXPORT_COMMAND,
+        },
+        {
+          id: "connect",
+          label: "Pair this workstation",
+          command: "runt workstation connect https://preview.runt.run --code ABCD-EFGH-JKMN",
+        },
+        {
+          id: "run",
+          label: "Linux user systemd service",
+          command: cloudWorkstationServiceInstallCommand(),
+        },
+        {
+          id: "foreground-run",
+          label: "macOS/non-systemd fallback",
+          command: cloudWorkstationRunCommand(),
+          optional: true,
+        },
+      ],
     );
   });
 });

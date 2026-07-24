@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import {
   Check,
+  ChevronDown,
   CircleAlert,
   CircleCheck,
   Cloud,
   Copy,
+  Cpu,
   FolderOpen,
   Gauge,
   MemoryStick,
@@ -33,10 +35,18 @@ import { cn } from "@/lib/utils";
 export interface NotebookWorkstationPairingView {
   code: string;
   connectCommand: string;
+  commands?: readonly NotebookWorkstationPairingCommandView[];
   expiresAt: string;
   status: "pending" | "redeemed" | "registered" | "expired";
   workstationName: string | null;
   error: string | null;
+}
+
+export interface NotebookWorkstationPairingCommandView {
+  id: string;
+  label: string;
+  command: string;
+  optional?: boolean;
 }
 
 export interface NotebookWorkstationsPanelProps {
@@ -233,6 +243,23 @@ function WorkstationPairingCard({
   onCancel?: () => void;
   onRestart?: () => void;
 }) {
+  const structuredCommands =
+    pairing.commands && pairing.commands.length > 0 ? pairing.commands : null;
+  const hasStructuredCommands = structuredCommands !== null;
+  const pairingCommands: readonly NotebookWorkstationPairingCommandView[] = structuredCommands ?? [
+    {
+      id: "connect",
+      label: "Connect workstation",
+      command: pairing.connectCommand,
+    },
+  ];
+  const hasServiceCommand = pairingCommands.some((command) =>
+    command.command.includes("workstation service"),
+  );
+  const hasForegroundFallback = pairingCommands.some((command) => command.id === "foreground-run");
+  const hasAdditionalCommands = pairingCommands.some((command) => command.optional === true);
+  const serviceHelpText = pairingCommandHelpText(hasServiceCommand, hasForegroundFallback);
+
   return (
     <section
       className="space-y-2 rounded-md border border-border/70 px-2.5 py-2"
@@ -256,13 +283,24 @@ function WorkstationPairingCard({
       </div>
 
       {pairing.status === "registered" ? (
-        <div className="space-y-2 text-xs" aria-live="polite">
+        <div className="space-y-2 text-xs">
           <div className="flex min-w-0 items-center gap-2 text-foreground">
             <CircleCheck className="size-4 shrink-0 text-emerald-500" aria-hidden="true" />
-            <span data-testid="workstation-pairing-status">
+            <span data-testid="workstation-pairing-status" aria-live="polite">
               {pairing.workstationName ?? "Workstation"} is connected.
             </span>
           </div>
+          {hasStructuredCommands ? (
+            <div className="space-y-2">
+              <p className="leading-5 text-muted-foreground">
+                Finish setup with the keep-available command if you have not run it yet:
+              </p>
+              <PairingCommandList commands={pairingCommands} />
+              {hasAdditionalCommands ? null : (
+                <p className="leading-5 text-muted-foreground">{serviceHelpText}</p>
+              )}
+            </div>
+          ) : null}
           {onCancel ? (
             <Button type="button" variant="secondary" size="sm" onClick={onCancel}>
               Done
@@ -286,12 +324,19 @@ function WorkstationPairingCard({
       ) : (
         <div className="space-y-2 text-xs">
           <p className="leading-5 text-muted-foreground">
-            Run this on the machine you want to attach:
+            {pairingCommands.length === 1
+              ? "Run this in a terminal on the machine you want to attach:"
+              : "Run these in a terminal on the machine you want to attach:"}
           </p>
-          <PairingCommand command={pairing.connectCommand} />
+          <PairingCommandList commands={pairingCommands} />
+          {hasAdditionalCommands ? null : (
+            <p className="leading-5 text-muted-foreground">{serviceHelpText}</p>
+          )}
           <p className="leading-5 text-muted-foreground" aria-live="polite">
             {pairing.status === "redeemed" ? (
-              <span data-testid="workstation-pairing-status">Machine connected — registering…</span>
+              <span data-testid="workstation-pairing-status">
+                Machine connected; registering...
+              </span>
             ) : (
               <span data-testid="workstation-pairing-status">
                 Waiting for the machine to connect.
@@ -305,7 +350,146 @@ function WorkstationPairingCard({
   );
 }
 
-function PairingCommand({ command }: { command: string }) {
+function pairingCommandHelpText(
+  hasServiceCommand: boolean,
+  hasForegroundFallback: boolean,
+): string {
+  if (hasServiceCommand && hasForegroundFallback) {
+    return "The Linux service command keeps this workstation available. Use the foreground fallback in tmux for macOS, non-systemd hosts, or manual testing.";
+  }
+  if (hasServiceCommand) {
+    return "The Linux service command keeps this workstation available after pairing.";
+  }
+  return "Keep the command running until the workstation appears in the panel.";
+}
+
+export function PairingCommandList({
+  commands,
+}: {
+  commands: readonly NotebookWorkstationPairingCommandView[];
+}) {
+  const requiredCommands = commands.filter((command) => command.optional !== true);
+  const primaryCommands = requiredCommands.length > 0 ? requiredCommands : commands;
+  const additionalCommands =
+    requiredCommands.length > 0 ? commands.filter((command) => command.optional === true) : [];
+  const hasAdditionalCommands = additionalCommands.length > 0;
+  const additionalPanelId = useId();
+  const [additionalOpen, setAdditionalOpen] = useState(false);
+  const bulkCommandText = primaryCommands.map((command) => command.command).join("\n");
+  const hasLinuxServiceBundle = commands.some((command) =>
+    command.command.includes("workstation service"),
+  );
+  const hasForegroundFallback = commands.some((command) => command.id === "foreground-run");
+  const copyLabel = hasLinuxServiceBundle
+    ? "Linux workstation setup commands"
+    : "workstation setup commands";
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) {
+      return;
+    }
+    const timer = window.setTimeout(() => setCopied(false), 2_000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  return (
+    <div className="space-y-1.5" data-testid="workstation-pairing-command-list">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10.5px] font-medium uppercase tracking-normal text-muted-foreground">
+          Setup commands
+        </span>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-7 shrink-0"
+          aria-label={copied ? `Copied ${copyLabel}` : `Copy ${copyLabel}`}
+          title={copied ? "Copied" : `Copy ${copyLabel}`}
+          disabled={!bulkCommandText}
+          onClick={() => {
+            void navigator.clipboard.writeText(bulkCommandText).then(() => setCopied(true));
+          }}
+        >
+          {copied ? (
+            <Check className="size-3.5 text-emerald-500" aria-hidden="true" />
+          ) : (
+            <Copy className="size-3.5" aria-hidden="true" />
+          )}
+        </Button>
+      </div>
+      <ol className="space-y-1.5">
+        {primaryCommands.map((command, index) => (
+          <PairingCommandItem key={command.id} command={command} index={index} />
+        ))}
+      </ol>
+      {hasAdditionalCommands ? (
+        <div className="pt-0.5">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="-ml-1 h-7 px-1.5 text-[11px] text-muted-foreground"
+            aria-expanded={additionalOpen}
+            aria-controls={additionalPanelId}
+            aria-label={
+              additionalOpen ? "Hide additional setup options" : "Show additional setup options"
+            }
+            onClick={() => setAdditionalOpen((open) => !open)}
+          >
+            <ChevronDown
+              className={cn("size-3.5 transition-transform", additionalOpen && "rotate-180")}
+              aria-hidden="true"
+            />
+            Additional setup options
+          </Button>
+          {additionalOpen ? (
+            <div
+              id={additionalPanelId}
+              className="mt-1.5 space-y-2 rounded-md border border-border/60 bg-muted/[0.03] p-2"
+              data-testid="workstation-pairing-additional-commands"
+            >
+              <ul className="space-y-1.5">
+                {additionalCommands.map((command) => (
+                  <PairingCommandItem key={command.id} command={command} />
+                ))}
+              </ul>
+              <p className="leading-5 text-muted-foreground">
+                {hasLinuxServiceBundle && hasForegroundFallback
+                  ? "Fresh Debian/Ubuntu hosts may need curl and tmux before the install command. Use the foreground fallback in tmux for macOS, non-systemd hosts, or manual testing."
+                  : "Run optional setup commands only when they match the host you are attaching."}
+              </p>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function PairingCommandItem({
+  command,
+  index,
+}: {
+  command: NotebookWorkstationPairingCommandView;
+  index?: number;
+}) {
+  return (
+    <li className="space-y-1">
+      <div className="flex min-w-0 items-center gap-1.5 text-[10.5px] text-muted-foreground">
+        {typeof index === "number" ? (
+          <span className="font-medium text-foreground">{index + 1}.</span>
+        ) : null}
+        <span className="truncate">{command.label}</span>
+        {command.optional ? (
+          <span className="shrink-0 text-muted-foreground">(optional)</span>
+        ) : null}
+      </div>
+      <PairingCommand command={command.command} label={command.label} />
+    </li>
+  );
+}
+
+function PairingCommand({ command, label }: { command: string; label: string }) {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) {
@@ -328,7 +512,8 @@ function PairingCommand({ command }: { command: string }) {
         variant="ghost"
         size="icon"
         className="size-7 shrink-0"
-        aria-label={copied ? "Copied" : "Copy connect command"}
+        aria-label={copied ? `Copied ${label} command` : `Copy ${label} command`}
+        title={copied ? "Copied" : `Copy ${label}`}
         onClick={() => {
           void navigator.clipboard.writeText(command).then(() => setCopied(true));
         }}
@@ -343,7 +528,7 @@ function PairingCommand({ command }: { command: string }) {
   );
 }
 
-function PairingCountdown({ expiresAt }: { expiresAt: string }) {
+export function PairingCountdown({ expiresAt }: { expiresAt: string }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -459,13 +644,31 @@ function WorkstationFact({
   icon: LucideIcon;
 }) {
   return (
-    <span className={cn("inline-flex min-w-0 items-center gap-1.5", fact.subtle && "opacity-75")}>
+    <span
+      className={cn(
+        "inline-grid min-w-0 grid-cols-[auto_auto_minmax(0,1fr)] gap-x-1.5",
+        fact.subtle && "opacity-75",
+      )}
+      data-tone={fact.tone}
+    >
       <Icon
-        className={cn("size-3.5 shrink-0", workstationFactIconClassName(fact.tone))}
+        className={cn("mt-px size-3.5 shrink-0", workstationFactIconClassName(fact.tone))}
         aria-hidden="true"
       />
       <span className="shrink-0 text-muted-foreground">{fact.label}</span>
-      <span className="min-w-0 truncate font-medium text-foreground">{fact.value}</span>
+      <span
+        className={cn(
+          "min-w-0 font-medium text-foreground",
+          fact.kind === "accelerator" ? "break-words" : "truncate",
+        )}
+      >
+        {fact.value}
+      </span>
+      {fact.detail ? (
+        <span className="col-span-2 col-start-2 min-w-0 text-[11px] leading-4 text-muted-foreground">
+          {fact.detail}
+        </span>
+      ) : null}
     </span>
   );
 }
@@ -476,9 +679,25 @@ function RegisteredWorkstationFact({
   fact: NotebookRegisteredWorkstationFactProjection;
 }) {
   return (
-    <span className="grid min-w-0 grid-cols-[2.25rem_minmax(0,1fr)] items-baseline gap-1 text-muted-foreground">
+    <span
+      className="grid min-w-0 grid-cols-[2.25rem_minmax(0,1fr)] items-baseline gap-x-1 gap-y-0.5 text-muted-foreground"
+      data-tone={fact.tone}
+    >
       <span className="text-[11px]">{fact.label}</span>
-      <span className="min-w-0 truncate font-medium text-foreground">{fact.value}</span>
+      <span
+        className={cn(
+          "min-w-0 font-medium",
+          fact.kind === "accelerator" ? "break-words" : "truncate",
+          fact.tone === "attention" ? "text-[var(--sev-warn)]" : "text-foreground",
+        )}
+      >
+        {fact.value}
+      </span>
+      {fact.detail ? (
+        <span className="col-start-2 min-w-0 text-[11px] leading-4 text-muted-foreground">
+          {fact.detail}
+        </span>
+      ) : null}
     </span>
   );
 }
@@ -584,6 +803,8 @@ function workstationFactIcon(
       return Gauge;
     case "memory":
       return MemoryStick;
+    case "accelerator":
+      return Cpu;
     case "working_directory":
       return FolderOpen;
     case "runtime_peers":

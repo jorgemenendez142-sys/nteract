@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use crate::connection::{EnvSource, LaunchSpec};
 pub use notebook_wire::{
-    InitialLoadPhaseWire, NotebookDocPhaseWire, RuntimeStatePhaseWire, SessionControlMessage,
-    SessionSyncStatusWire,
+    HostedBridgeStatusWire, InitialLoadPhaseWire, NotebookDocPhaseWire, RuntimeStatePhaseWire,
+    SessionControlMessage, SessionSyncStatusWire,
 };
 use serde::{Deserialize, Serialize};
 
@@ -136,12 +136,6 @@ pub struct QueueEntry {
     pub execution_id: String,
 }
 
-/// Frontend-observed notebook state used to guard trust-approved follow-up actions.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GuardedNotebookProvenance {
-    pub observed_heads: Vec<String>,
-}
-
 /// Dependency state used to guard trust-approved sync.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DependencyGuard {
@@ -223,24 +217,95 @@ pub struct EnvSyncDiff {
 
 // ── Notebook protocol enums ─────────────────────────────────────────────────
 
-/// Structured error kinds returned in `NotebookResponse::SaveError`.
+/// Why a save request could not advance the causal file checkpoint.
 ///
-/// Note: `path` fields carry the serialized path string. Callers that build
-/// `PathAlreadyOpen` from a `PathBuf` should use `p.to_string_lossy().into_owned()`
-/// so non-UTF-8 paths degrade gracefully on the wire (Task 6.2 concern).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A blocked save is an honest outcome, not a committed `NotebookSaved`
+/// event. Callers may retry I/O failures, reconnect to the owning room for a
+/// path conflict, or discard a superseded completion because a newer request
+/// owns the save sequence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum SaveErrorKind {
-    /// Another room is currently serving this path. The agent must close
-    /// the conflicting session (by UUID) before saving here.
-    PathAlreadyOpen {
-        /// UUID of the room that currently holds this path.
-        uuid: String,
-        /// The conflicting path (lossy-UTF-8 serialized from `PathBuf`).
-        path: String,
-    },
-    /// I/O or serialization failure. Message is human-readable.
+pub enum SaveBlockedReason {
+    /// Another room currently owns the requested path.
+    PathAlreadyOpen { uuid: String, path: String },
+    /// The monotonic sequence counter cannot advance.
+    SequenceExhausted,
+    /// A newer save request superseded this completion.
+    Superseded { latest_sequence: u64 },
+    /// Disk and recovery journal diverged; explicit reconciliation is
+    /// required before overwriting the bound source.
+    SourceConflict { message: String },
+    /// Another degraded source condition blocks in-place persistence.
+    SourceDegraded { message: String },
+    /// File preparation, serialization, or durable replacement failed.
     Io { message: String },
+}
+
+/// Deliberate resolution for a room whose recovered Automerge state and
+/// bound `.ipynb` source disagree.
+///
+/// These operations are intentionally separate from ordinary save and reload
+/// paths. A caller must name which side wins (or preserve the recovered side
+/// at a different path) before mutation capabilities are restored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SourceReconciliation {
+    /// Save the recovered room to a different file and continue from that new
+    /// binding. The divergent original source is left untouched.
+    SaveRecoveredAs { path: String },
+    /// Keep the recovered room and deliberately overwrite its bound source.
+    KeepRecoveredAndOverwriteSource,
+    /// Archive the recovery journal and causally replace the live room with
+    /// the exact current contents of the bound source file.
+    ArchiveRecoveryAndReloadSource,
+}
+
+/// Stable operation name echoed in reconciliation responses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceReconciliationOperation {
+    SaveRecoveredAs,
+    KeepRecoveredAndOverwriteSource,
+    ArchiveRecoveryAndReloadSource,
+}
+
+impl SourceReconciliation {
+    pub fn operation(&self) -> SourceReconciliationOperation {
+        match self {
+            Self::SaveRecoveredAs { .. } => SourceReconciliationOperation::SaveRecoveredAs,
+            Self::KeepRecoveredAndOverwriteSource => {
+                SourceReconciliationOperation::KeepRecoveredAndOverwriteSource
+            }
+            Self::ArchiveRecoveryAndReloadSource => {
+                SourceReconciliationOperation::ArchiveRecoveryAndReloadSource
+            }
+        }
+    }
+}
+
+/// Why an explicit source reconciliation did not commit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SourceReconciliationBlockedReason {
+    /// The room does not currently require an explicit source decision.
+    NotRequired { message: String },
+    /// Another reconciliation already owns the room transition.
+    Busy,
+    /// The operation requires a file-backed room.
+    NoBoundSource,
+    /// `save_recovered_as` must not name the divergent bound source.
+    TargetMustDiffer {
+        bound_path: String,
+        requested_path: String,
+    },
+    /// The requested path is currently owned by another room.
+    PathAlreadyOpen { uuid: String, path: String },
+    /// The source file could not be parsed or fully prepared before commit.
+    InvalidSource { message: String },
+    /// File or journal I/O failed before a complete reconciliation commit.
+    Io { message: String },
+    /// A causal save checkpoint was blocked.
+    Save { reason: SaveBlockedReason },
 }
 
 /// Why a caller-provided execution id was rejected.
@@ -272,8 +337,9 @@ pub enum BlobUploadErrorKind {
     FinalHashMismatch,
     OverPeerBudget,
     SessionExpired,
-    /// The connection's scope does not allow blob uploads
-    /// (`ConnectionScope::allows_blob_upload`).
+    /// The connection's scope does not allow blob uploads for this topology
+    /// (`ConnectionScope::allows_blob_upload` on hosted rooms,
+    /// `ConnectionScope::allows_local_blob_upload` on local daemon peers).
     Forbidden,
     Io {
         message: String,
@@ -462,6 +528,96 @@ pub struct CommRequestMessage {
     pub channel: String,
 }
 
+/// One raw Bokeh serialization buffer carried to the runtime agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BokehSessionBuffer {
+    pub id: String,
+    pub data: Vec<u8>,
+}
+
+/// Blob-backed Bokeh buffer supplied by a browser or published in a patch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BokehSessionBufferRef {
+    pub id: String,
+    pub blob: String,
+    pub size: u64,
+    #[serde(default = "default_binary_media_type")]
+    pub media_type: String,
+}
+
+fn default_binary_media_type() -> String {
+    "application/octet-stream".to_string()
+}
+
+/// Browser-origin mutation for one kernel-owned Bokeh document session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BokehSessionPatchRequest {
+    pub session_id: String,
+    pub transaction_id: String,
+    pub base_revision: u64,
+    pub patch: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buffers: Vec<BokehSessionBuffer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buffer_refs: Vec<BokehSessionBufferRef>,
+}
+
+/// Correlated shell acknowledgement for a Bokeh patch request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BokehSessionPatchReply {
+    Accepted {
+        session_id: String,
+        transaction_id: String,
+        revision: u64,
+    },
+    Stale {
+        session_id: String,
+        transaction_id: String,
+        revision: u64,
+    },
+    Error {
+        session_id: String,
+        transaction_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
+        error: String,
+    },
+}
+
+/// One JSON patch and its content-addressed binary buffers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BokehSessionPatchPayload {
+    pub patch: serde_json::Value,
+    #[serde(default)]
+    pub buffers: Vec<BokehSessionBufferRef>,
+}
+
+/// Full authoritative document replacement used after a partial patch error.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BokehSessionCheckpointPayload {
+    pub session_id: String,
+    pub revision: u64,
+    pub document: serde_json::Value,
+    #[serde(default)]
+    pub buffers: Vec<BokehSessionBufferRef>,
+}
+
+/// Canonical ordered transaction emitted by the kernel on IOPub.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BokehSessionPatchEvent {
+    pub session_id: String,
+    pub transaction_id: String,
+    pub base_revision: u64,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_patch: Option<BokehSessionPatchPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_patch: Option<BokehSessionPatchPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<BokehSessionCheckpointPayload>,
+}
+
 fn empty_json_object() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
@@ -534,6 +690,11 @@ pub enum NotebookRequest {
         message: Box<CommRequestMessage>,
     },
 
+    /// Apply a typed Bokeh document patch through the owning kernel session.
+    ApplyBokehSessionPatch {
+        request: Box<BokehSessionPatchRequest>,
+    },
+
     /// Search the kernel's input history.
     /// Returns matching history entries via HistoryResult response.
     GetHistory {
@@ -569,6 +730,11 @@ pub enum NotebookRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
+
+    /// Resolve a recovered-room/source conflict by explicitly choosing one of
+    /// the preservation policies in [`SourceReconciliation`]. Owner scope is
+    /// required and ordinary mutation remains gated until this commits.
+    ReconcileNotebookSource { operation: SourceReconciliation },
 
     /// Fork the current notebook into a new ephemeral (in-memory only) room.
     ///
@@ -690,14 +856,55 @@ pub enum NotebookResponse {
     /// All cells queued for execution.
     AllCellsQueued { queued: Vec<QueueEntry> },
 
-    /// Notebook saved successfully to disk.
+    /// Notebook saved successfully to disk by a committed atomic checkpoint.
     NotebookSaved {
         /// The absolute path where the notebook was written.
         path: String,
+        /// Exact NotebookDoc heads represented by the file.
+        exported_heads: Vec<String>,
+        /// Monotonic committed replacement sequence.
+        save_sequence: u64,
     },
 
-    /// Save failed with a structured error.
-    SaveError { error: SaveErrorKind },
+    /// The requested heads and serialized bytes already match the committed
+    /// file checkpoint. No file replacement or saved timestamp was emitted.
+    NotebookAlreadyCurrent {
+        path: String,
+        exported_heads: Vec<String>,
+        save_sequence: u64,
+    },
+
+    /// The request did not commit a file checkpoint.
+    NotebookSaveBlocked {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        save_sequence: Option<u64>,
+        reason: SaveBlockedReason,
+    },
+
+    /// An explicit room/source reconciliation committed successfully.
+    NotebookSourceReconciled {
+        operation: SourceReconciliationOperation,
+        /// The room's active source path after reconciliation.
+        path: String,
+        /// Archive directory containing the retired recovery journal, when
+        /// the disk source was deliberately selected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived_journal: Option<String>,
+        /// Exact NotebookDoc heads represented by the selected source.
+        exported_heads: Vec<String>,
+        /// Monotonic file-checkpoint sequence assigned to the selected source.
+        save_sequence: u64,
+        /// New room source generation made interactive by the decision.
+        source_generation: u64,
+    },
+
+    /// An explicit reconciliation did not reach its journal/file commit point.
+    NotebookSourceReconciliationBlocked {
+        operation: SourceReconciliationOperation,
+        reason: SourceReconciliationBlockedReason,
+    },
 
     /// Notebook forked into a new ephemeral room.
     NotebookCloned {
@@ -726,6 +933,9 @@ pub enum NotebookResponse {
         cursor_start: usize,
         cursor_end: usize,
     },
+
+    /// Correlated acknowledgement for a Bokeh document patch request.
+    BokehSessionPatch { reply: BokehSessionPatchReply },
 
     /// Environment sync completed successfully.
     SyncEnvironmentComplete {
@@ -778,12 +988,12 @@ pub enum NotebookResponse {
 /// Broadcast messages from daemon to all peers in a room.
 ///
 /// Ephemeral, room-wide events. Custom comm messages (ipywidgets model
-/// updates, button clicks) are the only traffic that still flows here.
-/// Kernel state, execution lifecycle, queue, outputs, the notebook's
-/// `path`, `last_saved` timestamp, and environment-preparation progress
-/// all live in `RuntimeStateDoc` (frame type `0x05`) — they used to flow
-/// as broadcasts and the dead variants were removed once the doc became
-/// authoritative.
+/// updates, button clicks) and the low-latency Bokeh document patch path flow
+/// here. Kernel state, execution lifecycle, queue, outputs, the notebook's
+/// `path`, `last_saved` timestamp, and environment-preparation progress all
+/// live in `RuntimeStateDoc` (frame type `0x05`). Bokeh session topology and
+/// replay pointers also live there; the broadcast only accelerates delivery
+/// of an already canonical revision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum NotebookBroadcast {
@@ -798,6 +1008,9 @@ pub enum NotebookBroadcast {
         #[serde(default)]
         buffers: Vec<Vec<u8>>,
     },
+
+    /// Canonical ordered Bokeh document transaction from the kernel.
+    BokehSessionPatch { patch: Box<BokehSessionPatchEvent> },
 }
 
 // ── Runtime agent protocol types ──────────────────────────────────────────
@@ -868,6 +1081,11 @@ pub enum RuntimeAgentRequest {
     /// Send a comm message to the kernel (widget interactions).
     SendComm { message: Box<CommRequestMessage> },
 
+    /// Apply a typed patch to a kernel-owned Bokeh document session.
+    ApplyBokehSessionPatch {
+        request: Box<BokehSessionPatchRequest>,
+    },
+
     /// Request code completions from the kernel.
     Complete { code: String, cursor_pos: usize },
 
@@ -893,12 +1111,21 @@ pub enum RuntimeAgentResponse {
     /// Kernel restarted successfully (same runtime agent, new kernel).
     KernelRestarted { env_source: EnvSource },
 
+    /// Kernel launch failed with a typed classification for coordinator policy.
+    KernelLaunchFailed {
+        kind: KernelLaunchFailureKind,
+        error: String,
+    },
+
     /// Code completion result.
     CompletionResult {
         items: Vec<CompletionItem>,
         cursor_start: usize,
         cursor_end: usize,
     },
+
+    /// Correlated acknowledgement for a Bokeh document patch request.
+    BokehSessionPatch { reply: BokehSessionPatchReply },
 
     /// History search result.
     HistoryResult { entries: Vec<HistoryEntry> },
@@ -914,6 +1141,19 @@ pub enum RuntimeAgentResponse {
 
     /// Error response.
     Error { error: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelLaunchFailureKind {
+    RetryableStartupTransport,
+    PortBind,
+    ProcessExited,
+    StartupTimeout,
+    ToolBootstrap,
+    Misconfiguration,
+    Unsupported,
+    Other,
 }
 
 /// Envelope around a `RuntimeAgentRequest` carrying a correlation ID.
@@ -1404,6 +1644,16 @@ mod tests {
                 }),
             ),
             (
+                "reconcile_notebook_source",
+                serde_json::json!({
+                    "action": "reconcile_notebook_source",
+                    "operation": {
+                        "type": "save_recovered_as",
+                        "path": "/tmp/recovered.ipynb",
+                    },
+                }),
+            ),
+            (
                 "clone_as_ephemeral",
                 serde_json::json!({
                     "action": "clone_as_ephemeral",
@@ -1454,6 +1704,18 @@ mod tests {
                     },
                 }),
             ),
+            (
+                "apply_bokeh_session_patch",
+                serde_json::json!({
+                    "action": "apply_bokeh_session_patch",
+                    "request": {
+                        "session_id": "session-1",
+                        "transaction_id": "tx-1",
+                        "base_revision": 4,
+                        "patch": {"events": []},
+                    },
+                }),
+            ),
         ];
 
         let request_actions = cases
@@ -1491,61 +1753,8 @@ mod tests {
         }
     }
 
-    fn extract_string_array(source: &str, const_name: &str) -> BTreeSet<String> {
-        let needle = format!("export const {const_name} = [");
-        let start = source
-            .find(&needle)
-            .unwrap_or_else(|| panic!("missing TS const {const_name}"))
-            + needle.len();
-        let rest = &source[start..];
-        let end = rest
-            .find("] as const")
-            .unwrap_or_else(|| panic!("missing end of TS const {const_name}"));
-
-        rest[..end]
-            .split(',')
-            .filter_map(|part| {
-                let value = part.trim().trim_matches('\n').trim();
-                value
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .map(ToOwned::to_owned)
-            })
-            .collect()
-    }
-
     fn expected_values(values: &[&str]) -> BTreeSet<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
-    }
-
-    #[test]
-    fn typescript_protocol_contract_matches_rust_discriminants() {
-        let ts_contract = include_str!("../../../packages/runtimed/src/protocol-contract.ts");
-
-        assert_eq!(
-            extract_string_array(ts_contract, "NOTEBOOK_REQUEST_TYPES"),
-            expected_values(crate::typescript::NOTEBOOK_REQUEST_TYPES)
-        );
-        assert_eq!(
-            extract_string_array(ts_contract, "NOTEBOOK_RESPONSE_RESULTS"),
-            expected_values(crate::typescript::NOTEBOOK_RESPONSE_RESULTS)
-        );
-        assert_eq!(
-            extract_string_array(ts_contract, "SESSION_CONTROL_TYPES"),
-            expected_values(crate::typescript::SESSION_CONTROL_TYPES)
-        );
-        assert_eq!(
-            extract_string_array(ts_contract, "NOTEBOOK_DOC_PHASES"),
-            expected_values(crate::typescript::NOTEBOOK_DOC_PHASES)
-        );
-        assert_eq!(
-            extract_string_array(ts_contract, "RUNTIME_STATE_PHASES"),
-            expected_values(crate::typescript::RUNTIME_STATE_PHASES)
-        );
-        assert_eq!(
-            extract_string_array(ts_contract, "INITIAL_LOAD_PHASES"),
-            expected_values(crate::typescript::INITIAL_LOAD_PHASES)
-        );
     }
 
     #[test]
@@ -1582,6 +1791,31 @@ mod tests {
 
         let parsed: RuntimeAgentResponseEnvelope = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.id, "req-42");
+    }
+
+    #[test]
+    fn runtime_agent_launch_failed_response_round_trip_preserves_kind() {
+        let envelope = RuntimeAgentResponseEnvelope {
+            id: "req-42".to_string(),
+            response: RuntimeAgentResponse::KernelLaunchFailed {
+                kind: KernelLaunchFailureKind::RetryableStartupTransport,
+                error: "Failed to launch kernel: Connection reset by peer".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["id"], "req-42");
+        assert_eq!(json["result"], "kernel_launch_failed");
+        assert_eq!(json["kind"], "retryable_startup_transport");
+
+        let parsed: RuntimeAgentResponseEnvelope = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.id, "req-42");
+        assert!(matches!(
+            parsed.response,
+            RuntimeAgentResponse::KernelLaunchFailed {
+                kind: KernelLaunchFailureKind::RetryableStartupTransport,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1725,6 +1959,71 @@ mod tests {
             packages: vec!["numpy".into()]
         })
         .is_command());
+        assert!(!RuntimeAgentRequest::ApplyBokehSessionPatch {
+            request: Box::new(BokehSessionPatchRequest {
+                session_id: "session-1".to_string(),
+                transaction_id: "tx-1".to_string(),
+                base_revision: 0,
+                patch: serde_json::json!({"events": []}),
+                buffers: Vec::new(),
+                buffer_refs: Vec::new(),
+            }),
+        }
+        .is_command());
+    }
+
+    #[test]
+    fn bokeh_patch_broadcast_round_trip_preserves_checkpoint_and_buffers() {
+        let broadcast = NotebookBroadcast::BokehSessionPatch {
+            patch: Box::new(BokehSessionPatchEvent {
+                session_id: "session-1".to_string(),
+                transaction_id: "tx-1".to_string(),
+                base_revision: 4,
+                revision: 5,
+                client_patch: Some(BokehSessionPatchPayload {
+                    patch: serde_json::json!({"events": [{"kind": "ModelChanged"}]}),
+                    buffers: vec![BokehSessionBufferRef {
+                        id: "buffer-1".to_string(),
+                        blob: "abc123".to_string(),
+                        size: 3,
+                        media_type: "application/octet-stream".to_string(),
+                    }],
+                }),
+                server_patch: None,
+                checkpoint: Some(BokehSessionCheckpointPayload {
+                    session_id: "session-1".to_string(),
+                    revision: 5,
+                    document: serde_json::json!({"version": "3.9.1", "roots": []}),
+                    buffers: Vec::new(),
+                }),
+            }),
+        };
+
+        let json = serde_json::to_value(&broadcast).expect("serialize Bokeh broadcast");
+        assert_eq!(json["event"], "bokeh_session_patch");
+        assert_eq!(json["patch"]["revision"], 5);
+        assert_eq!(
+            json["patch"]["client_patch"]["buffers"][0]["blob"],
+            "abc123"
+        );
+        let parsed: NotebookBroadcast =
+            serde_json::from_value(json).expect("deserialize Bokeh broadcast");
+        let NotebookBroadcast::BokehSessionPatch { patch } = parsed else {
+            panic!("expected Bokeh patch broadcast");
+        };
+        assert_eq!(patch.session_id, "session-1");
+        assert_eq!(patch.revision, 5);
+        assert_eq!(
+            patch
+                .client_patch
+                .expect("client patch")
+                .buffers
+                .first()
+                .expect("buffer")
+                .blob,
+            "abc123"
+        );
+        assert!(patch.checkpoint.is_some());
     }
 
     #[test]

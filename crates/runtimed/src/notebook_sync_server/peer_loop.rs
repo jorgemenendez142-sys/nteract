@@ -1,4 +1,7 @@
 use super::blob_upload::{enqueue_put_blob, spawn_put_blob_worker, MultipartUploadState};
+use super::peer_comments_sync::{
+    forward_comments_doc_broadcast, handle_comments_doc_frame, send_initial_comments_doc_sync,
+};
 use super::peer_comms_sync::{
     forward_comms_doc_broadcast, handle_comms_doc_frame, send_initial_comms_doc_sync,
 };
@@ -15,13 +18,27 @@ use super::peer_presence::{
 };
 use super::peer_runtime_sync::{forward_runtime_state_broadcast, handle_runtime_state_frame};
 use super::peer_session::{
-    send_initial_notebook_doc_sync, send_initial_runtime_state_sync, send_session_status,
-    stream_initial_load, InitialSyncState,
+    send_hosted_bridge_status, send_initial_notebook_doc_sync, send_initial_runtime_state_sync,
+    send_session_status, stream_initial_load_with_frame_drain, HandshakePhases, InitialSyncState,
+    PeerSessionContext,
 };
 use super::peer_writer::{
-    enqueue_notebook_request, queue_session_status, spawn_peer_request_worker, spawn_peer_writer,
+    enqueue_notebook_request, queue_hosted_bridge_status, queue_session_status,
+    spawn_peer_request_worker, spawn_peer_writer,
 };
 use super::*;
+use std::collections::VecDeque;
+
+async fn next_peer_frame(
+    deferred_frames: &mut VecDeque<connection::TypedNotebookFrame>,
+    framed_reader: &mut connection::FramedReader,
+) -> Option<std::io::Result<connection::TypedNotebookFrame>> {
+    if let Some(frame) = deferred_frames.pop_front() {
+        Some(Ok(frame))
+    } else {
+        framed_reader.recv().await
+    }
+}
 
 /// Typed frames sync loop with first-byte type indicator.
 ///
@@ -31,23 +48,28 @@ use super::*;
 /// Takes `reader` by value because the post-streaming-load main loop
 /// hands it to a `FramedReader` actor; from that point the read half
 /// belongs to the dedicated reader task, not this select loop.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_sync_loop_v2<R, W>(
-    mut reader: R,
+    reader: R,
     mut writer: W,
-    room: &Arc<NotebookRoom>,
-    _rooms: NotebookRooms,
-    notebook_id: String,
-    daemon: std::sync::Arc<crate::daemon::Daemon>,
-    needs_load: Option<&Path>,
-    peer_id: &str,
-    connection_identity: &RoomConnectionIdentity,
-    client_protocol_version: u8,
+    ctx: &PeerConnectionContext,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let room = &ctx.room;
+    let daemon = &ctx.daemon;
+    let notebook_id = ctx.notebook_id.as_str();
+    let peer_id = ctx.peer_id.as_str();
+    let connection_identity = &ctx.connection_identity;
+    let client_protocol_version = ctx.client_protocol_version;
+
+    // Hand the reader off to a dedicated FramedReader actor before bootstrap.
+    // The initial file-backed load can then safely wait for client sync replies
+    // between batches without risking partial-frame cancellation.
+    let mut framed_reader = connection::FramedReader::spawn(reader, 16);
+    let mut deferred_frames = VecDeque::new();
+
     // Subscribe before sending bootstrap traffic so any writes that land
     // during connection setup are still observed as steady-state deltas.
     let mut changed_rx = room.broadcasts.changed_tx.subscribe();
@@ -55,81 +77,100 @@ where
     let mut presence_rx = room.broadcasts.presence_tx.subscribe();
     let mut state_changed_rx = room.state.subscribe();
     let mut comms_changed_rx = room.comms.subscribe();
+    let mut comments_changed_rx = room.comments.subscribe();
+    let mut hosted_bridge_status_rx = room.broadcasts.hosted_bridge_status_tx.subscribe();
 
     // PoolDoc — global daemon pool state (UV/Conda availability, errors).
     let mut pool_changed_rx = daemon.pool_doc_changed.subscribe();
 
-    let mut notebook_doc_phase = notebook_protocol::protocol::NotebookDocPhaseWire::Pending;
-    let mut runtime_state_phase = notebook_protocol::protocol::RuntimeStatePhaseWire::Pending;
-    let mut initial_load_phase = if needs_load.is_some() {
-        notebook_protocol::protocol::InitialLoadPhaseWire::Streaming
-    } else {
-        notebook_protocol::protocol::InitialLoadPhaseWire::NotNeeded
+    let needs_load = ctx.needs_load.as_deref();
+    let room_load_state = room.initial_load.state();
+    let room_load_in_progress = room_load_state.is_loading();
+    let mut phases = HandshakePhases {
+        notebook_doc: notebook_protocol::protocol::NotebookDocPhaseWire::Pending,
+        runtime_state: notebook_protocol::protocol::RuntimeStatePhaseWire::Pending,
+        initial_load: match &room_load_state {
+            RoomInitialLoadState::Loading { .. } | RoomInitialLoadState::Failed { .. } => {
+                notebook_protocol::protocol::InitialLoadPhaseWire::Streaming
+            }
+            RoomInitialLoadState::NotNeeded { .. } | RoomInitialLoadState::Ready { .. }
+                if needs_load.is_some() =>
+            {
+                notebook_protocol::protocol::InitialLoadPhaseWire::Streaming
+            }
+            RoomInitialLoadState::NotNeeded { .. } | RoomInitialLoadState::Ready { .. } => {
+                notebook_protocol::protocol::InitialLoadPhaseWire::NotNeeded
+            }
+        },
     };
 
     if client_protocol_version >= 3 {
-        send_session_status(
-            &mut writer,
-            notebook_doc_phase,
-            runtime_state_phase,
-            initial_load_phase.clone(),
-        )
-        .await?;
+        send_session_status(&mut writer, &phases).await?;
+    }
+    // Protocol v4 introduced the hosted_bridge_status SessionControl variant.
+    if client_protocol_version >= 4 {
+        let status = *hosted_bridge_status_rx.borrow_and_update();
+        send_hosted_bridge_status(&mut writer, status).await?;
     }
 
-    let InitialSyncState { mut peer_state } =
-        send_initial_notebook_doc_sync(&mut writer, room).await?;
-    notebook_doc_phase = notebook_protocol::protocol::NotebookDocPhaseWire::Syncing;
+    // Fresh file-backed rooms stream the file itself as the initial doc sync.
+    // Sending an empty-doc handshake first leaves Automerge with an in-flight
+    // message and can collapse the visible cell batches into one final update.
+    let defer_initial_doc_sync_for_file_load = if needs_load.is_some() || room_load_in_progress {
+        let doc = room.doc.read().await;
+        doc.cell_count() == 0
+    } else {
+        false
+    };
+    let InitialSyncState { mut peer_state } = if defer_initial_doc_sync_for_file_load {
+        InitialSyncState::new()
+    } else {
+        send_initial_notebook_doc_sync(&mut writer, room).await?
+    };
+    phases.notebook_doc = notebook_protocol::protocol::NotebookDocPhaseWire::Syncing;
     if client_protocol_version >= 3 {
-        send_session_status(
-            &mut writer,
-            notebook_doc_phase,
-            runtime_state_phase,
-            initial_load_phase.clone(),
-        )
-        .await?;
+        send_session_status(&mut writer, &phases).await?;
     }
 
     let mut state_peer_state = sync::State::new();
     let mut comms_peer_state = sync::State::new();
+    let mut comments_peer_state = sync::State::new();
     let mut pool_peer_state = sync::State::new();
     let mut persisted_execution_records: std::collections::HashMap<
         String,
         runtimed_client::execution_store::ExecutionRecord,
     > = std::collections::HashMap::new();
     let execution_store = runtimed_client::execution_store::ExecutionStore::new(
-        daemon.config.execution_store_dir.clone(),
+        ctx.execution_store_dir().to_path_buf(),
     );
 
     send_initial_runtime_state_sync(&mut writer, room, &mut state_peer_state).await?;
-    runtime_state_phase = notebook_protocol::protocol::RuntimeStatePhaseWire::Syncing;
+    phases.runtime_state = notebook_protocol::protocol::RuntimeStatePhaseWire::Syncing;
     if client_protocol_version >= 3 {
-        send_session_status(
-            &mut writer,
-            notebook_doc_phase,
-            runtime_state_phase,
-            initial_load_phase.clone(),
-        )
-        .await?;
+        send_session_status(&mut writer, &phases).await?;
     }
 
     send_initial_comms_doc_sync(&mut writer, room, &mut comms_peer_state).await?;
+    send_initial_comments_doc_sync(&mut writer, room, &mut comments_peer_state).await?;
 
-    initial_load_phase = stream_initial_load(
-        &mut reader,
-        &mut writer,
+    let session = PeerSessionContext {
         room,
         needs_load,
-        &daemon.config.execution_store_dir,
-        &mut peer_state,
-        notebook_doc_phase,
-        runtime_state_phase,
-        initial_load_phase,
+        execution_store_dir: ctx.execution_store_dir(),
+        connection_identity,
         client_protocol_version,
+    };
+    stream_initial_load_with_frame_drain(
+        &mut framed_reader,
+        &mut writer,
+        &mut deferred_frames,
+        &session,
+        &mut peer_state,
+        &mut phases,
     )
     .await?;
 
-    send_initial_pool_sync(&mut writer, &daemon, &mut pool_peer_state).await?;
+    send_initial_pool_sync(&mut writer, daemon, &mut pool_peer_state).await?;
 
     // CommSync broadcast is no longer needed. Late joiners receive widget
     // state via RuntimeStateDoc CRDT sync, and the frontend CRDT watcher
@@ -147,14 +188,14 @@ where
     // writer task; the peer loop must keep draining client frames even when the
     // client is temporarily slow to read daemon frames.
     let (peer_writer, mut writer_task) =
-        spawn_peer_writer(writer, notebook_id.clone(), peer_id.to_string());
+        spawn_peer_writer(writer, notebook_id.to_string(), peer_id.to_string());
     let multipart_uploads = MultipartUploadState::new(&room.blob_store);
     let mut request_worker = spawn_peer_request_worker(
         room.clone(),
         daemon.clone(),
         peer_writer.clone(),
         multipart_uploads.clone(),
-        notebook_id.clone(),
+        notebook_id.to_string(),
         peer_id.to_string(),
         connection_identity.actor_label().as_str().to_string(),
     );
@@ -162,16 +203,9 @@ where
         room.blob_store.clone(),
         peer_writer.clone(),
         multipart_uploads,
-        notebook_id.clone(),
+        notebook_id.to_string(),
         peer_id.to_string(),
     );
-
-    // Hand the reader off to a dedicated FramedReader actor before
-    // entering the busy `select!` below. `recv_typed_frame`'s internal
-    // `read_exact` calls are NOT cancel-safe — putting them directly
-    // in a `select!` arm desyncs the framed stream the moment another
-    // arm wins mid-payload (see issue + production diagnostics).
-    let mut framed_reader = connection::FramedReader::spawn(reader, 16);
 
     // Idle peer timeout: disconnect peers that stop sending inbound frames.
     // This is the safety net for orphaned connections where the remote process
@@ -230,7 +264,7 @@ where
             }
 
             // Incoming message from this client (cancel-safe via FramedReader actor)
-            maybe_frame = framed_reader.recv() => {
+            maybe_frame = next_peer_frame(&mut deferred_frames, &mut framed_reader) => {
                 let frame = match maybe_frame {
                     Some(Ok(frame)) => frame,
                     Some(Err(e)) => return Err(e.into()),
@@ -259,18 +293,16 @@ where
                                 )
                                 .await?;
 
-                                if notebook_doc_phase
+                                // A queued reply means the joiner has not acknowledged
+                                // the daemon's current NotebookDoc yet.
+                                if !notebook_doc_effects.sync_reply_queued()
+                                    && phases.notebook_doc
                                     != notebook_protocol::protocol::NotebookDocPhaseWire::Interactive
                                 {
-                                    notebook_doc_phase =
+                                    phases.notebook_doc =
                                         notebook_protocol::protocol::NotebookDocPhaseWire::Interactive;
                                     if client_protocol_version >= 3 {
-                                        queue_session_status(
-                                            &peer_writer,
-                                            notebook_doc_phase,
-                                            runtime_state_phase,
-                                            initial_load_phase.clone(),
-                                        )?;
+                                        queue_session_status(&peer_writer, &phases)?;
                                     }
                                 }
 
@@ -284,7 +316,7 @@ where
                                     &request_worker,
                                     &peer_writer,
                                     &frame.payload,
-                                    &notebook_id,
+                                    notebook_id,
                                     peer_id,
                                     connection_identity.scope(),
                                 )?;
@@ -316,18 +348,13 @@ where
                                     continue;
                                 }
 
-                                if runtime_state_phase
+                                if phases.runtime_state
                                     != notebook_protocol::protocol::RuntimeStatePhaseWire::Ready
                                 {
-                                    runtime_state_phase =
+                                    phases.runtime_state =
                                         notebook_protocol::protocol::RuntimeStatePhaseWire::Ready;
                                     if client_protocol_version >= 3 {
-                                        queue_session_status(
-                                            &peer_writer,
-                                            notebook_doc_phase,
-                                            runtime_state_phase,
-                                            initial_load_phase.clone(),
-                                        )?;
+                                        queue_session_status(&peer_writer, &phases)?;
                                     }
                                 }
                             }
@@ -346,9 +373,34 @@ where
                                 }
                             }
 
+                            NotebookFrameType::CommentsDocSync => {
+                                // A comments-sync failure must never take down the
+                                // notebook connection. Drop the offending frame and
+                                // keep the peer editing; comments degrade alone.
+                                match handle_comments_doc_frame(
+                                    room,
+                                    &mut comments_peer_state,
+                                    &peer_writer,
+                                    &frame.payload,
+                                    connection_identity,
+                                )
+                                .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        warn!(
+                                            "[notebook-sync] CommentsDoc frame error (dropping frame, keeping connection): {}",
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
                             NotebookFrameType::PoolStateSync => {
                                 if !handle_pool_state_frame(
-                                    &daemon,
+                                    daemon,
                                     &mut pool_peer_state,
                                     &peer_writer,
                                     &frame.payload,
@@ -374,7 +426,7 @@ where
                                     &put_blob_worker,
                                     &peer_writer,
                                     frame.payload,
-                                    &notebook_id,
+                                    notebook_id,
                                     peer_id,
                                     connection_identity.scope(),
                                 )?;
@@ -385,23 +437,6 @@ where
             // Another peer changed the document — push update to this client
             _ = changed_rx.recv() => {
                 forward_notebook_doc_broadcast(room, &mut peer_state, &peer_writer).await?;
-
-                if matches!(
-                    initial_load_phase,
-                    notebook_protocol::protocol::InitialLoadPhaseWire::Streaming
-                ) && !room.is_loading()
-                {
-                    initial_load_phase =
-                        notebook_protocol::protocol::InitialLoadPhaseWire::Ready;
-                    if client_protocol_version >= 3 {
-                        queue_session_status(
-                            &peer_writer,
-                            notebook_doc_phase,
-                            runtime_state_phase,
-                            initial_load_phase.clone(),
-                        )?;
-                    }
-                }
             }
 
             // RuntimeStateDoc changed — push update to this client
@@ -419,6 +454,15 @@ where
                 }
             }
 
+            // Older peers do not know the v4 hosted_bridge_status variant.
+            result = hosted_bridge_status_rx.changed(), if client_protocol_version >= 4 => {
+                if result.is_err() {
+                    return Ok(());
+                }
+                let status = *hosted_bridge_status_rx.borrow_and_update();
+                queue_hosted_bridge_status(&peer_writer, status)?;
+            }
+
             // CommsDoc changed — push widget state updates to this client
             result = comms_changed_rx.recv() => {
                 if !forward_comms_doc_broadcast(
@@ -434,10 +478,25 @@ where
                 }
             }
 
+            // CommentsDoc changed. Push comment thread updates to this client.
+            result = comments_changed_rx.recv() => {
+                if !forward_comments_doc_broadcast(
+                    room,
+                    peer_id,
+                    &mut comments_peer_state,
+                    &peer_writer,
+                    result,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+
             // PoolDoc changed — push update to this client
             result = pool_changed_rx.recv() => {
                 if !forward_pool_state_broadcast(
-                    &daemon,
+                    daemon,
                     peer_id,
                     &mut pool_peer_state,
                     &peer_writer,

@@ -1,111 +1,46 @@
-import { act, renderHook, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi, beforeEach } from "vite-plus/test";
-import type { CloudAppSession } from "../app-session";
+import { act, renderHook } from "@testing-library/react";
+import { describe, expect, it } from "vite-plus/test";
+import { cloudAuthStore } from "../cloud-auth-store";
+import {
+  useCloudAppSession,
+  useCloudAuthState,
+  useCloudAuthRenewal,
+} from "../use-cloud-auth-store";
 
-// The page shell can already contain a verified app-session from the Worker.
-// A fresh initial session must avoid an immediate /api/auth/session round trip.
-// Explicit refreshes and stale/missing bootstrap sessions still read the
-// endpoint, and content-equal responses keep object identity stable so effect
-// dependency chains (resolveSyncAuth → live-room effect) do not reconnect.
-// These tests render the real hook, pinning setState updater wiring that
-// pure-reducer tests cannot.
+// The domain hooks are the read boundary between the auth store and the view
+// tree. The store's driver behavior (identity-stable app-session fetches, OIDC
+// refresh cadence, establish backoff) is covered headlessly in
+// cloud-auth-store.test.ts; these tests pin only the useSyncExternalStore wiring
+// - that each hook reflects the current store snapshot and re-renders when the
+// store emits.
 
-const mocks = vi.hoisted(() => ({
-  readCloudAppSessionStatus: vi.fn<() => Promise<{ ok: true; session: CloudAppSession | null }>>(),
-}));
+describe("cloud auth store domain hooks", () => {
+  it("reflects the app-session snapshot and re-renders when the store changes", () => {
+    const { result } = renderHook(() => useCloudAppSession());
+    expect(result.current).toBe(cloudAuthStore.appSessionSnapshot);
 
-vi.mock("../app-session", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../app-session")>()),
-  readCloudAppSessionStatus: mocks.readCloudAppSessionStatus,
-}));
-
-import { useCloudAppSessionStatus } from "../use-cloud-auth";
-
-describe("useCloudAppSessionStatus", () => {
-  beforeEach(() => {
-    mocks.readCloudAppSessionStatus.mockReset();
-  });
-
-  const session = (overrides: Partial<CloudAppSession> = {}): CloudAppSession => ({
-    provider: "oidc",
-    expires_at: 4_000_000_000,
-    ...overrides,
-  });
-
-  it("trusts a fresh initial session until an explicit refresh asks the endpoint", async () => {
-    const initial = session();
-    mocks.readCloudAppSessionStatus.mockResolvedValue({ ok: true, session: session() });
-
-    const { result } = renderHook(() => useCloudAppSessionStatus(initial));
-    expect(result.current.session).toBe(initial);
-
-    await act(async () => {});
-    expect(mocks.readCloudAppSessionStatus).not.toHaveBeenCalled();
-    expect(result.current.status).toBe("ready");
-    expect(result.current.session).toBe(initial);
-
-    // A manual refresh that confirms again keeps it too.
     act(() => {
-      result.current.refreshAppSessionStatus();
-    });
-    await waitFor(() => expect(mocks.readCloudAppSessionStatus).toHaveBeenCalledTimes(1));
-    await act(async () => {});
-
-    expect(result.current.status).toBe("ready");
-    expect(result.current.session).toBe(initial);
-  });
-
-  it("keeps stale initial session identity across content-equal confirming fetches", async () => {
-    const initial = session({ expires_at: 1 });
-    mocks.readCloudAppSessionStatus.mockResolvedValue({
-      ok: true,
-      session: session({ expires_at: 1 }),
+      cloudAuthStore.clearAppSessionStatus();
     });
 
-    const { result } = renderHook(() => useCloudAppSessionStatus(initial));
-    expect(result.current.session).toBe(initial);
-
-    await waitFor(() => expect(mocks.readCloudAppSessionStatus).toHaveBeenCalledTimes(1));
-    await act(async () => {});
-
     expect(result.current.status).toBe("ready");
-    // The wiring pin: the fetch returned a fresh-but-content-identical
-    // object, and the hook must keep the ORIGINAL reference.
-    expect(result.current.session).toBe(initial);
+    expect(result.current.session).toBe(null);
+    expect(result.current).toBe(cloudAuthStore.appSessionSnapshot);
   });
 
-  it("adopts a genuinely renewed session", async () => {
-    const initial = session({ expires_at: 1 });
-    const renewed = session({ expires_at: 4_000_009_999 });
-    mocks.readCloudAppSessionStatus.mockResolvedValue({ ok: true, session: renewed });
+  it("reflects the auth snapshot and re-renders when auth is re-read", () => {
+    const { result } = renderHook(() => useCloudAuthState());
+    expect(result.current).toEqual(cloudAuthStore.authSnapshot);
 
-    const { result } = renderHook(() => useCloudAppSessionStatus(initial));
-    await waitFor(() => expect(mocks.readCloudAppSessionStatus).toHaveBeenCalledTimes(1));
-    await act(async () => {});
+    act(() => {
+      cloudAuthStore.refreshAuthState();
+    });
 
-    expect(result.current.status).toBe("ready");
-    expect(result.current.session).toBe(renewed);
+    expect(result.current).toEqual(cloudAuthStore.authSnapshot);
   });
 
-  it("moves loading to ready with the fetched session when mounted without one", async () => {
-    const fetched = session();
-    mocks.readCloudAppSessionStatus.mockResolvedValue({ ok: true, session: fetched });
-
-    const { result } = renderHook(() => useCloudAppSessionStatus(null));
-    expect(result.current.status).toBe("loading");
-
-    await waitFor(() => expect(result.current.status).toBe("ready"));
-    expect(result.current.session).toBe(fetched);
-  });
-
-  it("reports fetch failures without dropping the session it already has", async () => {
-    const initial = session({ expires_at: 1 });
-    mocks.readCloudAppSessionStatus.mockRejectedValue(new Error("session endpoint down"));
-
-    const { result } = renderHook(() => useCloudAppSessionStatus(initial));
-    await waitFor(() => expect(result.current.status).toBe("error"));
-
-    expect(result.current.error).toBe("session endpoint down");
-    expect(result.current.session).toBe(initial);
+  it("reflects the renewal notice snapshot", () => {
+    const { result } = renderHook(() => useCloudAuthRenewal());
+    expect(result.current).toEqual(cloudAuthStore.renewalSnapshot);
   });
 });

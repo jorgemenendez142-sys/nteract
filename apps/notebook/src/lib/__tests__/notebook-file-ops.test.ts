@@ -24,6 +24,7 @@ const mockSendRequest = vi.fn();
 const mockGetDefaultSaveDirectory = vi.fn<() => Promise<string>>();
 const mockSaveAs = vi.fn<(path: string) => Promise<void>>();
 const mockOpenInNewWindow = vi.fn<(path: string) => Promise<void>>();
+const mockOpenHostedInNewWindow = vi.fn<(url: string) => Promise<void>>();
 const mockCloneToEphemeral = vi.fn<() => Promise<string>>();
 const stubTransport = {
   sendRequest: (req: unknown) => mockSendRequest(req),
@@ -43,6 +44,7 @@ const stubHost = {
     getDefaultSaveDirectory: () => mockGetDefaultSaveDirectory(),
     saveAs: (path: string) => mockSaveAs(path),
     openInNewWindow: (path: string) => mockOpenInNewWindow(path),
+    openHostedInNewWindow: (url: string) => mockOpenHostedInNewWindow(url),
     cloneToEphemeral: () => mockCloneToEphemeral(),
   },
 } as unknown as NotebookHost;
@@ -51,6 +53,7 @@ beforeEach(() => {
   mockGetDefaultSaveDirectory.mockResolvedValue("/home/user/notebooks");
   mockSaveAs.mockResolvedValue(undefined);
   mockOpenInNewWindow.mockResolvedValue(undefined);
+  mockOpenHostedInNewWindow.mockResolvedValue(undefined);
   mockCloneToEphemeral.mockResolvedValue("new-uuid-1234");
 });
 
@@ -61,6 +64,7 @@ afterEach(() => {
   mockGetDefaultSaveDirectory.mockReset();
   mockSaveAs.mockReset();
   mockOpenInNewWindow.mockReset();
+  mockOpenHostedInNewWindow.mockReset();
   mockCloneToEphemeral.mockReset();
 });
 
@@ -79,6 +83,8 @@ describe("saveNotebook", () => {
     mockSendRequest.mockResolvedValueOnce({
       result: "notebook_saved",
       path: "/home/user/notebooks/MyNotebook.ipynb",
+      exported_heads: ["abc123"],
+      save_sequence: 1,
     });
 
     const result = await saveNotebook(stubHost, flushSync, true);
@@ -117,13 +123,34 @@ describe("saveNotebook", () => {
 
   it("returns false on daemon save errors", async () => {
     mockSendRequest.mockResolvedValueOnce({
-      result: "save_error",
-      error: { type: "io", message: "disk full" },
+      result: "notebook_save_blocked",
+      reason: { type: "io", message: "disk full" },
     });
 
     const result = await saveNotebook(stubHost, flushSync, true);
 
     expect(result).toBe(false);
+  });
+
+  it("treats an already-current causal checkpoint as a successful save", async () => {
+    mockSendRequest.mockResolvedValueOnce({
+      result: "notebook_already_current",
+      path: "/home/user/notebooks/MyNotebook.ipynb",
+      exported_heads: ["abc123"],
+      save_sequence: 4,
+    });
+
+    await expect(saveNotebook(stubHost, flushSync, true)).resolves.toBe(true);
+  });
+
+  it("returns false for a typed blocked save outcome", async () => {
+    mockSendRequest.mockResolvedValueOnce({
+      result: "notebook_save_blocked",
+      save_sequence: 3,
+      reason: { type: "superseded", latest_sequence: 4 },
+    });
+
+    await expect(saveNotebook(stubHost, flushSync, true)).resolves.toBe(false);
   });
 
   it("returns false on transport failure", async () => {
@@ -132,6 +159,17 @@ describe("saveNotebook", () => {
     const result = await saveNotebook(stubHost, flushSync, true);
 
     expect(result).toBe(false);
+  });
+
+  it("flushes hosted notebooks without opening a local Save As flow", async () => {
+    const result = await saveNotebook(stubHost, flushSync, false, { hosted: true });
+
+    expect(result).toBe(true);
+    expect(flushSync).toHaveBeenCalledTimes(1);
+    expect(mockGetDefaultSaveDirectory).not.toHaveBeenCalled();
+    expect(mockSaveDialog).not.toHaveBeenCalled();
+    expect(mockSaveAs).not.toHaveBeenCalled();
+    expect(mockSendRequest).not.toHaveBeenCalled();
   });
 
   it("always flushes sync before saving", async () => {

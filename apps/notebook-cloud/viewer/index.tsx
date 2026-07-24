@@ -1,28 +1,41 @@
-import { lazy, Suspense, useState } from "react";
+import { lazy, Profiler, Suspense, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { BookOpen, House, Loader2 } from "lucide-react";
 import { ErrorBoundary } from "@/lib/error-boundary";
-import { setLoggerHost } from "../../notebook/src/lib/logger";
-import { setOpenUrlHost } from "../../notebook/src/lib/open-url";
+import { setLoggerHost } from "@/lib/logger";
+import { setOpenUrlHost } from "@/lib/open-url";
 import { installDocumentThemeSync } from "./theme";
 import {
   isHomePath,
   isNotebookListPath,
-  isOidcCallbackPath,
+  isWorkstationsPath,
   loadAuthConfig,
+  loadCloudNotebookListBootstrap,
   loadViewerRuntime,
   requireElement,
 } from "./cloud-viewer-config";
 import type { CloudViewerAuthConfig, ViewerRuntimeState } from "./cloud-viewer-types";
+import { cloudAuthStore } from "./cloud-auth-store";
+import { cloudNotebookModeFromSearch } from "./cloud-notebook-mode";
 import { cloudNotebookRouteTitleFromPathname } from "./cloud-notebook-title-state";
 import { CloudHomeView } from "./home-view";
 import { CloudNotebookListView } from "./notebook-list-view";
 import { loadNotebookRouteModule } from "./notebook-route-preload";
-import { OidcCallbackView } from "./oidc-callback-view";
+import { installStaleDeploymentRecovery } from "./stale-deployment-recovery";
 import "./index.css";
+
+installStaleDeploymentRecovery();
 
 const NotebookRoute = lazy(() =>
   loadNotebookRouteModule().then((module) => ({ default: module.NotebookRoute })),
+);
+
+// Boot-path discipline: only the auth store may ride the entry chunk (its
+// synchronous seed is what instant paint reads). The workstations surface -
+// store, hooks, and the management page UI - belongs to its route's chunk, so
+// notebook and dashboard visitors never download it.
+const CloudWorkstationsView = lazy(() =>
+  import("./workstations-view").then((module) => ({ default: module.CloudWorkstationsView })),
 );
 
 setLoggerHost({
@@ -42,10 +55,43 @@ setOpenUrlHost({
 
 installDocumentThemeSync();
 
+/**
+ * Start the app-wide auth store before React's first render, so the drivers own
+ * auth/app-session from boot and the seeded snapshot is available to the
+ * instant-paint matcher (F7). Config is route-derived: the notebook route seeds
+ * the bootstrap session and enables OIDC refresh for edit-mode links (the store
+ * ORs in a live app session), while the other routes always keep sign-in fresh.
+ */
+function bootCloudAuthStore(): void {
+  const authConfig = loadAuthConfig();
+  if (isHomePath() || isWorkstationsPath()) {
+    cloudAuthStore.activate({ authConfig, initialSession: null, appSessionRefreshFallback: true });
+    return;
+  }
+  if (isNotebookListPath()) {
+    cloudAuthStore.activate({
+      authConfig,
+      initialSession: loadCloudNotebookListBootstrap()?.session ?? null,
+      appSessionRefreshFallback: true,
+    });
+    return;
+  }
+  const runtime = loadViewerRuntime();
+  const initialSession = runtime.kind === "ready" ? (runtime.runtime.config.session ?? null) : null;
+  cloudAuthStore.activate({
+    authConfig,
+    initialSession,
+    appSessionRefreshFallback: true,
+    autoRefreshOidc: cloudNotebookModeFromSearch(window.location.search) === "edit",
+  });
+}
+
+bootCloudAuthStore();
+
 function App() {
   const [authConfig] = useState<CloudViewerAuthConfig>(() => loadAuthConfig());
   const [runtimeState] = useState<ViewerRuntimeState | null>(() =>
-    isOidcCallbackPath() || isHomePath() || isNotebookListPath() ? null : loadViewerRuntime(),
+    isHomePath() || isNotebookListPath() || isWorkstationsPath() ? null : loadViewerRuntime(),
   );
 
   if (isHomePath()) {
@@ -59,8 +105,12 @@ function App() {
     return <CloudNotebookListView authConfig={authConfig} />;
   }
 
-  if (isOidcCallbackPath()) {
-    return <OidcCallbackView authConfig={authConfig} />;
+  if (isWorkstationsPath()) {
+    return (
+      <Suspense fallback={<ViewerStartupLoading title="Workstations" />}>
+        <CloudWorkstationsView authConfig={authConfig} />
+      </Suspense>
+    );
   }
 
   if (!runtimeState) {
@@ -135,10 +185,38 @@ function ViewerStartupLoading({ title }: { title: string }) {
   );
 }
 
+/**
+ * Dev/profiling instrumentation, not a product surface. When the viewer URL
+ * carries `?profile=1`, wrap the root in a React `<Profiler>` that tallies
+ * commit counts on `window.__nteractRenderCounts` keyed by Profiler id, for the
+ * local profiling harness (`scripts/profile-local.mjs`) to read after settle.
+ * Invariant: without the flag no Profiler mounts and nothing attaches to
+ * window; the tree is returned unchanged. The helper itself and its one
+ * URLSearchParams parse still ship in the normal bundle.
+ */
+function withRenderProfiler(node: ReactNode): ReactNode {
+  if (new URLSearchParams(window.location.search).get("profile") !== "1") {
+    return node;
+  }
+  const counters = ((
+    window as unknown as { __nteractRenderCounts?: Record<string, number> }
+  ).__nteractRenderCounts ??= {});
+  return (
+    <Profiler
+      id="cloud-viewer-app"
+      onRender={(id) => {
+        counters[id] = (counters[id] ?? 0) + 1;
+      }}
+    >
+      {node}
+    </Profiler>
+  );
+}
+
 createRoot(requireElement("#root")).render(
   <ErrorBoundary
     fallback={(error) => <ViewerStartupError message={`Cloud viewer crashed: ${error.message}`} />}
   >
-    <App />
+    {withRenderProfiler(<App />)}
   </ErrorBoundary>,
 );

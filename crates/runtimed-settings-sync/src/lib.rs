@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use notebook_protocol::connection::{self, Handshake};
 use runtimed_client::settings_doc::{
     default_pool_sizes_for_python_env, read_nested_list, split_comma_list, ColorTheme,
-    CondaDefaults, PixiDefaults, SyncedSettings, ThemeMode, UvDefaults,
+    CondaDefaults, EditorSettings, PixiDefaults, SyncedSettings, ThemeMode, UvDefaults,
 };
 
 /// Error type for sync client operations.
@@ -513,6 +513,23 @@ pub fn get_all_from_doc(doc: &AutoCommit) -> SyncedSettings {
             })
     };
 
+    let get_nested_str = |map_key: &str, sub_key: &str| -> Option<String> {
+        let map_id = match doc.get(automerge::ROOT, map_key).ok().flatten() {
+            Some((automerge::Value::Object(ObjType::Map), id)) => id,
+            _ => return None,
+        };
+        doc.get(&map_id, sub_key)
+            .ok()
+            .flatten()
+            .and_then(|(value, _)| match value {
+                automerge::Value::Scalar(s) => match s.as_ref() {
+                    automerge::ScalarValue::Str(s) => Some(s.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+    };
+
     // Get a u64 value from the doc
     let get_u64 = |key: &str| -> Option<u64> {
         match doc.get(automerge::ROOT, key).ok().flatten() {
@@ -529,6 +546,20 @@ pub fn get_all_from_doc(doc: &AutoCommit) -> SyncedSettings {
     // Get a bool value from the doc
     let get_bool = |key: &str| -> Option<bool> {
         match doc.get(automerge::ROOT, key).ok().flatten() {
+            Some((automerge::Value::Scalar(s), _)) => match s.as_ref() {
+                automerge::ScalarValue::Boolean(b) => Some(*b),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+
+    let get_nested_bool = |map_key: &str, sub_key: &str| -> Option<bool> {
+        let map_id = match doc.get(automerge::ROOT, map_key).ok().flatten() {
+            Some((automerge::Value::Object(ObjType::Map), id)) => id,
+            _ => return None,
+        };
+        match doc.get(&map_id, sub_key).ok().flatten() {
             Some((automerge::Value::Scalar(s), _)) => match s.as_ref() {
                 automerge::ScalarValue::Boolean(b) => Some(*b),
                 _ => None,
@@ -573,6 +604,14 @@ pub fn get_all_from_doc(doc: &AutoCommit) -> SyncedSettings {
         color_theme: get_str("color_theme")
             .and_then(|s| serde_json::from_str::<ColorTheme>(&format!("\"{s}\"")).ok())
             .unwrap_or(defaults.color_theme),
+        editor: EditorSettings {
+            code_font_family: get_nested_str("editor", "code_font_family")
+                .unwrap_or_else(|| defaults.editor.code_font_family.clone()),
+            markdown_font_family: get_nested_str("editor", "markdown_font_family")
+                .unwrap_or_else(|| defaults.editor.markdown_font_family.clone()),
+            line_numbers: get_nested_bool("editor", "line_numbers")
+                .unwrap_or(defaults.editor.line_numbers),
+        },
         default_runtime: get_str("default_runtime")
             .and_then(|s| s.parse().ok())
             .unwrap_or_default(),
@@ -598,6 +637,9 @@ pub fn get_all_from_doc(doc: &AutoCommit) -> SyncedSettings {
             .unwrap_or(defaults.install_default_data_packages),
         disable_nteract_launcher: get_bool("disable_nteract_launcher")
             .unwrap_or(defaults.disable_nteract_launcher),
+        enable_comments: get_bool("enable_comments").unwrap_or(defaults.enable_comments),
+        disable_auto_format: get_bool("disable_auto_format")
+            .unwrap_or(defaults.disable_auto_format),
         redact_env_values_in_outputs: get_bool("redact_env_values_in_outputs")
             .unwrap_or(defaults.redact_env_values_in_outputs),
         import_shell_environment: get_bool("import_shell_environment")
@@ -814,6 +856,43 @@ mod tests {
         let settings = get_all_from_doc(&doc);
         assert!(settings.disable_nteract_launcher);
         assert!(!settings.feature_flags().bootstrap_dx);
+    }
+
+    #[test]
+    fn test_get_all_reads_enable_comments() {
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "enable_comments", true).unwrap();
+
+        let settings = get_all_from_doc(&doc);
+        assert!(settings.enable_comments);
+    }
+
+    #[test]
+    fn test_get_all_reads_disable_auto_format() {
+        let mut doc = AutoCommit::new();
+        doc.put(automerge::ROOT, "disable_auto_format", true)
+            .unwrap();
+
+        let settings = get_all_from_doc(&doc);
+        assert!(settings.disable_auto_format);
+    }
+
+    #[test]
+    fn test_get_all_reads_editor_settings() {
+        let mut doc = AutoCommit::new();
+        let editor_id = doc
+            .put_object(automerge::ROOT, "editor", ObjType::Map)
+            .unwrap();
+        doc.put(&editor_id, "code_font_family", "\"Hack\", monospace")
+            .unwrap();
+        doc.put(&editor_id, "markdown_font_family", "Georgia, serif")
+            .unwrap();
+        doc.put(&editor_id, "line_numbers", true).unwrap();
+
+        let settings = get_all_from_doc(&doc);
+        assert_eq!(settings.editor.code_font_family, "\"Hack\", monospace");
+        assert_eq!(settings.editor.markdown_font_family, "Georgia, serif");
+        assert!(settings.editor.line_numbers);
     }
 
     #[test]

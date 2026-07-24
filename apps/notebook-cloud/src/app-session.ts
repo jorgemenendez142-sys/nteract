@@ -5,6 +5,7 @@ export interface AppSessionEnvironment {
 }
 
 export interface CloudAppSession {
+  cacheKey: string;
   displayName?: string;
   expiresAt: number;
   issuedAt: number;
@@ -20,6 +21,7 @@ interface CloudAppSessionPayload {
   ns: string;
   principal: string;
   provider: "oidc";
+  sid?: string;
   v: 1;
 }
 
@@ -50,7 +52,35 @@ export async function createCloudAppSessionCookie(
     ns: identity.metadata.principalNamespace,
     iat: nowSeconds,
     exp: nowSeconds + NOTEBOOK_CLOUD_APP_SESSION_MAX_AGE_SECONDS,
+    sid: crypto.randomUUID(),
     ...(displayName ? { display_name: displayName } : {}),
+  };
+  const value = await signCloudAppSession(env, payload);
+  return `${NOTEBOOK_CLOUD_APP_SESSION_COOKIE_NAME}=${value}; Path=/; Max-Age=${NOTEBOOK_CLOUD_APP_SESSION_MAX_AGE_SECONDS}; HttpOnly; Secure; SameSite=Lax`;
+}
+
+export async function appSessionRenewalCookie(
+  env: AppSessionEnvironment,
+  session: CloudAppSession | null | undefined,
+  nowSeconds = currentEpochSeconds(),
+): Promise<string | null> {
+  if (!session || session.expiresAt <= nowSeconds) {
+    return null;
+  }
+  const remainingSeconds = session.expiresAt - nowSeconds;
+  if (remainingSeconds >= NOTEBOOK_CLOUD_APP_SESSION_MAX_AGE_SECONDS / 2) {
+    return null;
+  }
+
+  const payload: CloudAppSessionPayload = {
+    v: 1,
+    provider: "oidc",
+    principal: session.principal,
+    ns: session.principalNamespace,
+    iat: nowSeconds,
+    exp: nowSeconds + NOTEBOOK_CLOUD_APP_SESSION_MAX_AGE_SECONDS,
+    sid: crypto.randomUUID(),
+    ...(session.displayName ? { display_name: session.displayName } : {}),
   };
   const value = await signCloudAppSession(env, payload);
   return `${NOTEBOOK_CLOUD_APP_SESSION_COOKIE_NAME}=${value}; Path=/; Max-Age=${NOTEBOOK_CLOUD_APP_SESSION_MAX_AGE_SECONDS}; HttpOnly; Secure; SameSite=Lax`;
@@ -77,6 +107,7 @@ export async function readCloudAppSession(
 
   return {
     provider: payload.provider,
+    cacheKey: await appSessionCacheKey(env, payload),
     principal: payload.principal,
     principalNamespace: payload.ns,
     issuedAt: payload.iat,
@@ -92,6 +123,25 @@ async function signCloudAppSession(
   const encodedPayload = base64UrlEncodeString(JSON.stringify(payload));
   const signature = await hmacSha256(env, encodedPayload);
   return `${encodedPayload}.${base64UrlEncodeBytes(signature)}`;
+}
+
+async function appSessionCacheKey(
+  env: AppSessionEnvironment,
+  payload: CloudAppSessionPayload,
+): Promise<string> {
+  const signature = await hmacSha256(
+    env,
+    [
+      "app-session-cache:v1",
+      payload.provider,
+      payload.ns,
+      payload.principal,
+      String(payload.iat),
+      String(payload.exp),
+      payload.sid ?? "",
+    ].join(":"),
+  );
+  return base64UrlEncodeBytes(signature);
 }
 
 async function verifyCloudAppSession(
@@ -178,6 +228,7 @@ function isCloudAppSessionPayload(value: unknown): value is CloudAppSessionPaylo
     typeof payload.ns === "string" &&
     Number.isFinite(payload.iat) &&
     Number.isFinite(payload.exp) &&
+    (payload.sid === undefined || typeof payload.sid === "string") &&
     (payload.display_name === undefined || typeof payload.display_name === "string")
   );
 }

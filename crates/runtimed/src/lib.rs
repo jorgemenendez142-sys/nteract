@@ -27,6 +27,7 @@ pub use runtimed_settings_sync as sync_client;
 pub(crate) mod async_outcome;
 pub mod blob_server;
 pub mod blob_store;
+pub mod bokeh_session;
 pub mod cloud_peer;
 pub mod daemon;
 pub mod daemon_telemetry;
@@ -38,10 +39,13 @@ pub(crate) mod ipykernel_error;
 pub mod jupyter_kernel;
 pub mod kernel_connection;
 pub mod kernel_dispatch;
+pub(crate) mod kernel_launch_failure;
 pub(crate) mod kernel_ports;
 pub mod kernel_state;
 pub mod launcher_cache;
 pub mod markdown_assets;
+pub(crate) mod matplotlib_widget;
+pub(crate) mod notebook_registry;
 pub mod notebook_sync_server;
 pub(crate) mod output_blob_publisher;
 pub(crate) mod output_commit_context;
@@ -77,6 +81,10 @@ pub mod workstation;
 
 pub fn trusted_packages_db_path() -> std::path::PathBuf {
     runt_workspace::daemon_base_dir().join("trusted-packages.sqlite")
+}
+
+pub fn notebook_registry_db_path() -> std::path::PathBuf {
+    runt_workspace::daemon_base_dir().join("notebook-registry.sqlite")
 }
 
 /// Get the daemon version string (e.g., "0.1.0-dev.10+abc123").

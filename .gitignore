@@ -77,6 +77,8 @@ python/nteract/src/nteract/_widget.html
 /apps/notebook/src/renderer-plugins/isolated-renderer.css
 /apps/notebook/src/renderer-plugins/markdown.js
 /apps/notebook/src/renderer-plugins/markdown.css
+/apps/notebook/src/renderer-plugins/bokeh.js
+/apps/notebook/src/renderer-plugins/panel.js
 /apps/notebook/src/renderer-plugins/sift.js
 /apps/notebook/src/renderer-plugins/sift.css
 # wasm-pack outputs, rebuilt by `cargo xtask wasm`. xtask build/dev commands
@@ -103,6 +105,10 @@ crates/notebook/fixtures/**/uv.lock
 # Agent workspace context (per-worktree state)
 .context/
 .codex/environments/environment.toml
+
+# Project-scoped Codex config is source, not per-worktree state.
+!.codex/
+!.codex/config.toml
 
 # Override global gitignore for .claude — rules and skills are project docs
 !.claude/
@@ -147,3 +153,15 @@ scripts/apt/debs/*.deb
 
 # Superpowers brainstorming scratch
 .superpowers/
+
+# design-sync (generated/staged; durable inputs under .design-sync/ stay tracked)
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
+.design-sync/compiled.css
+.design-sync/synthpkg/entry.tsx
+.design-sync/synthpkg/compiled.css
+.design-sync/synthpkg/types/
+.design-sync/synthpkg/tsconfig.emit.json

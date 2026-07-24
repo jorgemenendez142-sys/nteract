@@ -45,6 +45,7 @@ import {
   rendererPluginInfoForMime,
   rendererPluginNameForMime,
 } from "@/components/isolated/renderer-plugin-info";
+import { Eyebrow } from "@/components/surface-primitives";
 
 const laneOutputs: JupyterOutput[] = [
   {
@@ -579,9 +580,7 @@ export function IsolatedOutputSurfacesExample() {
           </p>
         </div>
         <div className="border-b border-fd-border p-4">
-          <h3 className="text-xs font-semibold uppercase text-fd-muted-foreground">
-            Output frame boundary map
-          </h3>
+          <Eyebrow as="h3">Output frame boundary map</Eyebrow>
           <p className="mt-2 text-xs leading-5 text-fd-muted-foreground">
             The catalog can preview the same decision points, but it does not serve the daemon
             output document. Production MCP hosts only switch to the daemon{" "}
@@ -892,7 +891,7 @@ export function IsolatedOutputSurfacesExample() {
                 {(mcpFrameEvents.length > 0 ? mcpFrameEvents : ["waiting"]).map((event, index) => (
                   <span
                     key={`${index}-${event}`}
-                    className="rounded-full border border-fd-border bg-fd-card px-2 py-1 font-mono text-[11px] text-fd-muted-foreground"
+                    className="font-mono text-[11px] text-fd-muted-foreground"
                   >
                     {event}
                   </span>

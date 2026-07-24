@@ -5,17 +5,40 @@
 //! Automerge CRDT) for execution lifecycle state, using the CRDT as the
 //! source of truth instead of relying on broadcast hints.
 
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Duration;
 
 use notebook_protocol::protocol::{NotebookRequest, NotebookResponse};
 use notebook_sync::execution_wait::{
-    await_execution_terminal, ExecutionTerminalError, ExecutionTerminalState,
+    await_all_executions_terminal, await_execution_terminal, ExecutionTerminalError,
+    ExecutionTerminalState,
 };
 use notebook_sync::handle::DocHandle;
 use runtimed_outputs::output_resolver;
 use runtimed_outputs::resolved_output::Output;
 use tracing::warn;
+
+#[derive(Debug, Clone)]
+pub struct ExecutionDispatchError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl ExecutionDispatchError {
+    fn sync_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: "sync_failed",
+            message: message.into(),
+        }
+    }
+
+    fn not_ready(message: impl Into<String>) -> Self {
+        Self {
+            code: "notebook_not_ready",
+            message: message.into(),
+        }
+    }
+}
 
 /// Result of executing a cell.
 pub struct ExecutionResult {
@@ -25,9 +48,13 @@ pub struct ExecutionResult {
     /// Agents can pass this to `get_cell(execution_id=...)` to read
     /// outputs for this specific execution, bypassing the cell's
     /// current pointer.
-    pub execution_id: Option<String>,
+    pub execution_id: String,
     /// Resolved outputs from the cell after execution.
     pub outputs: Vec<Output>,
+    /// Output manifests that produced `outputs` and `resolved_outputs_by_manifest`.
+    pub output_manifests: Vec<serde_json::Value>,
+    /// Resolved outputs indexed to the original output manifest positions.
+    pub resolved_outputs_by_manifest: Vec<Option<Output>>,
     /// Execution count (e.g., "5" for In[5]).
     pub execution_count: Option<String>,
     /// Final status: "done", "error", "running" (if timed out).
@@ -66,15 +93,13 @@ pub async fn execute_and_wait(
     timeout: Duration,
     blob_base_url: &Option<String>,
     blob_store_path: &Option<std::path::PathBuf>,
-) -> ExecutionResult {
+) -> Result<ExecutionResult, ExecutionDispatchError> {
     // Step 1: Capture the source version this command is meant to observe.
-    let required_heads = match handle.current_heads_hex() {
-        Ok(heads) => heads,
-        Err(e) => {
-            warn!("failed to capture notebook heads before execution: {e}");
-            Vec::new()
-        }
-    };
+    let required_heads = handle.current_heads_hex().map_err(|error| {
+        ExecutionDispatchError::sync_failed(format!(
+            "Could not capture the notebook heads required for execution: {error}"
+        ))
+    })?;
 
     // Step 2: Submit execution request
     let request = NotebookRequest::ExecuteCell {
@@ -86,17 +111,22 @@ pub async fn execute_and_wait(
         .await;
 
     let execution_id = match response {
-        Ok(NotebookResponse::CellQueued { execution_id, .. }) => Some(execution_id),
-        Ok(_) => None,
-        Err(_e) => {
-            return ExecutionResult {
-                cell_id: cell_id.to_string(),
-                execution_id: None,
-                outputs: Vec::new(),
-                execution_count: None,
-                status: "error".to_string(),
-                success: false,
-            };
+        Ok(NotebookResponse::CellQueued { execution_id, .. }) => execution_id,
+        Ok(NotebookResponse::Error { error })
+        | Ok(NotebookResponse::GuardRejected { reason: error }) => {
+            return Err(ExecutionDispatchError::not_ready(format!(
+                "Execution was not queued: {error}"
+            )));
+        }
+        Ok(other) => {
+            return Err(ExecutionDispatchError::sync_failed(format!(
+                "Execution returned an unexpected daemon response: {other:?}"
+            )));
+        }
+        Err(error) => {
+            return Err(ExecutionDispatchError::sync_failed(format!(
+                "Execution could not be queued after the required heads: {error}"
+            )));
         }
     };
 
@@ -110,54 +140,37 @@ pub async fn execute_and_wait(
     let mut output_manifests: Vec<serde_json::Value> = Vec::new();
     let mut execution_count_from_wait: Option<i64> = None;
 
-    if let Some(ref eid) = execution_id {
-        match await_execution_terminal(handle, eid, timeout, None).await {
-            Ok(ExecutionTerminalState {
-                status,
-                success: s,
-                output_manifests: outs,
-                execution_count,
-            }) => {
-                final_status = status;
-                success = s;
-                output_manifests = outs;
-                execution_count_from_wait = execution_count;
-            }
-            Err(ExecutionTerminalError::Timeout) => {
-                // Leave `running` and fall through — caller can surface
-                // timeout based on the status field.
-            }
-            Err(ExecutionTerminalError::KernelFailed { reason }) => {
-                warn!("kernel failed during execution: {reason}");
-                final_status = "error".to_string();
-            }
+    match await_execution_terminal(handle, &execution_id, timeout, None).await {
+        Ok(ExecutionTerminalState {
+            status,
+            success: s,
+            output_manifests: outs,
+            execution_count,
+        }) => {
+            final_status = status;
+            success = s;
+            output_manifests = outs;
+            execution_count_from_wait = execution_count;
+        }
+        Err(ExecutionTerminalError::Timeout) => {
+            // Leave `running` and fall through — caller can surface
+            // timeout based on the status field.
+        }
+        Err(ExecutionTerminalError::KernelFailed { reason }) => {
+            warn!("kernel failed during execution: {reason}");
+            final_status = "error".to_string();
         }
     }
 
     // Step 4: Collect outputs from CRDT.
     // Prefer output hashes from RuntimeStateDoc (already returned above).
-    // Fall back to handle.get_cell() which reads via execution_id facade.
-    let execution_count = if let Some(count) = execution_count_from_wait {
-        Some(count.to_string())
-    } else if execution_id.is_none() {
-        // Fallback: find most recent execution for this cell with an execution_count
-        let ec = crate::tools::cell_read::get_cell_execution_count_from_runtime(handle, cell_id);
-        if ec.is_empty() {
-            None
-        } else {
-            Some(ec)
-        }
-    } else {
-        None
-    };
+    let execution_count = execution_count_from_wait.map(|count| count.to_string());
 
     let comms = handle.get_runtime_state().ok().map(|rs| rs.comms);
     let mut execution_cell_map = execution_cell_map(handle);
-    if let Some(eid) = &execution_id {
-        execution_cell_map
-            .entry(eid.clone())
-            .or_insert_with(|| cell_id.to_string());
-    }
+    execution_cell_map
+        .entry(execution_id.clone())
+        .or_insert_with(|| cell_id.to_string());
     // Execute paths (and `and_run` variants) always use preview mode —
     // agents that need unabridged output should call `get_cell(full_output=true)`
     // afterwards rather than paying for it on every run.
@@ -168,33 +181,33 @@ pub async fn execute_and_wait(
         execution_cell_map: Some(&execution_cell_map),
         ..Default::default()
     };
-    let outputs = if !output_manifests.is_empty() {
-        output_resolver::resolve_cell_outputs_for_llm(&output_manifests, ctx).await
+    let output_manifests = if !output_manifests.is_empty() {
+        output_manifests
     } else {
         // Outputs live in RuntimeStateDoc under execution_id/output_id. Fetch
         // via the explicit lookup — CellSnapshot no longer carries them.
-        let raw_outputs = handle.get_cell_outputs(cell_id).unwrap_or_default();
-        if raw_outputs.is_empty() {
-            Vec::new()
-        } else {
-            output_resolver::resolve_cell_outputs_for_llm(&raw_outputs, ctx).await
-        }
+        handle.get_cell_outputs(cell_id).unwrap_or_default()
     };
 
-    // Determine status from outputs if we didn't get it from RuntimeState
-    if final_status == "idle" && outputs.iter().any(|o| o.output_type == "error") {
-        final_status = "error".to_string();
-        success = false;
-    }
+    let (outputs, resolved_outputs_by_manifest) = if output_manifests.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let aligned =
+            output_resolver::resolve_cell_outputs_for_llm_aligned(&output_manifests, ctx).await;
+        let outputs = aligned.iter().flatten().cloned().collect();
+        (outputs, aligned)
+    };
 
-    ExecutionResult {
+    Ok(ExecutionResult {
         cell_id: cell_id.to_string(),
         execution_id,
         outputs,
+        output_manifests,
+        resolved_outputs_by_manifest,
         execution_count,
         status: final_status,
         success,
-    }
+    })
 }
 
 /// Result of running all cells.
@@ -214,14 +227,12 @@ pub struct RunAllResult {
 /// 2. Sends `RunAllCells` request.
 ///
 /// Returns immediately with the queued cell→execution ID mapping.
-pub async fn run_all_and_queue(handle: &DocHandle) -> RunAllResult {
-    let required_heads = match handle.current_heads_hex() {
-        Ok(heads) => heads,
-        Err(e) => {
-            warn!("failed to capture notebook heads before run_all_cells: {e}");
-            Vec::new()
-        }
-    };
+pub async fn run_all_and_queue(handle: &DocHandle) -> Result<RunAllResult, ExecutionDispatchError> {
+    let required_heads = handle.current_heads_hex().map_err(|error| {
+        ExecutionDispatchError::sync_failed(format!(
+            "Could not capture the notebook heads required to run all cells: {error}"
+        ))
+    })?;
 
     let response = handle
         .send_request_after_heads(
@@ -237,12 +248,21 @@ pub async fn run_all_and_queue(handle: &DocHandle) -> RunAllResult {
             .into_iter()
             .map(|q| (q.cell_id, q.execution_id))
             .collect(),
-        _ => {
-            return RunAllResult {
-                timed_out: false,
-                status: "error".to_string(),
-                cell_execution_ids: HashMap::new(),
-            };
+        Ok(NotebookResponse::Error { error })
+        | Ok(NotebookResponse::GuardRejected { reason: error }) => {
+            return Err(ExecutionDispatchError::not_ready(format!(
+                "Run all was not queued: {error}"
+            )));
+        }
+        Ok(other) => {
+            return Err(ExecutionDispatchError::sync_failed(format!(
+                "Run all returned an unexpected daemon response: {other:?}"
+            )));
+        }
+        Err(error) => {
+            return Err(ExecutionDispatchError::sync_failed(format!(
+                "Run all could not be queued after the required heads: {error}"
+            )));
         }
     };
 
@@ -253,77 +273,46 @@ pub async fn run_all_and_queue(handle: &DocHandle) -> RunAllResult {
     }
     .to_string();
 
-    RunAllResult {
+    Ok(RunAllResult {
         timed_out: false,
         status,
         cell_execution_ids,
-    }
+    })
 }
 
 /// Run all cells and wait for completion.
 ///
-/// Composes `run_all_and_queue` with a polling phase that waits for all
-/// queued execution IDs to reach terminal status in the RuntimeStateDoc.
+/// Composes `run_all_and_queue` with `await_all_executions_terminal`, which
+/// waits for every queued execution ID to reach terminal status in the
+/// RuntimeStateDoc against one shared deadline, then runs a single trailing
+/// output-sync grace pass. Kernel failure while executions are still pending
+/// maps to `status: "error"` (the kernel is gone, so later cells cannot
+/// run); hitting the deadline maps to `status: "timed_out"`.
 ///
 /// Returns a lightweight `RunAllResult` with overall status. The caller should
 /// read the full notebook state after this returns to build the summary view.
-pub async fn run_all_and_wait(handle: &DocHandle, timeout: Duration) -> RunAllResult {
-    let mut result = run_all_and_queue(handle).await;
+pub async fn run_all_and_wait(
+    handle: &DocHandle,
+    timeout: Duration,
+) -> Result<RunAllResult, ExecutionDispatchError> {
+    let mut result = run_all_and_queue(handle).await?;
 
     if result.status == "error" || result.cell_execution_ids.is_empty() {
-        return result;
+        return Ok(result);
     }
 
-    let execution_ids: HashSet<&str> = result
-        .cell_execution_ids
-        .values()
-        .map(|s| s.as_str())
-        .collect();
+    let execution_ids: Vec<String> = result.cell_execution_ids.values().cloned().collect();
+    let outcome = await_all_executions_terminal(handle, &execution_ids, timeout).await;
 
-    // Poll RuntimeStateDoc for all execution IDs to reach terminal status.
-    let deadline = Instant::now() + timeout;
-    let mut all_terminal = false;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        if let Ok(state) = handle.get_runtime_state() {
-            all_terminal = execution_ids.iter().all(|eid| {
-                state.executions.get(*eid).is_some_and(|exec| {
-                    exec.status == "done" || exec.status == "error" || exec.status == "cancelled"
-                })
-            });
-            if all_terminal {
-                break;
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // Derive overall status.
-    let timed_out = !all_terminal;
-    let has_error = handle.get_runtime_state().ok().is_some_and(|state| {
-        execution_ids.iter().any(|eid| {
-            state
-                .executions
-                .get(*eid)
-                .is_some_and(|exec| exec.status == "error")
-        })
-    });
-
-    result.timed_out = timed_out;
-    result.status = if timed_out {
+    result.timed_out = outcome.timed_out;
+    result.status = if outcome.timed_out {
         "timed_out"
-    } else if has_error {
+    } else if outcome.has_error {
         "error"
     } else {
         "completed"
     }
     .to_string();
 
-    result
+    Ok(result)
 }

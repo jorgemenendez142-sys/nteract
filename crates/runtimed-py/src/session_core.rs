@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use notebook_protocol::connection::LaunchSpec;
-use notebook_protocol::protocol::{NotebookRequest, NotebookResponse, SaveErrorKind};
+use notebook_protocol::protocol::{NotebookRequest, NotebookResponse, SaveBlockedReason};
 use notebook_sync::{BroadcastReceiver, DocHandle};
 use runtime_doc::{KernelActivity, RuntimeLifecycle};
 
@@ -479,38 +479,25 @@ pub(crate) async fn connect_open(
     Ok((notebook_id, state, connection_info))
 }
 
-/// Connect and create a new notebook.
+/// Connect and create the notebook described by `spec`.
+///
+/// An empty `spec.actor_label` is replaced with the default label so the
+/// daemon always sees an operator for Python sessions.
 ///
 /// Returns (notebook_id, populated SessionState, NotebookConnectionInfo).
 pub(crate) async fn connect_create(
     socket_path: PathBuf,
-    runtime: &str,
-    working_dir: Option<PathBuf>,
-    actor_label: Option<&str>,
-    package_manager: Option<notebook_protocol::connection::PackageManager>,
-    dependencies: Vec<String>,
-    environment_mode: Option<notebook_protocol::connection::CreateNotebookEnvironmentMode>,
+    mut spec: notebook_sync::connect::CreateNotebookSpec,
 ) -> PyResult<(String, SessionState, NotebookConnectionInfo)> {
-    let default_label;
-    let label = match actor_label {
-        Some(l) => l,
-        None => {
-            default_label = make_actor_label(DEFAULT_ACTOR_LABEL);
-            &default_label
-        }
-    };
-    let result = notebook_sync::connect::connect_create_with_environment_mode(
-        socket_path.clone(),
-        runtime,
-        working_dir.clone(),
-        label,
-        false,
-        package_manager,
-        dependencies,
-        environment_mode,
-    )
-    .await
-    .map_err(to_py_err)?;
+    if spec.actor_label.is_empty() {
+        spec.actor_label = make_actor_label(DEFAULT_ACTOR_LABEL);
+    }
+    let runtime = spec.runtime.clone();
+    let working_dir = spec.working_dir.clone();
+    let actor_label = spec.actor_label.clone();
+    let result = notebook_sync::connect::connect_create(socket_path.clone(), spec)
+        .await
+        .map_err(to_py_err)?;
     result
         .handle
         .await_session_ready()
@@ -530,14 +517,14 @@ pub(crate) async fn connect_create(
         kernel_started: false,
         kernel_type: None,
         env_source: None,
-        runtime: runtime.to_string(),
+        runtime: runtime.clone(),
         blob_base_url,
         blob_store_path,
         connection_info: Some(connection_info.clone()),
         notebook_path: working_dir.map(|p| p.to_string_lossy().to_string()),
         settings,
         peer_label: None, // Set by caller (Session/AsyncSession)
-        actor_label: actor_label.map(String::from),
+        actor_label: Some(actor_label),
     };
 
     hydrate_kernel_state(&mut state);
@@ -1891,17 +1878,33 @@ pub(crate) async fn save(
     let response = handle.send_request(request).await.map_err(to_py_err)?;
 
     match response {
-        NotebookResponse::NotebookSaved { path: saved_path } => Ok(SaveResult { path: saved_path }),
-        NotebookResponse::SaveError { error } => match error {
-            SaveErrorKind::PathAlreadyOpen {
-                uuid,
-                path: conflict,
-            } => Err(to_py_err(format!(
-                "Cannot save: {conflict} is already open in session {uuid}. \
-                 Close that session first, then retry.",
-            ))),
-            SaveErrorKind::Io { message } => Err(to_py_err(message)),
-        },
+        NotebookResponse::NotebookSaved {
+            path: saved_path, ..
+        }
+        | NotebookResponse::NotebookAlreadyCurrent {
+            path: saved_path, ..
+        } => Ok(SaveResult { path: saved_path }),
+        NotebookResponse::NotebookSaveBlocked { reason, .. } => {
+            let message = match reason {
+                SaveBlockedReason::PathAlreadyOpen { uuid, path } => format!(
+                    "Cannot save: {path} is already open in session {uuid}. Close that session first, then retry."
+                ),
+                SaveBlockedReason::SequenceExhausted => {
+                    "save checkpoint sequence exhausted".to_string()
+                }
+                SaveBlockedReason::Superseded { latest_sequence } => format!(
+                    "save was superseded by newer sequence {latest_sequence}"
+                ),
+                SaveBlockedReason::SourceConflict { message } => {
+                    format!("source conflict requires explicit reconciliation: {message}")
+                }
+                SaveBlockedReason::SourceDegraded { message } => {
+                    format!("source is degraded: {message}")
+                }
+                SaveBlockedReason::Io { message } => message,
+            };
+            Err(to_py_err(message))
+        }
         NotebookResponse::Error { error } => Err(to_py_err(error)),
         other => Err(to_py_err(format!("Unexpected response: {:?}", other))),
     }
@@ -2264,30 +2267,7 @@ async fn ensure_kernel_started(
 
 /// Resolve blob server URL and store path from daemon info.
 async fn resolve_blob_paths(socket_path: &Path) -> (Option<String>, Option<PathBuf>) {
-    if let Some(parent) = socket_path.parent() {
-        let daemon_json = parent.join("daemon.json");
-        let base_url = if daemon_json.exists() {
-            tokio::fs::read_to_string(&daemon_json)
-                .await
-                .ok()
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-                .and_then(|info| info.get("blob_port").and_then(|p| p.as_u64()))
-                .map(|port| format!("http://localhost:{}", port))
-        } else {
-            None
-        };
-
-        let store_path = parent.join("blobs");
-        let store_path = if store_path.exists() {
-            Some(store_path)
-        } else {
-            None
-        };
-
-        (base_url, store_path)
-    } else {
-        (None, None)
-    }
+    runtimed_client::daemon_paths::get_blob_paths_async(socket_path).await
 }
 
 // =========================================================================

@@ -1,0 +1,32 @@
+.comment-highlight {
+  --cm-comment-color: hsl(45 93% 47%);
+  background-color: color-mix(in srgb, var(--cm-comment-color) 22%, transparent);
+  border-bottom: 2px solid color-mix(in srgb, var(--cm-comment-color) 70%, transparent);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.comment-highlight:hover {
+  background-color: color-mix(in srgb, var(--cm-comment-color) 38%, transparent);
+}
+
+.comment-highlight-resolved {
+  background-color: color-mix(in srgb, var(--muted-foreground, #737373) 12%, transparent);
+  /* Resolved threads keep only a faint tint. The underline is the open-comment
+     "needs attention" cue, so a resolved thread drops it. */
+  border-bottom: none;
+}
+
+/* Compose preview: the range the open composer will attach to. It is tentative
+   and not yet a real comment, so it reads as a softer, dashed version of a
+   committed highlight and is not interactive. */
+.comment-highlight-pending {
+  background-color: color-mix(in srgb, var(--cm-comment-color) 14%, transparent);
+  border-bottom-style: dashed;
+  cursor: text;
+}
+
+.comment-highlight-pending:hover {
+  background-color: color-mix(in srgb, var(--cm-comment-color) 14%, transparent);
+}

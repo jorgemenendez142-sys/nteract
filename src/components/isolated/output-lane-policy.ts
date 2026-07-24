@@ -1,4 +1,15 @@
 import type { JupyterOutput } from "@/components/cell/jupyter-output";
+import {
+  BOKEHJS_EXEC_MIME_TYPE,
+  BOKEHJS_LOAD_MIME_TYPE,
+  NTERACT_BOKEH_SESSION_MIME_TYPE,
+  isBokehMimeType,
+} from "@/components/outputs/bokeh-mime";
+import {
+  PANEL_EXEC_MIME_TYPE,
+  PANEL_LOAD_MIME_TYPE,
+  isPanelMimeType,
+} from "@/components/outputs/panel-mime";
 import { DEFAULT_PRIORITY, selectMimeType } from "@/components/outputs/mime-priority";
 import { isSafeForMainDom } from "@/components/outputs/safe-mime-types";
 import { isVegaMimeType } from "@/components/outputs/vega-mime";
@@ -35,6 +46,14 @@ const SCROLL_PASSTHROUGH_MIME_TYPES = new Set([
   "text/markdown",
   "text/html",
   "image/svg+xml",
+  // JavaScript display outputs often act on adjacent HTML display outputs in
+  // the same cell (Bokeh and Panel notebook loader/root pairs are common).
+  "application/javascript",
+  BOKEHJS_LOAD_MIME_TYPE,
+  BOKEHJS_EXEC_MIME_TYPE,
+  NTERACT_BOKEH_SESSION_MIME_TYPE,
+  PANEL_LOAD_MIME_TYPE,
+  PANEL_EXEC_MIME_TYPE,
   // Sift's interactive tables are also click-to-engage (see SIFT_MIME_TYPES).
   "application/vnd.apache.parquet",
   "application/vnd.apache.arrow.stream",
@@ -79,6 +98,7 @@ export function outputAllowsScrollPassthrough(
   }
 
   const mimeType = selectedOutputMimeType(output, priority);
+  if (mimeType === null) return true;
   return mimeType !== null && isScrollPassthroughMimeType(mimeType);
 }
 
@@ -106,11 +126,27 @@ export function outputUsesPlotly(
   return mimeType === "application/vnd.plotly.v1+json";
 }
 
+export function outputUsesBokeh(
+  output: JupyterOutput,
+  priority: readonly string[] = DEFAULT_PRIORITY,
+): boolean {
+  const mimeType = selectedOutputMimeType(output, priority);
+  return mimeType !== null && isBokehMimeType(mimeType);
+}
+
+export function outputUsesPanel(
+  output: JupyterOutput,
+  priority: readonly string[] = DEFAULT_PRIORITY,
+): boolean {
+  const mimeType = selectedOutputMimeType(output, priority);
+  return mimeType !== null && isPanelMimeType(mimeType);
+}
+
 /**
  * Outputs whose iframe must own the wheel once the user engages it: Sift's
  * crossfilter tables scroll internally, and chart surfaces like Vega/Altair
- * and Plotly pan or zoom. While engaged the wheel-boundary forwarding is
- * locked so the page does not steal the gesture.
+ * Plotly, Bokeh, and Panel pan or zoom. While engaged the wheel-boundary
+ * forwarding is locked so the page does not steal the gesture.
  */
 export function outputUsesWheelOwningFrame(
   output: JupyterOutput,
@@ -119,7 +155,9 @@ export function outputUsesWheelOwningFrame(
   return (
     outputUsesSift(output, priority) ||
     outputUsesVega(output, priority) ||
-    outputUsesPlotly(output, priority)
+    outputUsesPlotly(output, priority) ||
+    outputUsesBokeh(output, priority) ||
+    outputUsesPanel(output, priority)
   );
 }
 
@@ -195,6 +233,16 @@ function laneStandsAlone(lane: OutputLane): boolean {
   return lane === "sift-frame" || lane === "vega-frame" || lane === "plotly-frame";
 }
 
+function isEmptyDisplayOutput(
+  output: JupyterOutput,
+  priority: readonly string[] = DEFAULT_PRIORITY,
+): boolean {
+  if (output.output_type !== "execute_result" && output.output_type !== "display_data") {
+    return false;
+  }
+  return selectedOutputMimeType(output, priority) === null;
+}
+
 export function splitOutputSegments(
   outputs: readonly JupyterOutput[],
   priority: readonly string[] = DEFAULT_PRIORITY,
@@ -205,7 +253,9 @@ export function splitOutputSegments(
     const lane = outputSegmentLane(output, priority);
     const previous = segments.at(-1);
 
-    if (!laneStandsAlone(lane) && previous && previous.lane === lane) {
+    if (previous?.lane === "static-frame" && isEmptyDisplayOutput(output, priority)) {
+      previous.outputs.push(output);
+    } else if (!laneStandsAlone(lane) && previous && previous.lane === lane) {
       previous.outputs.push(output);
     } else {
       segments.push({ lane, outputs: [output] });

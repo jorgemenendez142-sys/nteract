@@ -1,10 +1,12 @@
 import {
+  notebookShellWorkstationAcceleratorsCacheKey,
   notebookShellRuntimeTargetSummary,
   resolveNotebookShellRuntimeTarget,
   type NotebookShellAccessSource,
   type NotebookShellCapabilities,
   type NotebookShellRuntimeTargetKind,
 } from "./notebook-shell-capabilities";
+import { projectNotebookWorkstationAcceleratorSummary } from "./notebook-workstation-selection";
 import { getBoundedCacheValue, setBoundedCacheValue, stableCacheKey } from "./projection-cache";
 
 export type NotebookWorkstationPanelTone = "ready" | "available" | "offline";
@@ -16,13 +18,16 @@ export type NotebookWorkstationFactKind =
   | "kernel"
   | "cpu"
   | "memory"
+  | "accelerator"
   | "resource"
+  | "room_link"
   | "runtime_peers"
   | "working_directory"
   | "execution_state"
   | "remote_hint";
 
 export interface NotebookWorkstationFactProjection {
+  detail: string | null;
   kind: NotebookWorkstationFactKind;
   label: string;
   subtle: boolean;
@@ -72,8 +77,12 @@ export function projectNotebookWorkstationPanel(
     target.kernelStatusLabel ?? null,
     target.cpuCount ?? null,
     target.memoryBytes ?? null,
+    notebookShellWorkstationAcceleratorsCacheKey(target.accelerators),
     target.resourceLabel ?? null,
     target.runtimePeerCount ?? null,
+    target.roomLink?.status ?? null,
+    target.roomLink?.statusLabel ?? null,
+    target.roomLink?.lastSeenAt ?? null,
     target.workingDirectoryLabel ?? null,
     target.runtimeSessionId ?? null,
   ]);
@@ -103,8 +112,27 @@ export function projectNotebookWorkstationPanel(
   if (memoryLabel) {
     facts.push(workstationFact("memory", "RAM", memoryLabel));
   }
+  const acceleratorSummary = projectNotebookWorkstationAcceleratorSummary(
+    target.accelerators,
+    target.status === "offline",
+  );
+  if (acceleratorSummary) {
+    facts.push(
+      workstationFact(
+        "accelerator",
+        acceleratorSummary.label,
+        acceleratorSummary.value,
+        false,
+        acceleratorSummary.tone,
+        acceleratorSummary.detail,
+      ),
+    );
+  }
   if (!hasCpuCount && !memoryLabel && target.resourceLabel) {
     facts.push(workstationFact("resource", "Resources", target.resourceLabel));
+  }
+  if (target.roomLink) {
+    facts.push(roomLinkFact(target.roomLink));
   }
   if (typeof target.runtimePeerCount === "number" && target.runtimePeerCount > 0) {
     facts.push(workstationFact("runtime_peers", "Compute sessions", `${target.runtimePeerCount}`));
@@ -241,7 +269,22 @@ function isRuntimePeerDisconnectDetail(detail: string): boolean {
   const normalized = detail.trim().toLowerCase();
   return (
     normalized.startsWith("runtime peer disconnected") ||
-    normalized.includes("runtime peer left the room")
+    normalized.startsWith("compute disconnected") ||
+    normalized.includes("runtime peer left the room") ||
+    normalized.startsWith("room link lost")
+  );
+}
+
+function roomLinkFact(
+  roomLink: NonNullable<ReturnType<typeof resolveNotebookShellRuntimeTarget>["roomLink"]>,
+): NotebookWorkstationFactProjection {
+  const suffix = roomLink.lastSeenAt ? ` - last seen ${roomLink.lastSeenAt}` : "";
+  return workstationFact(
+    "room_link",
+    "Room link",
+    `${roomLink.statusLabel}${suffix}`,
+    false,
+    roomLink.status === "connected" ? "positive" : "attention",
   );
 }
 
@@ -318,6 +361,7 @@ function workstationFact(
   value: string,
   subtle = false,
   tone: NotebookWorkstationFactTone = "neutral",
+  detail: string | null = null,
 ): NotebookWorkstationFactProjection {
-  return Object.freeze({ kind, label, subtle, tone, value });
+  return Object.freeze({ detail, kind, label, subtle, tone, value });
 }

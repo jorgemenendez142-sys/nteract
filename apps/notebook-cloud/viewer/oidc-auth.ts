@@ -1,5 +1,32 @@
+// Browser-side OIDC client for the cloud viewer.
+//
+// The PKCE verifier lives in localStorage, so the viewer performs discovery and
+// token exchange itself. Every network request in this module is bounded by the
+// same timeout path so callback completion, login start, and token renewal fail
+// into recoverable UI instead of leaving a pending browser promise forever.
+
 export const NOTEBOOK_CLOUD_OIDC_REQUEST_STORAGE_KEY = "nteract:notebook-cloud:oidc-request";
 export const NOTEBOOK_CLOUD_OIDC_TOKEN_STORAGE_KEY = "nteract:notebook-cloud:oidc-token";
+export const DEFAULT_OIDC_FETCH_TIMEOUT_MS = 15_000;
+
+export type OidcFetchPhase = "discovery" | "token-exchange";
+export type OidcTimeoutSignalFactory = (timeoutMs: number) => AbortSignal;
+
+export interface OidcFetchTimeoutOptions {
+  timeoutMs?: number;
+  timeoutSignal?: OidcTimeoutSignalFactory;
+}
+
+export class OidcTimeoutError extends Error {
+  readonly phase: OidcFetchPhase;
+
+  constructor(phase: OidcFetchPhase) {
+    const subject = phase === "discovery" ? "OIDC discovery" : "OIDC token endpoint";
+    super(`${subject} did not respond before the sign-in timeout.`);
+    this.name = "OidcTimeoutError";
+    this.phase = phase;
+  }
+}
 
 export interface CloudOidcAuthConfig {
   issuer: string;
@@ -7,6 +34,11 @@ export interface CloudOidcAuthConfig {
   redirectUri: string;
   providerLabel?: string;
   scope?: string;
+  /**
+   * Set by the worker only under the NOTEBOOK_CLOUD_LOCAL_OIDC dev gate. Gates
+   * login_hint forwarding so production sign-in can never forward a URL hint.
+   */
+  localOidc?: boolean;
 }
 
 export interface CloudOidcRequestState {
@@ -63,11 +95,15 @@ export function normalizeOidcAuthConfig(
   if (!issuer || !clientId || !redirectUri) {
     return null;
   }
+  // The worker serializes this flag as a string; accept either shape.
+  const rawLocalOidc = (input as { localOidc?: unknown } | null | undefined)?.localOidc;
+  const localOidc = rawLocalOidc === true || rawLocalOidc === "true";
   return {
     issuer,
     clientId,
     redirectUri,
     ...(providerLabel ? { providerLabel } : {}),
+    ...(localOidc ? { localOidc: true } : {}),
     scope: input?.scope?.trim() || DEFAULT_OIDC_SCOPE,
   };
 }
@@ -114,7 +150,7 @@ export function refreshStoredOidcToken(
     storage: CloudOidcStorage;
     fetchImpl?: typeof fetch;
     nowSeconds?: number;
-  },
+  } & OidcFetchTimeoutOptions,
 ): Promise<CloudOidcTokenState> {
   const refreshKey = oidcRefreshKey(config);
   let storageRefreshes = refreshesByStorage.get(input.storage);
@@ -140,7 +176,7 @@ async function refreshStoredOidcTokenUncoalesced(
     storage: CloudOidcStorage;
     fetchImpl?: typeof fetch;
     nowSeconds?: number;
-  },
+  } & OidcFetchTimeoutOptions,
 ): Promise<CloudOidcTokenState> {
   const current = readStoredOidcTokenState(input.storage);
   if (!current.token) {
@@ -150,12 +186,13 @@ async function refreshStoredOidcTokenUncoalesced(
     throw new Error("Stored OIDC session cannot be refreshed.");
   }
 
-  const endpoints = await discoverOidcEndpoints(config, input.fetchImpl);
+  const endpoints = await discoverOidcEndpoints(config, input.fetchImpl, input);
   const response = await exchangeRefreshToken(
     config,
     endpoints,
     current.token.refreshToken,
     input.fetchImpl,
+    input,
   );
   return storeOidcTokenResponse(
     input.storage,
@@ -242,18 +279,44 @@ export function clearCloudOidcAuth(storage: Pick<CloudOidcStorage, "removeItem">
   storage.removeItem(NOTEBOOK_CLOUD_OIDC_TOKEN_STORAGE_KEY);
 }
 
+export function peekOidcReturnUrl(storage: Pick<CloudOidcStorage, "getItem">): string | null {
+  return readOidcRequestState(storage)?.returnUrl ?? null;
+}
+
 export async function beginOidcLogin(
   config: CloudOidcAuthConfig,
   input: {
     currentUrl: string;
     storage: CloudOidcStorage;
     fetchImpl?: typeof fetch;
-  },
+  } & OidcFetchTimeoutOptions,
 ): Promise<URL> {
   const requestState = await createOidcRequestState(input.currentUrl);
-  const endpoints = await discoverOidcEndpoints(config, input.fetchImpl);
+  const endpoints = await discoverOidcEndpoints(config, input.fetchImpl, input);
   input.storage.setItem(NOTEBOOK_CLOUD_OIDC_REQUEST_STORAGE_KEY, JSON.stringify(requestState));
-  return buildOidcAuthorizationUrl(config, endpoints, requestState);
+  return buildOidcAuthorizationUrl(
+    config,
+    endpoints,
+    requestState,
+    devLoginHint(config, input.currentUrl),
+  );
+}
+
+// The local dev issuer can grant more than one identity. Forward a `login_hint`
+// query param to the authorize request so local multi-user flows can select a
+// non-default user - but only when the worker marked this as the dev issuer
+// (`localOidc`), never by inferring dev-ness from the issuer URL, so production
+// sign-in can never forward an attacker-supplied URL hint.
+function devLoginHint(config: CloudOidcAuthConfig, currentUrl: string): string | undefined {
+  if (config.localOidc !== true) {
+    return undefined;
+  }
+  try {
+    const hint = new URL(currentUrl).searchParams.get("login_hint")?.trim();
+    return hint ? hint : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function completeOidcRedirect(
@@ -262,7 +325,7 @@ export async function completeOidcRedirect(
     callbackUrl: string;
     storage: CloudOidcStorage;
     fetchImpl?: typeof fetch;
-  },
+  } & OidcFetchTimeoutOptions,
 ): Promise<{ returnUrl: string; token: CloudOidcTokenState }> {
   const callbackUrl = new URL(input.callbackUrl);
   const error = callbackUrl.searchParams.get("error");
@@ -285,13 +348,14 @@ export async function completeOidcRedirect(
     throw new Error("OIDC callback state does not match the stored request");
   }
 
-  const endpoints = await discoverOidcEndpoints(config, input.fetchImpl);
+  const endpoints = await discoverOidcEndpoints(config, input.fetchImpl, input);
   const response = await exchangeAuthorizationCode(
     config,
     endpoints,
     code,
     requestState,
     input.fetchImpl,
+    input,
   );
   const token = storeOidcTokenResponse(input.storage, response);
   return {
@@ -304,6 +368,7 @@ export function buildOidcAuthorizationUrl(
   config: CloudOidcAuthConfig,
   endpoints: CloudOidcEndpoints,
   requestState: CloudOidcRequestState,
+  loginHint?: string,
 ): URL {
   const url = new URL(endpoints.authorizationEndpoint);
   url.searchParams.set("client_id", config.clientId);
@@ -313,16 +378,26 @@ export function buildOidcAuthorizationUrl(
   url.searchParams.set("response_type", "code");
   url.searchParams.set("scope", config.scope ?? DEFAULT_OIDC_SCOPE);
   url.searchParams.set("state", requestState.state);
+  if (loginHint) {
+    url.searchParams.set("login_hint", loginHint);
+  }
   return url;
 }
 
 export async function discoverOidcEndpoints(
   config: CloudOidcAuthConfig,
   fetchImpl: typeof fetch = fetch,
+  options: OidcFetchTimeoutOptions = {},
 ): Promise<CloudOidcEndpoints> {
-  const response = await fetchImpl(oidcDiscoveryUrl(config.issuer), {
-    headers: { Accept: "application/json" },
-  });
+  const response = await fetchWithTimeout(
+    fetchImpl,
+    oidcDiscoveryUrl(config.issuer),
+    {
+      headers: { Accept: "application/json" },
+    },
+    "discovery",
+    options,
+  );
   if (!response.ok) {
     throw new Error(`OIDC discovery failed: ${response.status}`);
   }
@@ -357,6 +432,7 @@ async function exchangeAuthorizationCode(
   code: string,
   requestState: CloudOidcRequestState,
   fetchImpl: typeof fetch = fetch,
+  options: OidcFetchTimeoutOptions = {},
 ): Promise<CloudOidcTokenResponse> {
   const form = new URLSearchParams();
   form.set("client_id", config.clientId);
@@ -365,14 +441,20 @@ async function exchangeAuthorizationCode(
   form.set("grant_type", "authorization_code");
   form.set("redirect_uri", config.redirectUri);
 
-  const response = await fetchImpl(endpoints.tokenEndpoint, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
+  const response = await fetchWithTimeout(
+    fetchImpl,
+    endpoints.tokenEndpoint,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: form,
     },
-    body: form,
-  });
+    "token-exchange",
+    options,
+  );
   if (!response.ok) {
     throw new Error(`OIDC token exchange failed: ${response.status}`);
   }
@@ -384,6 +466,7 @@ async function exchangeRefreshToken(
   endpoints: CloudOidcEndpoints,
   refreshToken: string,
   fetchImpl: typeof fetch = fetch,
+  options: OidcFetchTimeoutOptions = {},
 ): Promise<CloudOidcTokenResponse> {
   const form = new URLSearchParams();
   form.set("client_id", config.clientId);
@@ -393,18 +476,58 @@ async function exchangeRefreshToken(
     form.set("scope", config.scope);
   }
 
-  const response = await fetchImpl(endpoints.tokenEndpoint, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
+  const response = await fetchWithTimeout(
+    fetchImpl,
+    endpoints.tokenEndpoint,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: form,
     },
-    body: form,
-  });
+    "token-exchange",
+    options,
+  );
   if (!response.ok) {
     throw new Error(`OIDC token refresh failed: ${response.status}`);
   }
   return (await response.json()) as CloudOidcTokenResponse;
+}
+
+async function fetchWithTimeout(
+  fetchImpl: typeof fetch,
+  input: RequestInfo | URL,
+  init: RequestInit,
+  phase: OidcFetchPhase,
+  options: OidcFetchTimeoutOptions,
+): Promise<Response> {
+  const timeoutSignal = options.timeoutSignal ?? defaultOidcTimeoutSignal;
+  const signal = timeoutSignal(options.timeoutMs ?? DEFAULT_OIDC_FETCH_TIMEOUT_MS);
+  try {
+    return await fetchImpl(input, {
+      ...init,
+      signal,
+    });
+  } catch (error) {
+    if (isTimeoutAbortError(error)) {
+      throw new OidcTimeoutError(phase);
+    }
+    throw error;
+  }
+}
+
+function defaultOidcTimeoutSignal(timeoutMs: number): AbortSignal {
+  return AbortSignal.timeout(timeoutMs);
+}
+
+function isTimeoutAbortError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const name = (error as { name?: unknown }).name;
+  return name === "TimeoutError" || name === "AbortError";
 }
 
 function readOidcRequestState(

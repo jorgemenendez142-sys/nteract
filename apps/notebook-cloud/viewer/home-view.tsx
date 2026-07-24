@@ -10,34 +10,24 @@ import {
 } from "lucide-react";
 import { useTheme } from "@/hooks/useTheme";
 import { clearCloudAppSession } from "./app-session";
-import { cloudNotebookSignInLabel } from "./cloud-auth-controls";
+import { cloudNotebookSignInLabel, resolveCloudSignInMethod } from "./cloud-auth-controls";
 import { clearCloudPrototypeDevAuth, prepareCloudOidcViewerLogin } from "./collaborator-auth";
 import { beginOidcLogin } from "./oidc-auth";
 import { applyDocumentTheme, CLOUD_VIEWER_THEME_STORAGE_KEY } from "./theme";
-import {
-  useCloudAppSessionBridge,
-  useCloudAppSessionStatus,
-  useCloudPrototypeAuth,
-} from "./use-cloud-auth";
+import { useCloudAuthStore } from "./cloud-auth-context";
+import { useCloudAppSession, useCloudAuthRenewal, useCloudAuthState } from "./use-cloud-auth-store";
 import type { CloudViewerAuthConfig } from "./cloud-viewer-types";
 
 export function CloudHomeView({ authConfig }: { authConfig: CloudViewerAuthConfig }) {
   const { resolvedTheme } = useTheme(CLOUD_VIEWER_THEME_STORAGE_KEY);
-  const appSessionStatus = useCloudAppSessionStatus(null);
-  const { authState, authRenewal, refreshAuthState } = useCloudPrototypeAuth(authConfig, {
-    appSessionRefreshFallback: true,
-    appSessionLoading: appSessionStatus.status === "loading",
-    appSession: appSessionStatus.session,
-  });
-  useCloudAppSessionBridge(
-    authState,
-    appSessionStatus.session,
-    appSessionStatus.status === "loading",
-    appSessionStatus.refreshAppSessionStatus,
-  );
+  const auth = useCloudAuthStore();
+  const appSessionStatus = useCloudAppSession();
+  const authState = useCloudAuthState();
+  const authRenewal = useCloudAuthRenewal();
   const [authAction, setAuthAction] = useState<"idle" | "starting">("idle");
   const [formError, setFormError] = useState<string | null>(null);
   const localDevAuth = authConfig.localDev;
+  const localMode = Boolean(localDevAuth);
   const signInConfigured = Boolean(localDevAuth || authConfig.oidc);
 
   useEffect(() => {
@@ -45,30 +35,24 @@ export function CloudHomeView({ authConfig }: { authConfig: CloudViewerAuthConfi
   }, [resolvedTheme]);
 
   const beginAuth = async () => {
-    if (localDevAuth) {
-      try {
-        setAuthAction("starting");
-        setFormError(null);
-        window.location.assign(localDevAuth.authUrl);
-      } catch (error) {
-        setAuthAction("idle");
-        setFormError(error instanceof Error ? error.message : String(error));
-      }
-      return;
-    }
-    if (!authConfig.oidc) {
+    const method = resolveCloudSignInMethod(authConfig, authState);
+    if (!method) {
       setFormError("Sign-in is not configured for this host.");
       return;
     }
     try {
       setAuthAction("starting");
       setFormError(null);
-      prepareCloudOidcViewerLogin(window.localStorage);
-      const url = await beginOidcLogin(authConfig.oidc, {
-        currentUrl: window.location.href,
-        storage: window.localStorage,
-      });
-      window.location.assign(url.href);
+      if (method === "oidc") {
+        prepareCloudOidcViewerLogin(window.localStorage);
+        const url = await beginOidcLogin(authConfig.oidc!, {
+          currentUrl: window.location.href,
+          storage: window.localStorage,
+        });
+        window.location.assign(url.href);
+        return;
+      }
+      window.location.assign(authConfig.localDev!.authUrl);
     } catch (error) {
       setAuthAction("idle");
       setFormError(error instanceof Error ? error.message : String(error));
@@ -76,15 +60,15 @@ export function CloudHomeView({ authConfig }: { authConfig: CloudViewerAuthConfi
   };
 
   const resetAuth = () => {
-    appSessionStatus.clearAppSessionStatus();
+    auth.clearAppSessionStatus();
     void clearCloudAppSession()
       .catch((error: unknown) => {
         console.warn("[notebook-cloud] app session clear failed", error);
       })
-      .finally(appSessionStatus.refreshAppSessionStatus);
+      .finally(() => auth.refreshAppSessionStatus());
     clearCloudPrototypeDevAuth(window.localStorage);
     setFormError(null);
-    refreshAuthState();
+    auth.refreshAuthState();
   };
 
   const hasExplicitAuth = authState.mode === "oidc";
@@ -113,10 +97,14 @@ export function CloudHomeView({ authConfig }: { authConfig: CloudViewerAuthConfi
         <div className="cloud-home-copy">
           <div className="cloud-home-kicker">
             <Sparkles aria-hidden="true" />
-            NTERACT
+            {localMode ? "LOCAL MODE" : "NTERACT"}
           </div>
-          <h1>Bring computation to life.</h1>
-          <p>Sign in to create live notebooks, share work with colleagues, and attach compute.</p>
+          <h1>{localMode ? "Open local notebooks." : "Bring computation to life."}</h1>
+          <p>
+            {localMode
+              ? "Use local auth to create notebooks and test the live room on this machine."
+              : "Sign in to create live notebooks, share work with colleagues, and attach compute."}
+          </p>
         </div>
 
         <section
@@ -157,14 +145,14 @@ export function CloudHomeView({ authConfig }: { authConfig: CloudViewerAuthConfi
               <button
                 type="button"
                 onClick={() => {
-                  appSessionStatus.clearAppSessionStatus();
+                  auth.clearAppSessionStatus();
                   void clearCloudAppSession()
                     .catch((error: unknown) => {
                       console.warn("[notebook-cloud] app session clear failed", error);
                     })
-                    .finally(appSessionStatus.refreshAppSessionStatus);
+                    .finally(() => auth.refreshAppSessionStatus());
                   clearCloudPrototypeDevAuth(window.localStorage);
-                  refreshAuthState();
+                  auth.refreshAuthState();
                 }}
               >
                 <LogOut aria-hidden="true" />

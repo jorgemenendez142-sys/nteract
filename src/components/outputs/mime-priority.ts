@@ -1,3 +1,10 @@
+import {
+  BOKEHJS_EXEC_MIME_TYPE,
+  BOKEHJS_LOAD_MIME_TYPE,
+  NTERACT_BOKEH_SESSION_MIME_TYPE,
+} from "./bokeh-mime";
+import { PANEL_EXEC_MIME_TYPE, PANEL_LOAD_MIME_TYPE } from "./panel-mime";
+
 /**
  * Default MIME type priority order for rendering.
  * Higher priority types are preferred when multiple are available.
@@ -13,6 +20,14 @@ export const DEFAULT_PRIORITY = [
   // outrank source markdown and HTML fallbacks when a host supplies it.
   "application/vnd.nteract.markdown+json",
   "application/vnd.plotly.v1+json",
+  NTERACT_BOKEH_SESSION_MIME_TYPE,
+  // Bokeh and Panel emit marker MIMEs alongside text/html and
+  // application/javascript. They must win so renderer plugins can coordinate
+  // the sibling payloads.
+  BOKEHJS_EXEC_MIME_TYPE,
+  BOKEHJS_LOAD_MIME_TYPE,
+  PANEL_EXEC_MIME_TYPE,
+  PANEL_LOAD_MIME_TYPE,
   "application/vnd.vegalite.v6+json",
   "application/vnd.vegalite.v6.json",
   "application/vnd.vegalite.v5+json",

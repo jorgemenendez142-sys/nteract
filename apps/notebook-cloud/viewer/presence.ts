@@ -1,6 +1,12 @@
 import type { CloudRoomPeerRosterEntry, SessionControlMessage } from "../src/protocol";
 import type { ConnectionScope } from "../src/auth-shared";
-import { notebookActorIdentityFromProjection, notebookActorProjectionFromLabel } from "runtimed";
+import {
+  actorInitials,
+  notebookActorIdentityFromProjection,
+  notebookActorProjectionFromLabel,
+  colorForActorIdentity,
+  contrastColorForActorIdentity,
+} from "runtimed";
 
 export type CloudViewerPresenceConnection = "connecting" | "connected" | "disconnected";
 
@@ -25,6 +31,7 @@ export interface CloudViewerPresenceDisplay {
 export interface CloudViewerPresencePeer {
   id: string;
   participantKey: string;
+  actorLabel?: string | null;
   label: string;
   connectionScope: ConnectionScope | null;
   kind: "self" | "peer" | "anonymous" | "runtime" | "unknown";
@@ -190,6 +197,7 @@ function cloudPresencePeerFromMessage({
   return {
     id: peerId,
     participantKey: cloudPresenceParticipantKey({ participantKey, actorLabel, peerId }),
+    actorLabel: actorLabel?.trim() || null,
     label,
     connectionScope: normalizedConnectionScope,
     kind: isRuntimePeer ? "runtime" : isAnonymous ? "anonymous" : kind === "self" ? "self" : "peer",
@@ -357,21 +365,10 @@ export function cloudPresenceRuntimePeerCount(state: CloudViewerPresenceState): 
   return Math.max(state.runtimePeerCount, visibleRuntimePeers);
 }
 
-export function cloudPresenceInitials(label: string): string {
-  const trimmed = label.trim();
-  if (looksLikeEmailAddress(trimmed)) {
-    return "U";
-  }
-  const words = trimmed
-    .split(/[\s@._-]+/g)
-    .map((word) => word.trim())
-    .filter(Boolean);
-  const initials = words
-    .slice(0, 2)
-    .map((word) => word[0]?.toUpperCase() ?? "")
-    .join("");
-  return initials || "?";
-}
+export const cloudPresenceInitials: (label: string) => string = actorInitials;
+export const cloudPresenceColor: (actorLabel: string) => string = colorForActorIdentity;
+export const cloudPresenceContrastColor: (actorLabel: string) => string =
+  contrastColorForActorIdentity;
 
 export interface CloudFriendlyPeerLabelInput {
   displayName?: string | null;

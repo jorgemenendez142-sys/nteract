@@ -4,7 +4,7 @@ import { extname, join } from "node:path";
 import { test } from "node:test";
 import { viewerCorpus, viewerFileContaining } from "./viewer-source-corpus";
 
-test("cloud notebook body renders through the desktop NotebookView surface", () => {
+test("cloud notebook body renders through the temporary shared NotebookView surface", () => {
   const sourceText = viewerCorpus;
 
   assert.match(sourceText, /from "\.\.\/\.\.\/notebook\/src\/notebook-surface"/);
@@ -65,6 +65,12 @@ test("cloud notebook list uses local auth copy in local mode", () => {
 test("cloud viewer imports desktop notebook code only through public surfaces", () => {
   const viewerDir = new URL("../viewer", import.meta.url);
   const offenders: string[] = [];
+  const allowedSharedNotebookInternals = new Set([
+    "../../notebook/src/components/InlineCommentComposer",
+    "../../notebook/src/lib/comment-highlights",
+    "../../notebook/src/lib/comment-source-anchor",
+    "../../notebook/src/lib/frame-pipeline",
+  ]);
 
   for (const fileName of readdirSync(viewerDir)) {
     if (![".ts", ".tsx"].includes(extname(fileName))) continue;
@@ -78,14 +84,8 @@ test("cloud viewer imports desktop notebook code only through public surfaces", 
       const importPath = match[1] ?? "";
       if (
         importPath.includes("/wasm/") ||
-        // Entry-only host shims install cloud-safe logger and external-link
-        // behavior for shared notebook components.
-        (fileName === "index.tsx" &&
-          (importPath.endsWith("/lib/logger") || importPath.endsWith("/lib/open-url"))) ||
         importPath.endsWith("/notebook-surface") ||
-        // Headless store surface: same public symbols, no component/CSS
-        // imports, so node-run tests can exercise the bridge directly.
-        importPath.endsWith("/notebook-surface-stores")
+        allowedSharedNotebookInternals.has(importPath)
       ) {
         continue;
       }
@@ -107,11 +107,11 @@ test("cloud projects live cells into the NotebookView stores", () => {
 
   assert.doesNotMatch(
     sessionSourceText,
-    /useLayoutEffect\(\(\) => \{[\s\S]*projectCloudCellsIntoNotebookViewStores\(cells\);/,
+    /useLayoutEffect\(\(\) => \{[\s\S]*projectNotebookCellsIntoViewStores\(cells\);/,
   );
   assert.match(
     sessionSourceText,
-    /const applyResolvedCells = useCallback\(\s*\(resolvedCells: ResolvedCell\[\]\) => \{[\s\S]*projectCloudCellsIntoNotebookViewStores\(resolvedCells\);[\s\S]*setCells\(resolvedCells\);/,
+    /const applyResolvedCells = useCallback\(\s*\(resolvedCells: ResolvedCell\[\]\) => \{[\s\S]*projectNotebookCellsIntoViewStores\(resolvedCells\);[\s\S]*setCells\(resolvedCells\);/,
   );
   assert.match(sessionSourceText, /applyResolvedCells\(syncCells\);/);
   assert.match(sessionSourceText, /applyResolvedCells\(progressiveCells\);/);
@@ -146,10 +146,50 @@ test("cloud live changesets gate stale post-await status writes", () => {
   );
 });
 
+test("cloud runtime store projection comes from the shared store module", () => {
+  const projectionLifecycleSourcePath = new URL(
+    "../../../src/components/notebook/state/projection-lifecycle.ts",
+    import.meta.url,
+  );
+  const projectionLifecycleSourceText = readFileSync(projectionLifecycleSourcePath, "utf8");
+  const sessionSourcePath = new URL("../viewer/cloud-viewer-session.ts", import.meta.url);
+  const sessionSourceText = readFileSync(sessionSourcePath, "utf8");
+
+  assert.match(projectionLifecycleSourceText, /from ["']\.\/runtime-store-projection["']/);
+  assert.match(
+    sessionSourceText,
+    /from ["']@\/components\/notebook\/state\/runtime-store-projection["']/,
+  );
+  assert.doesNotMatch(projectionLifecycleSourceText, /notebook-surface-stores/);
+  assert.doesNotMatch(sessionSourceText, /notebook-surface-stores/);
+  assert.doesNotMatch(sessionSourceText, /notebook-view-store-bridge/);
+
+  const notebookSurfaceImports = [
+    ...sessionSourceText.matchAll(
+      /import\s+{([^}]*)}\s+from\s+["']\.\.\/\.\.\/notebook\/src\/notebook-surface["']/g,
+    ),
+    ...viewerCorpus.matchAll(
+      /import\s+{([^}]*)}\s+from\s+["']\.\.\/\.\.\/notebook\/src\/notebook-surface["']/g,
+    ),
+  ];
+  for (const importMatch of notebookSurfaceImports) {
+    const importList = importMatch[1] ?? "";
+    assert.doesNotMatch(
+      importList,
+      /\b(applyExecutionViewChangeset|applyOutputChangeset|resetRuntimeStoresProjection|getCellById|getCellIdsSnapshot|CellChangeset|JupyterOutput|createNotebookCellId|createNotebookController|PresenceValueProvider|PresenceContextValue|CrdtBridgeProvider|startCursorDispatch|emitBroadcast|emitPresence|resetPoolState|setPoolState)\b/,
+    );
+  }
+});
+
 test("cloud notebook mutations route through the shared notebook controller", () => {
   const sourceText = viewerCorpus;
 
   assert.match(sourceText, /createNotebookController/);
+  assert.match(sourceText, /from "@\/components\/notebook"/);
+  assert.doesNotMatch(
+    sourceText,
+    /import\s+{[^}]*createNotebookController[^}]*}\s+from\s+["']\.\.\/\.\.\/notebook\/src\/notebook-surface["']/,
+  );
   assert.match(sourceText, /const cloudNotebookController = useMemo/);
   assert.match(sourceText, /cloudNotebookController\.addCell\(type, afterCellId\)/);
   assert.match(sourceText, /cloudNotebookController\.deleteCell\(cellId\)/);
@@ -227,10 +267,14 @@ test("cloud wires shared presence and cleans projected store entries", () => {
   const sourceText = viewerFileContaining("export function NotebookViewer");
   const sessionSourcePath = new URL("../viewer/cloud-viewer-session.ts", import.meta.url);
   const sessionSourceText = readFileSync(sessionSourcePath, "utf8");
-  const bridgeSourcePath = new URL("../viewer/notebook-view-store-bridge.ts", import.meta.url);
-  const bridgeSourceText = readFileSync(bridgeSourcePath, "utf8");
+  const projectionLifecycleSourcePath = new URL(
+    "../../../src/components/notebook/state/projection-lifecycle.ts",
+    import.meta.url,
+  );
+  const projectionLifecycleSourceText = readFileSync(projectionLifecycleSourcePath, "utf8");
 
   assert.match(sourceText, /PresenceValueProvider/);
+  assert.match(sourceText, /from "@\/components\/notebook"/);
   assert.match(sourceText, /from "\.\.\/\.\.\/notebook\/src\/notebook-surface"/);
   assert.doesNotMatch(sourceText, /\.\.\/\.\.\/notebook\/src\/contexts\/PresenceContext/);
   assert.doesNotMatch(sourceText, /\.\.\/\.\.\/notebook\/src\/hooks\/useCrdtBridge/);
@@ -243,15 +287,25 @@ test("cloud wires shared presence and cleans projected store entries", () => {
     /sendSelectionPresence\(\s+cellId,\s+anchorLine,\s+anchorCol,\s+headLine,\s+headCol,/,
   );
   assert.match(sourceText, /sendInteractionPresence\(target\)/);
-  assert.match(sessionSourceText, /resetCloudViewStoreProjection/);
-  assert.match(bridgeSourceText, /@\/components\/notebook\/state\/cell-store/);
-  assert.match(bridgeSourceText, /@\/components\/notebook\/state\/execution-store/);
-  assert.match(bridgeSourceText, /@\/components\/notebook\/state\/output-store/);
-  assert.doesNotMatch(bridgeSourceText, /\.\.\/\.\.\/notebook\/src\/lib\/notebook-cells/);
-  assert.doesNotMatch(bridgeSourceText, /\.\.\/\.\.\/notebook\/src\/lib\/notebook-executions/);
-  assert.doesNotMatch(bridgeSourceText, /\.\.\/\.\.\/notebook\/src\/lib\/notebook-outputs/);
-  assert.match(bridgeSourceText, /deleteOutputs\(difference\(cloudOwnedOutputIds/);
-  assert.match(bridgeSourceText, /deleteExecutions\(difference\(cloudOwnedExecutionIds/);
+  assert.match(sessionSourceText, /cleanupNotebookProjectionForRemovedCells/);
+  assert.match(projectionLifecycleSourceText, /from "\.\/view-store-projection"/);
+  assert.match(projectionLifecycleSourceText, /createNotebookViewStoreProjector\(\)/);
+  assert.doesNotMatch(projectionLifecycleSourceText, /syntheticExecutionId/);
+  assert.doesNotMatch(projectionLifecycleSourceText, /syntheticOutputId/);
+  assert.doesNotMatch(
+    projectionLifecycleSourceText,
+    /\.\.\/\.\.\/notebook\/src\/lib\/notebook-cells/,
+  );
+  assert.doesNotMatch(
+    projectionLifecycleSourceText,
+    /\.\.\/\.\.\/notebook\/src\/lib\/notebook-executions/,
+  );
+  assert.doesNotMatch(
+    projectionLifecycleSourceText,
+    /\.\.\/\.\.\/notebook\/src\/lib\/notebook-outputs/,
+  );
+  assert.doesNotMatch(projectionLifecycleSourceText, /deleteOutputs\(difference/);
+  assert.doesNotMatch(projectionLifecycleSourceText, /deleteExecutions\(difference/);
 });
 
 test("cloud package rail renders package metadata through the shared shell panel", () => {
@@ -276,10 +330,12 @@ test("cloud package rail stays package-only and leaves sync/env state to app chr
   assert.doesNotMatch(sourceText, /Live sync connected/);
 });
 
-test("cloud workstation registry state lives in the workstation manager hook", () => {
+test("cloud workstation registry state lives in the workstations store", () => {
   const sourceText = viewerFileContaining("export function NotebookViewer");
   const hookSourcePath = new URL("../viewer/use-cloud-workstations.ts", import.meta.url);
   const hookSourceText = readFileSync(hookSourcePath, "utf8");
+  const storeSourcePath = new URL("../viewer/cloud-workstations-store.ts", import.meta.url);
+  const storeSourceText = readFileSync(storeSourcePath, "utf8");
 
   assert.match(sourceText, /useCloudWorkstationManager/);
   assert.match(sourceText, /cloudBrowserCanUseAuthenticatedApi/);
@@ -296,13 +352,31 @@ test("cloud workstation registry state lives in the workstation manager hook", (
   assert.doesNotMatch(sourceText, /setCloudDefaultWorkstation/);
   assert.doesNotMatch(sourceText, /requestCloudWorkstationAttachment/);
   assert.doesNotMatch(sourceText, /projectNotebookWorkstationSelection/);
+  assert.doesNotMatch(sourceText, /projectNotebookWorkstationSurface/);
   assert.doesNotMatch(sourceText, /cloudWorkstationRefreshIntervalMs/);
-  assert.match(hookSourceText, /fetchCloudWorkstations/);
-  assert.match(hookSourceText, /setCloudDefaultWorkstation/);
-  assert.match(hookSourceText, /requestCloudWorkstationAttachment/);
-  assert.match(hookSourceText, /projectNotebookWorkstationSelection/);
-  assert.match(hookSourceText, /projectNotebookWorkstationLaunchReadiness/);
-  assert.match(hookSourceText, /cloudWorkstationRefreshIntervalMs/);
+
+  // The manager hook delegates the registry poll, mutations, and pairing to the
+  // store; it only shapes the presentational workstation surface for the rail.
+  // The store instance is resolved from context (singleton by default) so an
+  // override consumes a coherent store for both reads and action dispatch.
+  assert.match(hookSourceText, /useCloudWorkstationsController/);
+  assert.match(hookSourceText, /const \{ workstations \} = useCloudStores\(\)/);
+  assert.match(hookSourceText, /workstations\.attach\(/);
+  assert.match(hookSourceText, /workstations\.setDefault\(/);
+  assert.doesNotMatch(hookSourceText, /cloudWorkstationsStore/);
+  assert.match(hookSourceText, /projectNotebookWorkstationSurface/);
+  assert.doesNotMatch(hookSourceText, /fetchCloudWorkstations/);
+  assert.doesNotMatch(hookSourceText, /setCloudDefaultWorkstation/);
+  assert.doesNotMatch(hookSourceText, /requestCloudWorkstationAttachment/);
+  assert.doesNotMatch(hookSourceText, /projectNotebookWorkstationSelection/);
+  assert.doesNotMatch(hookSourceText, /projectNotebookWorkstationLaunchReadiness/);
+  assert.doesNotMatch(hookSourceText, /cloudWorkstationRefreshIntervalMs/);
+
+  // The store owns the registry/mutation client calls and the dynamic cadence.
+  assert.match(storeSourceText, /fetchCloudWorkstations/);
+  assert.match(storeSourceText, /setCloudDefaultWorkstation/);
+  assert.match(storeSourceText, /requestCloudWorkstationAttachment/);
+  assert.match(storeSourceText, /cloudWorkstationRefreshIntervalMs/);
 });
 
 test("cloud identity chrome renders through the shared actor projection surface", () => {
@@ -361,15 +435,24 @@ test("cloud edit mode chrome renders through the shared shell component", () => 
   );
   assert.match(
     editModeButtonSourceText,
-    /<NotebookEditModeButton[\s\S]*state=\{accessPending \? "viewing" : interaction\.state\}/,
+    /<NotebookEditModeButton[\s\S]*state=\{\s*accessPending \|\| \(!hasSentEditRequest && interaction\.state === "requested"\)\s*\? "viewing"\s*: interaction\.state\s*\}/,
   );
   assert.match(editModeButtonSourceText, /<NotebookEditModeButton[\s\S]*variant="segmented"/);
   assert.match(authControlsSourceText, /authConfig\.localDev\?\.label\?\.trim\(\)/);
-  assert.match(authControlsSourceText, /return "Use local auth"/);
-  assert.match(authControlsSourceText, /window\.location\.assign\(localDevAuth\.authUrl\)/);
+  assert.match(authControlsSourceText, /localDevLabel \|\| "Use local auth"/);
+  assert.match(
+    authControlsSourceText,
+    /window\.location\.assign\(authConfig\.localDev!\.authUrl\)/,
+  );
   assert.match(
     authControlsSourceText,
     /const providerLabel = authConfig\.oidc\?\.providerLabel\?\.trim\(\)/,
+  );
+  // OIDC is the primary sign-in when configured: cloudSignInMethodForConfig
+  // returns "oidc" before it ever falls back to "localDev".
+  assert.match(
+    authControlsSourceText,
+    /if \(authConfig\.oidc\)\s*\{\s*return "oidc";[\s\S]*if \(authConfig\.localDev\)\s*\{\s*return "localDev";/,
   );
   assert.match(
     editModeButtonSourceText,
@@ -381,6 +464,10 @@ test("cloud edit mode chrome renders through the shared shell component", () => 
   );
   assert.match(editModeButtonSourceText, /onModeChange=\{\(mode\) => \{/);
   assert.match(sourceText, /accessLevel=\{shellCapabilities\.access\.level\}/);
+  assert.match(
+    sourceText,
+    /hasSentEditRequest=\{\s*accessRequestFacts\.requestedByUser \|\| Boolean\(cloudAccessFacts\.effectiveAccessRequest\)\s*\}/,
+  );
   assert.doesNotMatch(sourceText, /projectCloudNotebookEditAccess/);
   assert.doesNotMatch(sourceText, /cloudNotebookShellCapabilities/);
   assert.match(shellHookSourceText, /projectCloudNotebookEditAccess/);
@@ -388,7 +475,7 @@ test("cloud edit mode chrome renders through the shared shell component", () => 
   assert.match(shellHookSourceText, /cloudNotebookShellCapabilities/);
   assert.match(shellHookSourceText, /selectedMode/);
   assert.match(shellHookSourceText, /editAccessRequestPending/);
-  assert.match(sourceText, /onModeChange=\{setSelectedInteractionMode\}/);
+  assert.match(sourceText, /onModeChange=\{handleSelectInteractionMode\}/);
   assert.match(sourceText, /onRequestEditAccess=\{requestCloudEditAccess\}/);
   assert.match(sourceText, /reconnecting=\{sustainedReconnecting\}/);
   assert.match(
@@ -404,7 +491,7 @@ test("cloud edit mode chrome renders through the shared shell component", () => 
   assert.match(sourceText, /accessPending=\{editAccessPending\}/);
   assert.match(
     editModeButtonSourceText,
-    /state=\{accessPending \? "viewing" : interaction\.state\}/,
+    /state=\{\s*accessPending \|\| \(!hasSentEditRequest && interaction\.state === "requested"\)\s*\? "viewing"\s*: interaction\.state\s*\}/,
   );
   assert.match(editModeButtonSourceText, /disabled=\{accessPending\}/);
   assert.match(
@@ -430,11 +517,19 @@ test("cloud edit mode chrome renders through the shared shell component", () => 
   assert.doesNotMatch(cssText, /cloud-edit-mode-placeholder/);
   assert.doesNotMatch(cssText, /cloud-command-toolbar-placeholder/);
   assert.match(editModeButtonSourceText, /if \(mode === "edit" && !canSwitchToEdit\) \{/);
-  assert.match(sourceText, /projectCloudAccessRequestTransition\(\{/);
-  assert.match(
-    sourceText,
-    /if \(transition\.requestedScope\) \{[\s\S]*storeCloudRequestedScope\(window\.localStorage, transition\.requestedScope\);/,
+  // The loaded-request transition and its scope-persist side effect moved into
+  // the access-request store; the viewer delegates through requestEditAccess.
+  const accessRequestStoreText = readFileSync(
+    new URL("../viewer/cloud-access-request-store.ts", import.meta.url),
+    "utf8",
   );
+  assert.doesNotMatch(sourceText, /projectCloudAccessRequestTransition/);
+  assert.match(accessRequestStoreText, /projectCloudAccessRequestTransition\(\{/);
+  assert.match(
+    accessRequestStoreText,
+    /if \(transition\.requestedScope\) \{[\s\S]*deps\.storeRequestedScope\(transition\.requestedScope\);/,
+  );
+  assert.match(accessRequestStoreText, /storeCloudRequestedScope\(window\.localStorage, scope\);/);
   assert.doesNotMatch(sourceText, /mode === "edit" \? "editor" : NOTEBOOK_CLOUD_DEFAULT_SCOPE/);
   assert.doesNotMatch(sourceText, /className="cloud-scope-toggle-button"/);
   assert.doesNotMatch(cssText, /cloud-scope-toggle-button/);
@@ -455,7 +550,7 @@ test("cloud mobile shell gives the collapsed rail a toolbar entrypoint", () => {
 
   assert.match(sourceText, /PanelLeftOpen/);
   assert.match(sourceText, /const handleOpenMobileRail = useCallback\(\(\) => \{/);
-  assert.match(sourceText, /setRailCollapsed\(false\);/);
+  assert.match(sourceText, /setNotebookRailCollapsed\(false\);/);
   assert.match(
     sourceText,
     /leadingControls: \(\s*<button[\s\S]*className="cloud-mobile-rail-toggle hidden h-8 w-8[\s\S]*aria-label="Open notebook panels"[\s\S]*onClick=\{handleOpenMobileRail\}/,
@@ -496,7 +591,14 @@ test("cloud host notices sit in the shared shell above the rail and notebook sta
   );
   assert.match(sourceText, /const notebookHeaderChrome = projectCloudNotebookHeaderChrome\(\{/);
   assert.match(sourceText, /projectCloudNotebookViewSurface\(\{/);
-  assert.match(sourceText, /bodyAccessBlocked: notebookBodyAccessBlocked/);
+  // A signed-out gate blocks the stage like an access diagnostic, so both the
+  // header-chrome and view-surface projections consume the combined
+  // notebookStageGated flag.
+  assert.match(
+    sourceText,
+    /const notebookStageGated = notebookBodyAccessBlocked \|\| signedOutNotebookSignInRequired/,
+  );
+  assert.match(sourceText, /bodyAccessBlocked: notebookStageGated/);
   assert.match(
     sourceText,
     /hasAccessDiagnostic: isCloudConnectionAccessDiagnostic\(connectionError\)/,
@@ -553,7 +655,7 @@ test("cloud viewer shell uses the shared notebook rail as an adapter surface", (
   assert.match(sourceText, /onNavigateOutlineItem=\{handleNavigateOutlineItem\}/);
   assert.match(
     sourceText,
-    /navigateNotebookOutlineItem\(item, href, \{ headingHashTarget: "cell" \}\)/,
+    /navigateNotebookOutlineItem\(item, href, \{[\s\S]*documentAnchors,[\s\S]*headingHashTarget: "cell",[\s\S]*\}\)/,
   );
   assert.doesNotMatch(sourceText, /findCellElement: \(outlineItem\)/);
 });
@@ -569,7 +671,7 @@ test("cloud outline keeps iframe heading hashes at parent cell anchors", () => {
   );
   assert.match(
     sourceText,
-    /navigateNotebookOutlineItem\(item, hash, \{\s+behavior: "auto",\s+headingHashTarget: "cell",\s+\}\)/,
+    /navigateNotebookOutlineItem\(item, hash, \{\s+behavior: "auto",\s+documentAnchors,\s+headingHashTarget: "cell",\s+\}\)/,
   );
 });
 
@@ -650,55 +752,87 @@ test("hosted live room smoke can exercise the shared history shortcut", () => {
   assert.match(sourceText, /isRecoverableSocketCloseConsoleMessage/);
 });
 
-test("cloud app-session bridge refreshes cookie-backed state after OIDC exchange", () => {
-  const sourceText = viewerCorpus;
+test("cloud auth store re-establishes and refreshes cookie-backed state after OIDC exchange", () => {
   const routeSourcePath = new URL("../viewer/notebook-list-view.tsx", import.meta.url);
   const routeSourceText = readFileSync(routeSourcePath, "utf8");
-  const authSourcePath = new URL("../viewer/use-cloud-auth.ts", import.meta.url);
-  const authSourceText = readFileSync(authSourcePath, "utf8");
+  const storeSourcePath = new URL("../viewer/cloud-auth-store.ts", import.meta.url);
+  const storeSourceText = readFileSync(storeSourcePath, "utf8");
 
+  // The establish-then-refresh handshake lives in the auth store's establish
+  // driver, not a per-view hook: a fresh OIDC token exchanges for an app-session
+  // cookie, then the store re-reads /api/auth/session so the cookie-backed state
+  // is current.
+  assert.match(storeSourceText, /establishCloudAppSession/);
   assert.match(
-    sourceText,
-    /useCloudAppSessionBridge\(\s*authState,\s*appSessionStatus\.session,\s*appSessionStatus\.status === "loading",\s*appSessionStatus\.refreshAppSessionStatus,\s*\)/,
-  );
-  assert.match(
-    authSourceText,
-    /establishCloudAppSession\(authState\)[\s\S]*\.then\(\(\) => \{[\s\S]*onEstablished\?\.\(\)/,
+    storeSourceText,
+    /this\.establishAppSessionOp\(authState\)\s*\.then\(\(\) => \{[\s\S]*this\.refreshAppSessionStatus\(\);/,
   );
   assert.match(
     routeSourceText,
-    /\[authState, bootstrap, canFetchNotebookList, refreshIndex, waitingForAppSession\]/,
+    /\[\s*appSessionStatus\.session,[\s\S]*appSessionWaitDeadline,[\s\S]*authState,[\s\S]*bootstrap,[\s\S]*canFetchNotebookList,[\s\S]*refreshIndex,[\s\S]*waitingForAppSession,[\s\S]*\]/,
   );
 });
 
-test("cloud notebook list refresh re-establishes app sessions before listing notebooks", () => {
+test("cloud notebook list refresh stays on the GET-first session path", () => {
   const routeSourcePath = new URL("../viewer/notebook-list-view.tsx", import.meta.url);
   const routeSourceText = readFileSync(routeSourcePath, "utf8");
 
-  assert.match(routeSourceText, /import \{ clearCloudAppSession, establishCloudAppSession \}/);
-  assert.match(
+  assert.match(routeSourceText, /import \{ clearCloudAppSession \}/);
+  assert.match(routeSourceText, /const refreshList = \(\) => \{[\s\S]{0,500}?setRefreshIndex/);
+  assert.doesNotMatch(
     routeSourceText,
-    /const refreshList = \(\) => \{[\s\S]*authState\.mode === "oidc" && authState\.token[\s\S]*establishCloudAppSession\(authState\)[\s\S]*appSessionStatus\.refreshAppSessionStatus\(\)[\s\S]*setRefreshIndex/,
-    "manual notebook-list refresh should re-run the trusted session exchange so pending invites can resolve",
+    /const refreshList = \(\) => \{[\s\S]{0,500}?refreshAppSessionStatus/,
+    "manual refresh should issue one list GET; that response renews the cookie and syncs the stored profile",
+  );
+  assert.doesNotMatch(
+    routeSourceText,
+    /establishCloudAppSession/,
+    "the list view never re-validates upstream with an establish POST; the missing-session fallback lives in the auth store",
   );
 });
 
-test("cloud notebook list waits for app-session cookies before catalog fetches", () => {
+test("readable cloud notebooks leave disconnected compute to the existing runtime controls", () => {
+  const sourcePath = new URL("../viewer/notebook-viewer.tsx", import.meta.url);
+  const sourceText = readFileSync(sourcePath, "utf8");
+
+  assert.doesNotMatch(sourceText, /ComputeDisconnectedNotice/);
+  assert.doesNotMatch(sourceText, /shouldRenderComputeDisconnectedNotice/);
+  assert.match(sourceText, /onStartRuntime: handleCloudStartRuntime/);
+  assert.match(sourceText, /workstationAction/);
+});
+
+test("cloud notebook list bounds app-session waits before catalog fetches", () => {
   const sourcePath = new URL("../viewer/notebook-list-view.tsx", import.meta.url);
   const sourceText = readFileSync(sourcePath, "utf8");
 
   assert.match(
     sourceText,
-    /const canFetchNotebookList = authState\.mode === "dev" \|\| hasAppSession;/,
+    /const \{[\s\S]*canFetchCatalog: canFetchNotebookList,[\s\S]*hasAppSession,[\s\S]*signedIn,[\s\S]*waitingForAppSession,[\s\S]*\} = hostedAuth;/,
+  );
+  assert.match(sourceText, /const hostedAuth = useHostedCatalogAuth\(\);/);
+  assert.doesNotMatch(
+    sourceText,
+    /cloudNotebookListCanUseExistingCredentials/,
+    "the list should trust the hosted-auth projection instead of speculating that a cookie exists",
   );
   assert.match(
     sourceText,
-    /if \(!canFetchNotebookList\) \{[\s\S]*if \(waitingForAppSession\) \{[\s\S]*\{ kind: "loading" \}[\s\S]*return;/,
+    /const appSessionWaitDeadline =[\s\S]*appSessionWaitDeadlineMs \?\? CLOUD_NOTEBOOK_LIST_APP_SESSION_WAIT_DEADLINE_MS;/,
   );
   assert.match(
     sourceText,
-    /fetchCloudNotebookList\(authState, controller\.signal\)/,
-    "catalog fetch should still use the existing auth helper once the cookie-backed state is ready",
+    /if \(!canFetchNotebookList\) \{[\s\S]*if \(waitingForAppSession\) \{[\s\S]*window\.setTimeout\([\s\S]*\(\) => \{[\s\S]*loadNotebookList\(controller, " after app-session wait deadline"\);/,
+    "waiting for the trusted cookie must have a deadline fallback instead of an eternal skeleton",
+  );
+  assert.match(
+    sourceText,
+    /if \(seed\) \{[\s\S]*console\.warn\([\s\S]*keeping cached list/,
+    "stale local-first content should stay visible when a refresh fails",
+  );
+  assert.match(
+    sourceText,
+    /fetchCloudNotebookList\(\s*authState,\s*AbortSignal\.any\(\[[\s\S]*AbortSignal\.timeout\(CLOUD_NOTEBOOK_LIST_FETCH_TIMEOUT_MS\)/,
+    "catalog fetch should still use the existing auth helper on ready and deadline paths",
   );
 });
 
@@ -708,34 +842,36 @@ test("cloud notebook list trusts server bootstrap on initial app-session paint",
 
   assert.match(
     sourceText,
-    /const seededNotebooks = cloudNotebookListSeedFromBootstrapOrCache\(authState, bootstrap\);/,
+    /const seed = cloudNotebookListSeedFromBootstrapOrCache\([\s\S]*authState,[\s\S]*appSessionStatus\.session,[\s\S]*bootstrap,[\s\S]*\);/,
   );
   assert.match(
     sourceText,
-    /if \(refreshIndex === 0 && bootstrap\) \{[\s\S]*writeCachedCloudNotebookListToWindow\(authState, bootstrap\.notebooks\);[\s\S]*setListState\(\{ kind: "ready", notebooks: bootstrap\.notebooks \}\);[\s\S]*return;/,
+    /if \(refreshIndex === 0 && bootstrap\) \{[\s\S]*const totalCount = normalizeCloudNotebookListTotalCount\([\s\S]*bootstrap\.notebooks,[\s\S]*bootstrap\.total_count,[\s\S]*\);[\s\S]*writeCachedCloudNotebookListToLocalStorage\([\s\S]*authState,[\s\S]*appSessionStatus\.session,[\s\S]*notebooks: bootstrap\.notebooks,[\s\S]*totalCount,[\s\S]*\);[\s\S]*setListState\(\{ kind: "ready", notebooks: bootstrap\.notebooks, totalCount \}\);[\s\S]*return;/,
     "fresh notebook-home bootstrap should satisfy the initial render without an immediate duplicate /api/n fetch",
   );
   assert.match(
     sourceText,
-    /return bootstrap\?\.notebooks \?\? readCachedCloudNotebookListFromWindow\(authState\);/,
-    "server bootstrap should beat stale sessionStorage cache when both are present",
+    /return bootstrap[\s\S]*\? \{[\s\S]*notebooks: bootstrap\.notebooks,[\s\S]*totalCount: normalizeCloudNotebookListTotalCount\([\s\S]*bootstrap\.notebooks,[\s\S]*bootstrap\.total_count,[\s\S]*\),[\s\S]*\}[\s\S]*: readCachedCloudNotebookListFromLocalStorage\(authState, appSession\);/,
+    "server bootstrap should beat stale localStorage cache when both are present",
   );
 });
 
-test("cloud app-session live sync requests the resolved notebook-list scope", () => {
-  const sourceText = viewerCorpus;
+test("cloud app-session live sync uses streamed catalog access facts without awaiting list fetch", () => {
+  const sourceText = viewerFileContaining("function resolveCloudAppSessionSyncScope");
 
-  assert.match(sourceText, /async function resolveCloudAppSessionSyncScope/);
-  assert.match(sourceText, /new URL\("api\/n\?limit=100"/);
+  assert.match(sourceText, /function resolveCloudAppSessionSyncScope/);
   assert.match(sourceText, /createCloudNotebookCatalogAccessLoader\(\{/);
-  assert.match(sourceText, /catalogAccessLoader\.load/);
+  assert.match(sourceText, /loadCatalogAccess: async \(\) => \{/);
+  assert.match(sourceText, /config\.catalogEndpoint/);
+  assert.match(sourceText, /catalog\.catalogAccessFactsSnapshot/);
   assert.match(sourceText, /cloudNotebookSyncScopeForCatalogAccess\(\{/);
-  assert.match(sourceText, /catalogResolved: false/);
-  assert.match(sourceText, /\.\.\.\(await loadCatalogAccess\(\)\)/);
   assert.match(
     sourceText,
-    /const requestedScope = await resolveCloudAppSessionSyncScope\([\s\S]*catalogAccessLoader\.load,[\s\S]*selectedInteractionMode,[\s\S]*\)/,
+    /const requestedScope = resolveCloudAppSessionSyncScope\([\s\S]*catalog\.catalogAccessFactsSnapshot,[\s\S]*accessRequest\.selectedModeSnapshot,[\s\S]*\)/,
   );
+  assert.doesNotMatch(sourceText, /new URL\("api\/n\?limit=100"/);
+  assert.doesNotMatch(sourceText, /\.\.\.\(await loadCatalogAccess\(\)\)/);
+  assert.doesNotMatch(sourceText, /await resolveCloudAppSessionSyncScope/);
   assert.doesNotMatch(
     sourceText,
     /cloudSyncAuthFromAppSessionCookie\(\{[\s\S]*requestedScope: "owner"/,
@@ -774,6 +910,10 @@ test("cloud command client keeps routine command logs out of the browser console
 test("cloud installs a host logger sink for shared notebook components", () => {
   const sourceText = viewerCorpus;
 
+  assert.match(sourceText, /from ["']@\/lib\/logger["']/);
+  assert.match(sourceText, /from ["']@\/lib\/open-url["']/);
+  assert.doesNotMatch(sourceText, /\.\.\/\.\.\/notebook\/src\/lib\/logger/);
+  assert.doesNotMatch(sourceText, /\.\.\/\.\.\/notebook\/src\/lib\/open-url/);
   assert.match(sourceText, /setLoggerHost/);
   assert.match(sourceText, /debug: \(\) => \{\}/);
   assert.match(sourceText, /info: \(\) => \{\}/);

@@ -1,8 +1,25 @@
-# nteract notebook cloud prototype
+# nteract hosted notebook cloud
 
-This app is a Cloudflare Worker prototype for hosted nteract notebook rooms. It is intentionally small: the Worker authenticates dev credentials, first-party browser app-session cookies minted from OIDC, Anaconda API-key publishing/runtime requests, or anonymous viewer connections, authorizes the principal through the D1 room ACL, stamps a trusted `<principal>/<operator>` actor label, and routes `/n/:notebookId/sync` to a Durable Object keyed by notebook id.
+This app is a Cloudflare Worker for hosted nteract notebook rooms. The Worker
+authenticates dev credentials, first-party browser app-session cookies minted
+from OIDC, Anaconda API-key publishing/runtime requests, or anonymous viewer
+connections; authorizes the principal through the D1 room ACL; stamps a trusted
+`<principal>/<operator>` actor label; and routes `/n/:notebookId/sync` to a
+Durable Object keyed by notebook id. Shipped surfaces include app sessions,
+OIDC login, notebook list/dashboard, workstations, invites, access requests,
+author profiles, runtime repair, OG images, snapshots, blobs, and live sync
+(commits 0745eeab daemon-mediated rooms, 81f8117e list-scale presence,
+1c9023df/739fad72 OG/pinned revision work, 8a0105a3 snapshot metadata,
+49e46666/6febe0d2/48dae8fb dashboard). Experimental APIs and preview deployment
+resources retain explicit "prototype" or "preview" labels.
 
-The current Durable Object does not host kernels. It owns a `runtimed-wasm` room host for the notebook's `NotebookDoc` + `RuntimeStateDoc`, syncs peers with typed-frame v4, rejects unauthorized Automerge changes before mutating the room, checkpoints the materialized document pair in Durable Object storage, rewrites canonical CBOR presence through the shared helper, and stores bounded frame metadata for sync frames that actually change a materialized document. Viewer-scope peers use the normal sync exchange so they can materialize live room updates, while the room host uses read-only peer state as a protocol hint and still rejects any viewer-authored changes explicitly. No-op read-only sync control frames are acknowledged and delivered as protocol traffic, but they are not persisted as room-event history. Editor-scope live `NotebookDoc` writes are deliberately limited to existing markdown-cell source edits in this prototype; code cells and structural document changes remain read-only unless the connection has owner scope. Runtime peers use a separate `RuntimeStatePeerHandle` authoring surface: they can sync kernel lifecycle, widget comm topology, output routing, and progress/output state for room-accepted executions into `RuntimeStateDoc`, but they cannot create execution intent, edit `NotebookDoc`, rewrite trust/environment/path/project metadata, or acquire the frontend notebook editing API.
+The current Durable Object does not host kernels. It owns a `runtimed-wasm`
+room host for the notebook's `NotebookDoc` + `RuntimeStateDoc` + `CommsDoc` +
+`CommentsDoc` (sidecar, commit 778fc53e), syncs peers with typed-frame v4,
+rejects unauthorized Automerge changes before mutating the room, checkpoints
+the materialized document set in Durable Object storage, rewrites canonical
+CBOR presence through the shared helper, and keeps in-memory frame-budget
+telemetry for live sync traffic. Viewer-scope peers use the normal sync exchange so they can materialize live room updates, while the room host uses read-only peer state as a protocol hint and still rejects any viewer-authored changes explicitly. No-op read-only sync control frames are acknowledged and delivered as protocol traffic, but they are not persisted as room-event history. Editor-scope live `NotebookDoc` writes cover the allowed cell surface, while notebook identity and metadata remain owner-only. Widget state writes live in `CommsDoc`; `RuntimeStateDoc` remains runtime-peer/room-host owned. Runtime peers can sync kernel lifecycle, widget comm topology, output routing, and progress/output state for room-accepted executions into `RuntimeStateDoc`, but they cannot create execution intent, edit `NotebookDoc`, rewrite trust/environment/path/project metadata, or acquire the frontend notebook editing API.
 
 `/n/:notebookId/:vanityName` is a hosted notebook page backed by `/n/:id/sync`. Latest notebook views do not fetch a separate materialized render document; viewers join the live Automerge room as read-only peers and editor+ connections use the same synced document for permitted edits. `/n/:id/r/:headsHash` is an immutable pinned viewer that loads the persisted `NotebookDoc` + `RuntimeStateDoc` + `CommsDoc` Automerge snapshot set directly through `/api/n/:id/snapshots/:headsHash`, `/api/n/:id/runtime-snapshots/:runtimeHeadsHash`, `/api/n/:id/comms-snapshots/:commsHeadsHash`, and catalog revision metadata. Snapshot publishes validate that the documents can be loaded and that referenced output/widget blobs exist before recording the catalog revision, so missing runtime or comm snapshots, corrupt snapshot bytes, or missing blobs fail the publish request instead of advertising a broken revision. Output blob refs stay host-neutral and are mapped to `/api/n/:id/blobs/:hash` through the shared `BlobResolver` surface. The browser viewer bundle uses the shared notebook display components (`CellContainer`, `OutputArea`, `ReadOnlyCodeMirror`, `MediaProvider`) so published source, markdown, stdout/stderr, rich display data, widgets, and blob-backed renderer manifests go through the same isolated output renderer path as the desktop notebook.
 
@@ -94,8 +111,8 @@ The smoke script proves:
 - Viewer-scope rejection for blob, request, and pool-state writes.
 - Explicit anonymous viewer identity (`anonymous:<session>/browser:<session>`).
 - Local-only anonymous presence: accepted to the sender, not broadcast or persisted.
-- Materialized room sync for real `NotebookDoc` and `RuntimeStateDoc` frames.
-- Editor-scope markdown source edits are accepted, while code-cell edits and structural `NotebookDoc` changes are rejected.
+- Materialized room sync for real `NotebookDoc`, `RuntimeStateDoc`, and `CommsDoc` frames.
+- Editor-scope allowed-cell edits are accepted, while notebook identity/metadata changes remain owner-only.
 
 If the volatile frontend WASM package exists at `apps/notebook/src/wasm/runtimed-wasm`,
 the deeper roundtrip smoke sends real `runtimed-wasm` Automerge sync payloads through
@@ -207,9 +224,10 @@ renderer bundle checks: it fails on `cloud sync socket` churn, output resolution
 errors, failed notebook blob responses, missing cells, or a closed final room
 socket. Sandboxed output frames must not read localStorage; the smoke tracks
 that denial as a benign iframe error because only the first-party viewer shell
-uses the transitional OIDC cache to acquire its cookie. The room WebSocket does
-not use that cookie directly; the viewer asks the Worker for a short-lived sync
-ticket derived from the app session.
+uses the transitional OIDC cache to acquire its cookie. Browser live sync uses
+the first-party app-session cookie directly (`index.ts:720-778`), with trusted
+`Origin` checks and `nteract.v4` as the non-sensitive subprotocol. No
+intermediate sync ticket is generated for browser sessions.
 
 Before running credentialed preview smokes from lab2, check local credential
 health:
@@ -365,7 +383,7 @@ For local browser-only testing, the same values can be supplied as query params:
 
 `X-Principal` or `principal` may be used to provide a full principal directly. The Worker stamps internal `x-nteract-*` headers before forwarding to the Durable Object, modeling the ADR boundary where the room host trusts an upstream-authenticated identity.
 
-Dev credentials are accepted without an extra token only from loopback Wrangler local development (`localhost`, `127.0.0.1`, or `::1`). Deployed prototype environments require the `NOTEBOOK_CLOUD_DEV_TOKEN` Worker secret to match either the `X-Notebook-Cloud-Dev-Token` header or a WebSocket subprotocol named `nteract-dev-token.<base64url-token>`. `DEPLOYMENT_ENV=development` does not bypass this host check, and URL-carried `dev_token` credentials are rejected on deployed hosts so prototype owner credentials do not appear in URLs. If no scope is supplied, dev auth defaults to `viewer`. Write and publish paths must ask for `editor`, `runtime_peer`, or `owner` explicitly. Blob upload is allowed for runtime peers and owners only, and verifies that the uploaded bytes match the SHA-256 digest in the blob route before writing to R2. Runtime peers may write typed-frame `0x05` (`RuntimeStateDoc`) kernel lifecycle, widget comm topology, output routing, and progress/output changes for accepted executions through the materialized room host; typed-frame `0x00` (`NotebookDoc`) changes, direct execution creation, and trust/environment/path/project metadata rewrites are rejected for runtime_peer scope. Editor and owner `0x05` frames are accepted only for existing widget comm-state mutations under the shared `RuntimeStateDoc` policy; viewer and peer-authored `system` changes are rejected.
+Dev credentials are accepted without an extra token only from loopback Wrangler local development (`localhost`, `127.0.0.1`, or `::1`). Deployed prototype environments require the `NOTEBOOK_CLOUD_DEV_TOKEN` Worker secret to match either the `X-Notebook-Cloud-Dev-Token` header or a WebSocket subprotocol named `nteract-dev-token.<base64url-token>`. `DEPLOYMENT_ENV=development` does not bypass this host check, and URL-carried `dev_token` credentials are rejected on deployed hosts so prototype owner credentials do not appear in URLs. If no scope is supplied, dev auth defaults to `viewer`. Write and publish paths must ask for `editor`, `runtime_peer`, or `owner` explicitly. Blob upload is allowed for runtime peers and owners only, and verifies that the uploaded bytes match the SHA-256 digest in the blob route before writing to R2. Runtime peers may write typed-frame `0x05` (`RuntimeStateDoc`) kernel lifecycle, widget comm topology, output routing, and progress/output changes for accepted executions through the materialized room host; typed-frame `0x00` (`NotebookDoc`) changes, direct execution creation, and trust/environment/path/project metadata rewrites are rejected for runtime_peer scope. Editor and owner `0x05` frames are rejected; mutable widget state uses typed-frame `0x09` (`CommsDoc`) and remains gated by `RuntimeStateDoc` topology. Viewer and peer-authored `system` changes are rejected.
 
 For the browser-hosted editor prototype, the viewer keeps the dev token out of
 URLs. Open the key menu in the sticky toolbar, paste the Worker dev token, pick
@@ -482,9 +500,9 @@ users only receive that scope when the notebook has an explicit public
 `notebook_acl` row. Production hosts should move output blobs to signed URLs or
 a dedicated output origin before accepting private notebook data at scale.
 
-## ACL management
+## ACL and sharing
 
-The prototype exposes a small owner-only ACL API:
+The flat ACL API remains the low-level authorization primitive:
 
 ```text
 GET    /api/n/{notebookId}/acl
@@ -514,17 +532,43 @@ Public read is explicit:
 ```
 
 Public rows may only grant `viewer`, and principal rows cannot target `system`
-or anonymous principals. Deleting the final owner row is rejected. Group/org
-expansion, owner transfer workflow, audit events, and Zanzibar/Authzed-style
-relationship evaluation remain outside this prototype API.
+or anonymous principals. Deleting the final owner row is rejected.
+
+The sharing and invite layer is built on top:
+
+```text
+GET    /api/n/{notebookId}/invites
+POST   /api/n/{notebookId}/invites
+DELETE /api/n/{notebookId}/invites/{inviteId}
+
+GET    /api/n/{notebookId}/access-requests
+POST   /api/n/{notebookId}/access-requests
+DELETE /api/n/{notebookId}/access-requests/{requestId}
+```
+
+Owner-scoped invite routes create pending invites by normalized email, optional
+provider hint, and `viewer` or `editor` scope (`index.ts:387-427`). Invites
+resolve to principal ACL rows on the recipient's first login
+(`sharing-storage.ts` resolution logic). Access requests allow viewers to
+request editor/owner promotion. Principal account links join profiles across
+providers. The schema includes `notebook_invites`, `notebook_access_requests`,
+`principal_profiles`, `principal_account_links` (`storage.ts:247-290`).
+
+Group/org expansion, owner transfer workflow, audit events, and
+Zanzibar/Authzed-style relationship evaluation remain future work.
 
 ## Storage shape
 
 Bindings in `wrangler.toml`:
 
 - `NOTEBOOK_ROOMS`: Durable Object namespace, one object per notebook id.
-- `DB`: D1 catalog for notebooks, revisions, and blobs.
-- `NOTEBOOK_SNAPSHOTS`: R2 bucket for `NotebookDoc`, `RuntimeStateDoc`, `CommsDoc`, and blob snapshots.
+- `DB`: D1 catalog for notebooks, revisions, blobs, principal profiles,
+  notebook invites, access requests, workstations, pairing codes, and
+  credentials (`storage.ts:222-365`).
+- `NOTEBOOK_SNAPSHOTS`: R2 bucket for `NotebookDoc`, `RuntimeStateDoc`,
+  `CommsDoc`, `CommentsDoc`, blob snapshots, and room summaries
+  (`roomSummaryKey()` at `storage.ts:451`). Room summaries enable list-scale
+  presence hydration in bounded batches (`index.ts:1321`).
 - `ASSETS`: Worker static assets for `/assets/notebook-cloud-viewer.js`, content-hashed runtime WASM sidecars, renderer chunks, and `/plugins/sift_wasm.wasm`.
 - `RENDERER_ASSETS_BASE_URL` (optional): base URL for renderer plugin assets such as `sift_wasm.wasm`. The prototype deployment points this at the dedicated `nteract-notebook-cloud-assets` Worker. If unset, the viewer uses the main Worker-owned `/renderer-assets/` route so sandboxed `srcdoc` iframes can fetch plugin WASM through explicit CORS headers.
 - `RUNTIMED_WASM_BASE_URL` (optional): base URL for `runtimed_wasm.js` and `runtimed_wasm_bg.wasm`. If unset, the viewer reads `runtime-wasm-assets.json` from the main Worker asset bundle and loads the content-hashed runtime WASM files from `/assets/`, so the viewer JS and matching WASM are deployed atomically.
@@ -540,8 +584,10 @@ Automerge sync, runtime-state sync, and response frames may be up to 64 MiB;
 `PUT_BLOB` up to 32 MiB; request and broadcast frames up to 16 MiB; presence
 frames up to 4 KiB; and pool-state/session-control frames up to 1 MiB. The
 Durable Object does not persist a frame replay log. Reconnecting peers recover
-from the materialized `NotebookDoc`, `RuntimeStateDoc`, and `CommsDoc`
-checkpoints, with published snapshots as the fallback durable boundary.
+from the materialized `NotebookDoc`, `RuntimeStateDoc`, `CommsDoc`, and
+`CommentsDoc` checkpoints (`CHECKPOINT_COMMENTS_DOC_KEY` at
+`room-materializer.ts:13`), with published snapshots as the fallback durable
+boundary.
 
 Published revision artifacts follow `docs/adr/hosted-notebook-artifacts.md`:
 
@@ -549,8 +595,13 @@ Published revision artifacts follow `docs/adr/hosted-notebook-artifacts.md`:
 n/{id}/snapshots/{notebookHeadsHash}.am
 docs/{runtimeStateDocId}/snapshots/{runtimeHeadsHash}.am
 docs/{comms:runtimeStateDocId}/snapshots/{commsHeadsHash}.am
+docs/{comments:notebookId}/snapshots/{commentsHeadsHash}.am
 n/{id}/blobs/{sha256}
 ```
+
+`CommentsDoc` is checkpointed by the room host and recorded in revision rows
+(`comments_heads_hash`, `comments_snapshot_key` at `storage.ts:31`, `:35`), but
+public snapshot routes for comments are not yet shipped.
 
 Notebook snapshots currently retain the `n/{id}` compatibility namespace.
 Runtime-state snapshots are keyed by first-class `runtime_state_doc_id`; publish
@@ -631,6 +682,23 @@ pnpm --workspace-root exec wrangler tail nteract-notebook-cloud \
   --format pretty
 ```
 
+Check deployed Worker and Durable Object usage with:
+
+```bash
+CLOUDFLARE_ACCOUNT_ID=... \
+pnpm --dir apps/notebook-cloud run ops:cloudflare:usage -- \
+  --hours 24 \
+  --request-warn 50000 \
+  --do-duration-warn-seconds 3600
+```
+
+The main Worker serves static assets from `dist/` with asset-first routing. Do
+not enable `assets.run_worker_first=true` unless a path truly needs Worker
+logic before asset delivery; otherwise every bundle/chunk fetch becomes Worker
+execution instead of free static asset traffic.
+The usage command queries Cloudflare's live GraphQL analytics schema and should
+fail loudly if Cloudflare renames or removes a metric.
+
 Useful events while debugging collaboration:
 
 - `room.connection.accepted` / `room.connection.closed` - peer lifecycle and
@@ -697,17 +765,17 @@ markdown edit convergence loop when chasing intermittent editor divergence.
 
 Use `GET /api/n/{id}/acl` with an owner credential to confirm editor/viewer
 grants. A healthy throwaway collaboration run should show editor
-`room.materialized_frame.applied` records with `persisted=true` when Alice/Bob
+`room.materialized_frame.applied` records with `changed=true` when Alice/Bob
 change the document, viewer `room.peer_sync.completed` records, no unexpected
 `room.frame.rejected` records for Alice/Bob, and anonymous viewer presence
 logged only as `room.presence.local_only`. Read-only viewer sync acks/needs may
-emit `room.materialized_frame.applied` with `persisted=false`; they should not
-create stored room-event history. If the browser shows `Offline`, open the key
-menu first: placeholder or stale dev tokens are surfaced there, and the Worker
-logs token/auth failures as `auth.failed` without recording raw token material.
-The copied browser diagnostic should include the requested principal/scope,
-connected actor/scope when available, and the last WebSocket connection error,
-but never the stored token value.
+emit `room.materialized_frame.applied` with `changed=false`; they should not
+checkpoint document bytes or create stored room-event history. If the browser
+shows `Offline`, open the key menu first: placeholder or stale dev tokens are
+surfaced there, and the Worker logs token/auth failures as `auth.failed` without
+recording raw token material. The copied browser diagnostic should include the
+requested principal/scope, connected actor/scope when available, and the last
+WebSocket connection error, but never the stored token value.
 
 Live runtime-peer smoke with preview API-key credentials:
 
@@ -756,9 +824,18 @@ pnpm --dir apps/notebook-cloud smoke:hosted:workstation-agent
 The workstation agent reads `NTERACT_API_KEY` from the environment and also
 loads `${PREVIEW_RUNT_ENV:-$HOME/preview.runt.run/.env}` when present. It
 registers and heartbeats the current machine through `POST /api/workstations`,
-polls `GET /api/workstations/:workstationId/attach-jobs`, and spawns
-`runtimed cloud-runtime-agent` for pending attach jobs. API-key auth is the
-default (`NOTEBOOK_CLOUD_WORKSTATION_AUTH_KIND=anaconda-key`); set
+keeps a hibernatable WebSocket open at
+`GET /api/workstations/:workstationId/events` for attach-job wakeups, and
+spawns `runtimed cloud-runtime-agent` for pending attach jobs. Low-frequency
+`GET /api/workstations/:workstationId/attach-jobs` polling is still the
+recovery path for missed events, older servers, and jobs that predate agent
+startup. The event socket carries idle online presence without burning a
+Worker/D1 request per workstation per heartbeat interval, and it uses
+Cloudflare's hibernatable WebSocket path so idle sockets do not keep the
+WorkstationEvents Durable Object active. The socket does not replay events;
+attach jobs are durable D1 rows, so reconnect recovery polls the queue rather
+than replaying transient wakeup events. API-key auth is the default
+(`NOTEBOOK_CLOUD_WORKSTATION_AUTH_KIND=anaconda-key`); set
 `NOTEBOOK_CLOUD_WORKSTATION_AUTH_KIND=oidc` when `NTERACT_API_KEY` carries a
 short-lived OIDC bearer token. Prefer API-key auth for long-lived tmux/systemd
 workstations; browser OIDC token refresh depends on an active browser session.
@@ -767,8 +844,9 @@ through argv; `runtimed` removes cloud environment variables again before
 launching the Python kernel. When the hosted service returns a rate-limit or
 maintenance response (`429`/`503`), the runner honors `Retry-After` when
 present and otherwise backs off with a capped exponential cooldown before
-heartbeating or polling again. Run this helper inside tmux for preview/manual
-testing so the polling agent stays alive while the browser attaches
+heartbeating, reconnecting the event socket, or polling again. Run this helper
+inside tmux for preview/manual testing so the workstation agent stays alive
+while the browser attaches
 workstations. The first registered workstation becomes the account default
 automatically; use the Workstations rail or
 `PATCH /api/workstations/default` only when switching to another machine. In a
@@ -842,12 +920,14 @@ curl -X PUT "$NOTEBOOK_CLOUD_LOCAL_URL/api/n/demo/runtime-snapshots/runtime123" 
   -H "X-User: alice" \
   -H "X-Operator: desktop:curl" \
   -H "X-Scope: owner" \
+  -H "X-Runtime-State-Doc-Id: runtime:demo" \
   --data-binary @runtime-state.am
 
 curl -X PUT "$NOTEBOOK_CLOUD_LOCAL_URL/api/n/demo/snapshots/heads123" \
   -H "X-User: alice" \
   -H "X-Operator: desktop:curl" \
   -H "X-Scope: owner" \
+  -H "X-Runtime-State-Doc-Id: runtime:demo" \
   -H "X-Runtime-Heads-Hash: runtime123" \
   --data-binary @notebook.am
 

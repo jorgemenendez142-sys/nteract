@@ -15,16 +15,22 @@ use crate::NteractMcp;
 /// When the session was previously active but dropped, the error includes
 /// the *reason* (evicted, disconnected, switched) and the *notebook_id*
 /// so agents can recover in one turn via `connect_notebook`.
-macro_rules! require_handle {
-    ($server:expr) => {{
-        let guard = $server.session.read().await;
-        match guard.as_ref() {
-            Some(s) => s.handle.clone(),
-            None => {
-                drop(guard);
-                return $crate::tools::no_session_error($server).await;
-            }
+macro_rules! require_session_access {
+    ($server:expr, $requirement:ident) => {{
+        match $server
+            .session_access($crate::session::SessionRequirement::$requirement)
+            .await
+        {
+            Ok(Some(access)) => access,
+            Ok(None) => return $crate::tools::no_session_error($server).await,
+            Err(error) => return $crate::tools::session_access_error(error),
         }
+    }};
+}
+
+macro_rules! require_handle {
+    ($server:expr, $requirement:ident) => {{
+        require_session_access!($server, $requirement).handle
     }};
 }
 
@@ -62,6 +68,7 @@ fn cell_resource_content(notebook_id: &str, cell_id: &str) -> Content {
 mod cell_crud;
 mod cell_meta;
 pub(crate) mod cell_read;
+mod comments;
 mod deps;
 mod editing;
 mod execution;
@@ -245,6 +252,41 @@ pub fn all_tools() -> Vec<Tool> {
         )
         .annotate(ToolAnnotations::new().destructive(false).open_world(false))
         .with_meta(app_tool_meta()),
+        // -- Comments --
+        Tool::new(
+            "create_comment",
+            "Create a comment thread anchored to a cell or the notebook.",
+            schema_for::<comments::CreateCommentParams>(),
+        )
+        .annotate(ToolAnnotations::new().destructive(false).open_world(false)),
+        Tool::new(
+            "reply_comment",
+            "Reply to an existing comment thread.",
+            schema_for::<comments::ReplyCommentParams>(),
+        )
+        .annotate(ToolAnnotations::new().destructive(false).open_world(false)),
+        Tool::new(
+            "resolve_comment",
+            "Mark a comment thread as resolved.",
+            schema_for::<comments::ResolveCommentParams>(),
+        )
+        .annotate(
+            ToolAnnotations::new()
+                .destructive(false)
+                .idempotent(true)
+                .open_world(false),
+        ),
+        Tool::new(
+            "reopen_comment",
+            "Reopen a resolved comment thread.",
+            schema_for::<comments::ReopenCommentParams>(),
+        )
+        .annotate(
+            ToolAnnotations::new()
+                .destructive(false)
+                .idempotent(true)
+                .open_world(false),
+        ),
     ];
 
     attach_icons(&mut tools);
@@ -345,6 +387,11 @@ pub async fn dispatch(
         // Editing
         "replace_match" => editing::replace_match(server, request).await,
         "replace_regex" => editing::replace_regex(server, request).await,
+        // Comments
+        "create_comment" => comments::create_comment(server, request).await,
+        "reply_comment" => comments::reply_comment(server, request).await,
+        "resolve_comment" => comments::resolve_comment(server, request).await,
+        "reopen_comment" => comments::reopen_comment(server, request).await,
         _ => Err(McpError::invalid_params(
             format!("Unknown tool: {}", request.name),
             None,
@@ -546,19 +593,64 @@ pub fn assert_cell_exists(
 }
 
 /// Helper: create a text error result.
+///
+/// Error text is agent-channel content (`audience: [assistant]`): the agent
+/// recovers from it; the human render comes from `structuredContent`.
 pub fn tool_error(msg: &str) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::error(vec![Content::text(msg.to_string())]))
+    Ok(CallToolResult::error(vec![
+        crate::formatting::assistant_text(msg),
+    ]))
+}
+
+/// Convert a centralized session capability failure into a structured tool
+/// result instead of an opaque timeout or cached-success response.
+pub fn session_access_error(
+    error: crate::session::SessionAccessError,
+) -> Result<CallToolResult, McpError> {
+    let details = serde_json::json!({
+        "error": {
+            "code": error.code,
+            "message": error.message,
+        },
+        "session": error.readiness,
+    });
+    let mut result =
+        CallToolResult::error(vec![crate::formatting::assistant_text(details.to_string())]);
+    result.structured_content = Some(details);
+    Ok(result)
+}
+
+pub fn execution_dispatch_error(
+    error: crate::execution::ExecutionDispatchError,
+) -> Result<CallToolResult, McpError> {
+    let details = serde_json::json!({
+        "error": {
+            "code": error.code,
+            "message": error.message,
+        }
+    });
+    let mut result =
+        CallToolResult::error(vec![crate::formatting::assistant_text(details.to_string())]);
+    result.structured_content = Some(details);
+    Ok(result)
 }
 
 /// Helper: create a text success result.
+///
+/// Status text is agent-channel content (`audience: [assistant]`); the human
+/// render comes from `structuredContent` or the notebook itself.
 pub fn tool_success(msg: &str) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
-        msg.to_string(),
-    )]))
+    Ok(CallToolResult::success(vec![
+        crate::formatting::assistant_text(msg),
+    ]))
 }
 
 /// Build a `CallToolResult` from an execution result, including structured content
 /// for the MCP Apps widget. Shared by cell_crud, editing, and execution tools.
+///
+/// Text content blocks are the agent channel (annotated `audience:
+/// [assistant]`, compact, with legibility pointers to blob-stored renders);
+/// `structured_content` is the complete, URL-rich human render contract.
 pub async fn build_execution_result(
     result: &crate::execution::ExecutionResult,
     handle: &notebook_sync::handle::DocHandle,
@@ -569,18 +661,24 @@ pub async fn build_execution_result(
         "code",
         result.execution_count.as_deref(),
         Some(&result.status),
-        result.execution_id.as_deref(),
+        Some(result.execution_id.as_str()),
     );
 
     let mut items = vec![
-        Content::text(header),
+        crate::formatting::assistant_text(header),
         cell_resource_content(handle.notebook_id(), &result.cell_id),
     ];
-    let output_summaries = crate::formatting::format_outputs_summary_lines(&result.outputs, 120);
+    let output_summaries = crate::formatting::format_outputs_summary_lines_aligned(
+        &result.resolved_outputs_by_manifest,
+        &result.output_manifests,
+        120,
+    );
     if output_summaries.is_empty() {
-        items.push(Content::text("Output summary: 0 outputs".to_string()));
+        items.push(crate::formatting::assistant_text(
+            "Output summary: 0 outputs",
+        ));
     } else {
-        items.push(Content::text(format!(
+        items.push(crate::formatting::assistant_text(format!(
             "Output summary:\n{}",
             output_summaries.join("\n")
         )));
@@ -589,12 +687,11 @@ pub async fn build_execution_result(
 
     // Build structured content directly from manifest Values + blob URLs.
     // No blob fetches — inline ContentRefs pass through, blobs become URLs.
-    // Outputs live in RuntimeStateDoc, keyed by execution_id, so we fetch
-    // them separately from the cell snapshot.
+    // Use the same manifest slice captured during execution resolution so
+    // resolved summaries stay aligned to their source manifests.
     let cell_snapshot = handle.get_cell(&result.cell_id);
     let runtime_comms = handle.get_runtime_state().ok().map(|rs| rs.comms);
     let mut structured_content = if let Some(snap) = cell_snapshot {
-        let outputs = handle.get_cell_outputs(&result.cell_id).unwrap_or_default();
         let ec_str = cell_read::get_cell_execution_count_from_runtime(handle, &snap.id);
         let ec: Option<i64> = if ec_str.is_empty() {
             None
@@ -606,11 +703,12 @@ pub async fn build_execution_result(
                 cell_id: &snap.id,
                 cell_type: &snap.cell_type,
                 source: &snap.source,
-                output_manifests: &outputs,
+                output_manifests: &result.output_manifests,
                 execution_count: ec,
                 status: &result.status,
                 blob_base_url: &server.blob_base_url,
                 comms: runtime_comms.as_ref(),
+                resolved_outputs_by_manifest: Some(&result.resolved_outputs_by_manifest),
             },
         ))
     } else {
@@ -629,12 +727,10 @@ pub async fn build_execution_result(
             );
             // Inject execution_id into structured content so MCP App renderers
             // can associate outputs with a specific execution.
-            if let Some(ref eid) = result.execution_id {
-                cell_obj.insert(
-                    "execution_id".to_string(),
-                    serde_json::Value::String(eid.clone()),
-                );
-            }
+            cell_obj.insert(
+                "execution_id".to_string(),
+                serde_json::Value::String(result.execution_id.clone()),
+            );
         }
     }
     call_result.structured_content = structured_content;
@@ -879,6 +975,29 @@ mod tests {
         let link = decoded.as_resource_link().expect("resource link");
         assert_eq!(link.uri, expected_uri);
         assert_eq!(link.mime_type.as_deref(), Some("application/json"));
+    }
+
+    #[test]
+    fn tool_text_results_carry_assistant_audience() {
+        // Error/status text is agent-channel content; the assistant audience
+        // annotation lets renderers drop it from human views.
+        let ok = tool_success("done").unwrap();
+        assert_eq!(
+            ok.content[0].audience(),
+            Some(&vec![rmcp::model::Role::Assistant])
+        );
+
+        let err = tool_error("boom").unwrap();
+        assert_eq!(
+            err.content[0].audience(),
+            Some(&vec![rmcp::model::Role::Assistant])
+        );
+    }
+
+    #[test]
+    fn resource_links_stay_unannotated_for_both_audiences() {
+        let content = cell_resource_content("nb", "cell");
+        assert!(content.annotations.is_none());
     }
 
     #[test]

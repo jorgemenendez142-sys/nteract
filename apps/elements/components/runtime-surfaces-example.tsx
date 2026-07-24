@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
-import { asyncTrue, noop } from "@/components/fixture-notebook-host";
+import { asyncTrue, noop } from "./fixture-notebook-host";
 import {
   DaemonStatusBanner,
   DebugBanner,
@@ -25,7 +25,6 @@ import {
   TrustDialog,
   UntrustedBanner,
 } from "@/components/notebook";
-import { EnvironmentSummary } from "@/components/environment";
 import {
   getElementsNotebookScenario,
   type ElementsNotebookScenario,
@@ -231,15 +230,6 @@ function PackageSummaryFixture({ scenario }: { scenario: ElementsNotebookScenari
           <NotebookPackageSummaryPanel
             packages={scenario.viewModel.packages}
             readOnly={!scenario.capabilities.canManagePackages}
-            header={
-              <EnvironmentSummary
-                capabilities={scenario.capabilities}
-                packages={scenario.viewModel.packages}
-                environment={scenario.environment}
-                showPackageDetails={false}
-                className="shadow-none"
-              />
-            }
           />
         </div>
       </div>
@@ -268,7 +258,7 @@ function RuntimeBanners() {
         >
           <NotebookNotice
             tone="warning"
-            icon={<AlertTriangle className="h-4 w-4" />}
+            icon={<AlertTriangle className="size-4" aria-hidden="true" />}
             title="Document attention needed."
             actions={<NotebookNoticeAction onClick={noop}>Review</NotebookNoticeAction>}
           >
@@ -398,7 +388,7 @@ export function RuntimeSurfacesExample() {
 
   return (
     <div className="not-prose space-y-6">
-      <section className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4 text-emerald-900 dark:text-emerald-900">
+      <section className="border-l border-fd-border py-1 pl-4 text-fd-muted-foreground">
         <div className="flex items-start gap-3">
           <PackageCheck className="mt-0.5 size-4 flex-none" aria-hidden="true" />
           <div>
@@ -446,7 +436,7 @@ export function RuntimeSurfacesExample() {
                 </div>
                 <p className="text-xs leading-5 text-fd-muted-foreground">{piece.role}</p>
                 <div>
-                  <span className="inline-flex items-center gap-1 rounded-full border border-fd-border bg-fd-background px-2 py-1 text-[11px] text-fd-muted-foreground">
+                  <span className="inline-flex items-center gap-1 text-[11px] font-medium text-fd-muted-foreground">
                     {piece.status === "rendered" ? (
                       <PackageCheck className="size-3 text-emerald-600" aria-hidden="true" />
                     ) : (

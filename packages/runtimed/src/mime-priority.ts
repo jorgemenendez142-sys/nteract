@@ -9,6 +9,13 @@ export const DEFAULT_MIME_PRIORITY = [
   // Rich formats first
   "application/vnd.jupyter.widget-view+json",
   "application/vnd.plotly.v1+json",
+  "application/vnd.nteract.bokeh-session.v1+json",
+  // Bokeh and Panel emit marker MIMEs alongside application/javascript and
+  // text/html. These must win so the frontend can keep the bundle together.
+  "application/vnd.bokehjs_exec.v0+json",
+  "application/vnd.bokehjs_load.v0+json",
+  "application/vnd.holoviews_exec.v0+json",
+  "application/vnd.holoviews_load.v0+json",
   "application/vnd.vegalite.v6+json",
   "application/vnd.vegalite.v6.json",
   "application/vnd.vegalite.v5+json",

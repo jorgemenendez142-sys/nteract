@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import type { EditorView } from "@codemirror/view";
 import type { NotebookCell } from "../../types";
 import { createNotebookController, type NotebookControllerHandle } from "../notebook-controller";
 import { getCellById, resetNotebookCells, replaceNotebookCells } from "../notebook-cells";
+import {
+  clearPendingCellFocus,
+  getAllCellEditors,
+  registerCellEditor,
+  requestCellEditorFocus,
+} from "../editor-registry";
 
 function codeCell(id: string, source = ""): NotebookCell {
   return {
@@ -16,20 +23,24 @@ function codeCell(id: string, source = ""): NotebookCell {
 
 function createHandle(): NotebookControllerHandle & {
   sources: Map<string, string>;
+  cellTypes: Map<string, "code" | "markdown" | "raw">;
   cells: string[];
 } {
   const sources = new Map<string, string>([["cell-a", "old"]]);
+  const cellTypes = new Map<string, "code" | "markdown" | "raw">([["cell-a", "code"]]);
   const cells = ["cell-a"];
   return {
     sources,
+    cellTypes,
     cells,
     update_source(cellId, source) {
       if (!sources.has(cellId)) return false;
       sources.set(cellId, source);
       return true;
     },
-    add_cell_after(cellId) {
+    add_cell_after(cellId, cellType) {
       cells.push(cellId);
+      cellTypes.set(cellId, cellType);
     },
     move_cell(cellId, afterCellId) {
       const previousIndex = cells.indexOf(cellId);
@@ -44,9 +55,15 @@ function createHandle(): NotebookControllerHandle & {
       const index = cells.indexOf(cellId);
       if (index < 0) return false;
       cells.splice(index, 1);
+      cellTypes.delete(cellId);
       return true;
     },
     clear_outputs() {
+      return true;
+    },
+    set_cell_type(cellId, cellType) {
+      if (!cellTypes.has(cellId)) return false;
+      cellTypes.set(cellId, cellType);
       return true;
     },
     set_cell_source_hidden() {
@@ -63,7 +80,23 @@ function createHandle(): NotebookControllerHandle & {
 
 afterEach(() => {
   resetNotebookCells();
+  clearPendingCellFocus();
+  getAllCellEditors().clear();
 });
+
+function createEditorView(): EditorView {
+  return {
+    state: {
+      doc: {
+        length: 0,
+        lines: 1,
+        line: vi.fn(() => ({ from: 0 })),
+      },
+    },
+    dispatch: vi.fn(),
+    focus: vi.fn(),
+  } as unknown as EditorView;
+}
 
 describe("createNotebookController", () => {
   it("updates source through the handle and mirrors the shared cell store", () => {
@@ -195,6 +228,31 @@ describe("createNotebookController", () => {
     expect(engine.flush).toHaveBeenCalledTimes(1);
   });
 
+  it("clears pending focus when deleting a cell before its editor registers", () => {
+    const handle = createHandle();
+    handle.cells.push("cell-b");
+    handle.cellTypes.set("cell-b", "code");
+    const engine = { flush: vi.fn(), scheduleFlush: vi.fn() };
+    const afterMutation = vi.fn();
+    const controller = createNotebookController({
+      getHandle: () => handle,
+      getEngine: () => engine,
+      canWriteCellSource: () => true,
+      canEditStructure: () => true,
+      afterMutation,
+    });
+    const view = createEditorView();
+
+    requestCellEditorFocus("cell-b");
+    controller.deleteCell("cell-b");
+    registerCellEditor("cell-b", view);
+
+    expect(handle.cells).toEqual(["cell-a"]);
+    expect(afterMutation).toHaveBeenCalledWith(handle, "structure");
+    expect(engine.flush).toHaveBeenCalledTimes(1);
+    expect(view.focus).not.toHaveBeenCalled();
+  });
+
   it("keeps legacy afterMutation behavior when wrappers are absent", () => {
     const handle = createHandle();
     handle.cells.push("cell-b");
@@ -216,6 +274,35 @@ describe("createNotebookController", () => {
     expect(applyMutationEvent).not.toHaveBeenCalled();
     expect(afterMutation).toHaveBeenCalledWith(handle, "structure");
     expect(engine.flush).toHaveBeenCalledTimes(1);
+  });
+
+  it("switches cell type through the changeset wrapper as a structural mutation", () => {
+    const handle = createHandle();
+    const engine = { flush: vi.fn(), scheduleFlush: vi.fn() };
+    const afterMutation = vi.fn();
+    const applyMutationEvent = vi.fn(() => true);
+    const event = { type: "sync_applied", changed: true };
+    handle.set_cell_type_with_changeset = vi.fn((cellId, cellType) => {
+      handle.set_cell_type(cellId, cellType);
+      return { result: true, event };
+    });
+    const controller = createNotebookController({
+      getHandle: () => handle,
+      getEngine: () => engine,
+      canWriteCellSource: () => true,
+      canEditStructure: () => true,
+      applyMutationEvent,
+      afterMutation,
+    });
+
+    controller.setCellType("cell-a", "markdown");
+
+    expect(handle.set_cell_type_with_changeset).toHaveBeenCalledWith("cell-a", "markdown");
+    expect(handle.cellTypes.get("cell-a")).toBe("markdown");
+    expect(applyMutationEvent).toHaveBeenCalledWith(event);
+    expect(afterMutation).not.toHaveBeenCalled();
+    expect(engine.flush).toHaveBeenCalledTimes(1);
+    expect(engine.scheduleFlush).not.toHaveBeenCalled();
   });
 
   it("keeps structural mutations closed when the host has not accepted the cells map", () => {

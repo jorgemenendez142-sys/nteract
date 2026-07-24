@@ -1,4 +1,9 @@
-import { createCommandRegistry, type NotebookHost, type Unlisten } from "@nteract/notebook-host";
+import {
+  DEFAULT_FONT_FAMILIES,
+  createCommandRegistry,
+  type NotebookHost,
+  type Unlisten,
+} from "@nteract/notebook-host";
 import { EMPTY, type Observable } from "rxjs";
 import type {
   BlobResolver,
@@ -201,6 +206,9 @@ export function createCloudNotebookHost({
       openInNewWindow: async () => {
         throw new Error("Hosted notebooks cannot open local files.");
       },
+      openHostedInNewWindow: async () => {
+        throw new Error("Hosted notebooks are already open in the cloud host.");
+      },
       cloneToEphemeral: async () => {
         throw new Error("Hosted notebooks cannot clone to a local ephemeral room.");
       },
@@ -210,6 +218,7 @@ export function createCloudNotebookHost({
       setTitle: async (title) => {
         document.title = title;
       },
+      setTheme: async () => {},
       onFocusChange: (callback) => {
         const onFocus = () => callback(true);
         const onBlur = () => callback(false);
@@ -224,6 +233,7 @@ export function createCloudNotebookHost({
     system: {
       getGitInfo: async () => null,
       getUsername: async () => "notebook-cloud",
+      getFontFamilies: async () => [...DEFAULT_FONT_FAMILIES],
     },
     dialog: {
       openFile: async () => null,
@@ -240,6 +250,10 @@ export function createCloudNotebookHost({
     },
     settings: {
       openWindow: asyncNoop,
+      getSynced: async () => ({}),
+      setSynced: asyncNoop,
+      rotateInstallId: async () => "",
+      onChanged: () => unlisten,
     },
     commands: createCommandRegistry(),
     log: {

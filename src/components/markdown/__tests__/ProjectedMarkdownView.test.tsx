@@ -39,6 +39,550 @@ describe("ProjectedMarkdownView", () => {
     }
   });
 
+  it("marks rendered runs with source spans for comment anchors", () => {
+    const { container } = render(
+      <ProjectedMarkdownView
+        plan={plan({
+          blocks: [
+            {
+              blockId: "p0",
+              blockIndex: 0,
+              element: "p",
+              kind: "paragraph",
+              measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+              sourceSpanByte: [0, 16],
+              sourceSpanUtf16: [0, 16],
+              syntaxSpans: [],
+              text: "alpha beta",
+            },
+          ],
+          runs: [
+            {
+              blockId: "p0",
+              inlineId: "r0",
+              listItemIndex: null,
+              renderedText: "alpha",
+              renderedTextUtf16: [0, 5],
+              semantic: "text",
+              sourceSpanByte: [0, 5],
+              sourceSpanUtf16: [0, 5],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const run = container.querySelector("[data-markdown-source-run='true']");
+    expect(run).not.toBeNull();
+    expect(run).toHaveAttribute("data-rendered-start", "0");
+    expect(run).toHaveAttribute("data-rendered-end", "5");
+    expect(run).toHaveAttribute("data-source-start", "0");
+    expect(run).toHaveAttribute("data-source-end", "5");
+  });
+
+  it("renders open and resolved comment highlights for overlapping source ranges", () => {
+    const { container } = render(
+      <ProjectedMarkdownView
+        commentHighlights={[
+          { from: 0, to: 20, threadId: "thread-open", color: "#d97706", resolved: false },
+          { from: 6, to: 10, threadId: "thread-resolved", color: "#52525b", resolved: true },
+        ]}
+        plan={plan({
+          blocks: [
+            {
+              blockId: "p0",
+              blockIndex: 0,
+              element: "p",
+              kind: "paragraph",
+              measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+              sourceSpanByte: [0, 10],
+              sourceSpanUtf16: [0, 10],
+              syntaxSpans: [],
+              text: "alpha beta",
+            },
+          ],
+          runs: [
+            {
+              blockId: "p0",
+              inlineId: "r0",
+              listItemIndex: null,
+              renderedText: "alpha",
+              renderedTextUtf16: [0, 5],
+              semantic: "text",
+              sourceSpanByte: [0, 5],
+              sourceSpanUtf16: [0, 5],
+            },
+            {
+              blockId: "p0",
+              inlineId: "r1",
+              listItemIndex: null,
+              renderedText: "beta",
+              renderedTextUtf16: [6, 10],
+              semantic: "text",
+              sourceSpanByte: [6, 10],
+              sourceSpanUtf16: [6, 10],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const runs = container.querySelectorAll<HTMLElement>("[data-markdown-source-run='true']");
+    const highlights = container.querySelectorAll<HTMLElement>(".comment-highlight");
+    expect(highlights).toHaveLength(2);
+    expect(runs[0]).not.toHaveClass("comment-highlight");
+    expect(runs[0]).not.toHaveClass("comment-highlight-resolved");
+    expect(highlights[0]).toHaveTextContent("alpha");
+    expect(highlights[0]).not.toHaveClass("comment-highlight-resolved");
+    expect(highlights[0]?.style.getPropertyValue("--cm-comment-color")).toBe("#d97706");
+    expect(runs[1]).not.toHaveClass("comment-highlight");
+    expect(runs[1]).not.toHaveClass("comment-highlight-resolved");
+    expect(highlights[1]).toHaveTextContent("beta");
+    expect(highlights[1]).toHaveClass("comment-highlight-resolved");
+    expect(highlights[1]?.style.getPropertyValue("--cm-comment-color")).toBe("#52525b");
+  });
+
+  it("activates rendered comment highlights on click", () => {
+    const onActivateCommentThread = vi.fn();
+    const onOuterClick = vi.fn();
+    const { container } = render(
+      <div onClick={onOuterClick}>
+        <ProjectedMarkdownView
+          onActivateCommentThread={onActivateCommentThread}
+          commentHighlights={[
+            { from: 0, to: 5, threadId: "thread-alpha", color: "#d97706", resolved: false },
+          ]}
+          plan={plan({
+            blocks: [
+              {
+                blockId: "p0",
+                blockIndex: 0,
+                element: "p",
+                kind: "paragraph",
+                measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+                sourceSpanByte: [0, 10],
+                sourceSpanUtf16: [0, 10],
+                syntaxSpans: [],
+                text: "alpha beta",
+              },
+            ],
+            runs: [
+              {
+                blockId: "p0",
+                inlineId: "r0",
+                listItemIndex: null,
+                renderedText: "alpha beta",
+                renderedTextUtf16: [0, 10],
+                semantic: "text",
+                sourceSpanByte: [0, 10],
+                sourceSpanUtf16: [0, 10],
+              },
+            ],
+          })}
+        />
+      </div>,
+    );
+
+    const highlighted = container.querySelector<HTMLElement>(".comment-highlight");
+    expect(highlighted).not.toBeNull();
+
+    fireEvent.click(highlighted!);
+
+    expect(onActivateCommentThread).toHaveBeenCalledTimes(1);
+    expect(onActivateCommentThread).toHaveBeenCalledWith("thread-alpha");
+    expect(onOuterClick).not.toHaveBeenCalled();
+  });
+
+  it("activates rendered comment highlights with Enter", () => {
+    const onActivateCommentThread = vi.fn();
+    render(
+      <ProjectedMarkdownView
+        onActivateCommentThread={onActivateCommentThread}
+        commentHighlights={[
+          { from: 0, to: 5, threadId: "thread-alpha", color: "#d97706", resolved: false },
+        ]}
+        plan={plan({
+          blocks: [
+            {
+              blockId: "p0",
+              blockIndex: 0,
+              element: "p",
+              kind: "paragraph",
+              measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+              sourceSpanByte: [0, 10],
+              sourceSpanUtf16: [0, 10],
+              syntaxSpans: [],
+              text: "alpha beta",
+            },
+          ],
+          runs: [
+            {
+              blockId: "p0",
+              inlineId: "r0",
+              listItemIndex: null,
+              renderedText: "alpha beta",
+              renderedTextUtf16: [0, 10],
+              semantic: "text",
+              sourceSpanByte: [0, 10],
+              sourceSpanUtf16: [0, 10],
+            },
+          ],
+        })}
+      />,
+    );
+
+    fireEvent.keyDown(screen.getByRole("button", { name: "Open comment thread" }), {
+      key: "Enter",
+    });
+
+    expect(onActivateCommentThread).toHaveBeenCalledTimes(1);
+    expect(onActivateCommentThread).toHaveBeenCalledWith("thread-alpha");
+  });
+
+  it("wraps only the selected characters for partial paragraph highlights", () => {
+    const source = "This is some markdown text it is good";
+    const selected = "some markdown";
+    const { container } = render(
+      <ProjectedMarkdownView
+        commentHighlights={[
+          { from: 8, to: 21, threadId: "thread-partial", color: "#d97706", resolved: false },
+        ]}
+        plan={plan({
+          blocks: [
+            {
+              blockId: "p0",
+              blockIndex: 0,
+              element: "p",
+              kind: "paragraph",
+              measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+              sourceSpanByte: [0, source.length],
+              sourceSpanUtf16: [0, source.length],
+              syntaxSpans: [],
+              text: source,
+            },
+          ],
+          runs: [
+            {
+              blockId: "p0",
+              inlineId: "r0",
+              listItemIndex: null,
+              renderedText: source,
+              renderedTextUtf16: [0, source.length],
+              semantic: "text",
+              sourceSpanByte: [0, source.length],
+              sourceSpanUtf16: [0, source.length],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const paragraph = container.querySelector("p");
+    const highlighted = container.querySelector<HTMLElement>(".comment-highlight");
+    const run = container.querySelector<HTMLElement>("[data-markdown-source-run='true']");
+    expect(paragraph).toHaveTextContent(source);
+    expect(highlighted?.textContent).toBe(selected);
+    expect(highlighted).not.toHaveTextContent("This is");
+    expect(highlighted).not.toHaveTextContent("text it is good");
+    expect(run).not.toHaveClass("comment-highlight");
+  });
+
+  it("renders two non-overlapping highlights in one transparent run", () => {
+    const source = "alpha beta gamma";
+    const { container } = render(
+      <ProjectedMarkdownView
+        commentHighlights={[
+          { from: 0, to: 5, threadId: "thread-alpha", color: "#d97706", resolved: false },
+          {
+            from: 11,
+            to: 16,
+            threadId: "thread-gamma",
+            color: "#2563eb",
+            resolved: false,
+            pending: true,
+          },
+        ]}
+        plan={plan({
+          blocks: [
+            {
+              blockId: "p0",
+              blockIndex: 0,
+              element: "p",
+              kind: "paragraph",
+              measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+              sourceSpanByte: [0, source.length],
+              sourceSpanUtf16: [0, source.length],
+              syntaxSpans: [],
+              text: source,
+            },
+          ],
+          runs: [
+            {
+              blockId: "p0",
+              inlineId: "r0",
+              listItemIndex: null,
+              renderedText: source,
+              renderedTextUtf16: [0, source.length],
+              semantic: "text",
+              sourceSpanByte: [0, source.length],
+              sourceSpanUtf16: [0, source.length],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const run = container.querySelector<HTMLElement>("[data-markdown-source-run='true']");
+    const highlights = Array.from(container.querySelectorAll<HTMLElement>(".comment-highlight"));
+    const plainText = Array.from(run?.childNodes ?? [])
+      .filter((node) => node.nodeType === 3)
+      .map((node) => node.textContent)
+      .join("");
+
+    expect(highlights).toHaveLength(2);
+    expect(highlights.map((highlight) => highlight.textContent)).toEqual(["alpha", "gamma"]);
+    expect(plainText).toBe(" beta ");
+    expect(highlights[0]).not.toHaveTextContent("beta");
+    expect(highlights[1]).not.toHaveTextContent("beta");
+    expect(highlights[1]).toHaveClass("comment-highlight-pending");
+    expect(run).not.toHaveClass("comment-highlight");
+  });
+
+  it("uses the narrower highlight for overlapping segments in one transparent run", () => {
+    const source = "alpha beta gamma";
+    const onActivateCommentThread = vi.fn();
+    const { container } = render(
+      <ProjectedMarkdownView
+        onActivateCommentThread={onActivateCommentThread}
+        commentHighlights={[
+          { from: 0, to: 16, threadId: "thread-wide", color: "#d97706", resolved: false },
+          { from: 6, to: 10, threadId: "thread-beta", color: "#2563eb", resolved: false },
+        ]}
+        plan={plan({
+          blocks: [
+            {
+              blockId: "p0",
+              blockIndex: 0,
+              element: "p",
+              kind: "paragraph",
+              measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+              sourceSpanByte: [0, source.length],
+              sourceSpanUtf16: [0, source.length],
+              syntaxSpans: [],
+              text: source,
+            },
+          ],
+          runs: [
+            {
+              blockId: "p0",
+              inlineId: "r0",
+              listItemIndex: null,
+              renderedText: source,
+              renderedTextUtf16: [0, source.length],
+              semantic: "text",
+              sourceSpanByte: [0, source.length],
+              sourceSpanUtf16: [0, source.length],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const highlights = Array.from(container.querySelectorAll<HTMLElement>(".comment-highlight"));
+    const betaHighlight = highlights.find((highlight) => highlight.textContent === "beta");
+
+    expect(highlights).toHaveLength(3);
+    expect(highlights.map((highlight) => highlight.textContent).join("")).toBe(source);
+    expect(highlights[0]?.textContent).toBe("alpha ");
+    expect(highlights[0]?.style.getPropertyValue("--cm-comment-color")).toBe("#d97706");
+    expect(betaHighlight).not.toBeUndefined();
+    expect(betaHighlight?.style.getPropertyValue("--cm-comment-color")).toBe("#2563eb");
+    expect(highlights[2]?.textContent).toBe(" gamma");
+    expect(highlights[2]?.style.getPropertyValue("--cm-comment-color")).toBe("#d97706");
+
+    fireEvent.click(betaHighlight!);
+
+    expect(onActivateCommentThread).toHaveBeenCalledTimes(1);
+    expect(onActivateCommentThread).toHaveBeenCalledWith("thread-beta");
+  });
+
+  it("highlights transparent strong run characters without ballooning to siblings", () => {
+    const { container } = render(
+      <ProjectedMarkdownView
+        commentHighlights={[
+          { from: 8, to: 12, threadId: "thread-strong", color: "#d97706", resolved: false },
+        ]}
+        plan={plan({
+          blocks: [
+            {
+              blockId: "p0",
+              blockIndex: 0,
+              element: "p",
+              kind: "paragraph",
+              measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+              sourceSpanByte: [0, 20],
+              sourceSpanUtf16: [0, 20],
+              syntaxSpans: [],
+              text: "alpha bold omega",
+            },
+          ],
+          runs: [
+            {
+              blockId: "p0",
+              inlineId: "before",
+              listItemIndex: null,
+              renderedText: "alpha ",
+              renderedTextUtf16: [0, 6],
+              semantic: "text",
+              sourceSpanByte: [0, 6],
+              sourceSpanUtf16: [0, 6],
+            },
+            {
+              blockId: "p0",
+              inlineId: "strong",
+              listItemIndex: null,
+              renderedText: "bold",
+              renderedTextUtf16: [6, 10],
+              semantic: "strong",
+              sourceSpanByte: [8, 12],
+              sourceSpanUtf16: [8, 12],
+            },
+            {
+              blockId: "p0",
+              inlineId: "after",
+              listItemIndex: null,
+              renderedText: " omega",
+              renderedTextUtf16: [10, 16],
+              semantic: "text",
+              sourceSpanByte: [14, 20],
+              sourceSpanUtf16: [14, 20],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const paragraph = container.querySelector("p");
+    const highlighted = container.querySelector<HTMLElement>(".comment-highlight");
+    expect(paragraph).toHaveTextContent("alpha bold omega");
+    expect(highlighted?.textContent).toBe("bold");
+    expect(highlighted?.querySelector("strong")).toHaveTextContent("bold");
+    expect(highlighted).not.toHaveTextContent("alpha");
+    expect(highlighted).not.toHaveTextContent("omega");
+    expect(container.querySelector("[data-source-start='0'] .comment-highlight")).toBeNull();
+    expect(container.querySelector("[data-source-start='14'] .comment-highlight")).toBeNull();
+  });
+
+  it("keeps opaque image highlights scoped to the image run", () => {
+    const source = "before ![Plot alt](attachment:plot.png) after";
+    const { container } = render(
+      <ProjectedMarkdownView
+        commentHighlights={[
+          { from: 10, to: 20, threadId: "thread-image", color: "#d97706", resolved: false },
+        ]}
+        plan={plan({
+          blocks: [
+            {
+              blockId: "p0",
+              blockIndex: 0,
+              element: "p",
+              kind: "paragraph",
+              measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+              sourceSpanByte: [0, source.length],
+              sourceSpanUtf16: [0, source.length],
+              syntaxSpans: [],
+              text: "before  after",
+            },
+          ],
+          runs: [
+            {
+              blockId: "p0",
+              inlineId: "before",
+              listItemIndex: null,
+              renderedText: "before ",
+              renderedTextUtf16: [0, 7],
+              semantic: "text",
+              sourceSpanByte: [0, 7],
+              sourceSpanUtf16: [0, 7],
+            },
+            {
+              blockId: "p0",
+              imageAlt: "Plot alt",
+              imageSrc: "attachment:plot.png",
+              inlineId: "image",
+              listItemIndex: null,
+              renderedText: "Plot alt",
+              renderedTextUtf16: [7, 15],
+              semantic: "image",
+              sourceSpanByte: [7, 39],
+              sourceSpanUtf16: [7, 39],
+            },
+            {
+              blockId: "p0",
+              inlineId: "after",
+              listItemIndex: null,
+              renderedText: " after",
+              renderedTextUtf16: [15, 21],
+              semantic: "text",
+              sourceSpanByte: [39, 45],
+              sourceSpanUtf16: [39, 45],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const image = screen.getByRole("img", { name: "Plot alt" });
+    const highlighted = image.closest<HTMLElement>(".comment-highlight");
+    const imageRun = highlighted?.parentElement;
+    expect(container.querySelectorAll(".comment-highlight")).toHaveLength(1);
+    expect(highlighted).not.toBeNull();
+    expect(highlighted?.textContent).toBe("");
+    expect(imageRun).toHaveAttribute("data-markdown-source-run", "true");
+    expect(imageRun).toHaveAttribute("data-source-start", "7");
+    expect(imageRun).toHaveAttribute("data-source-end", "39");
+    expect(imageRun).not.toHaveClass("comment-highlight");
+  });
+
+  it("renders runs without highlights without inserting highlight wrappers", () => {
+    const { container } = render(
+      <ProjectedMarkdownView
+        plan={plan({
+          blocks: [
+            {
+              blockId: "p0",
+              blockIndex: 0,
+              element: "p",
+              kind: "paragraph",
+              measurement: { estimatedHeight: 32, confidence: "high", width: 720 },
+              sourceSpanByte: [0, 10],
+              sourceSpanUtf16: [0, 10],
+              syntaxSpans: [],
+              text: "alpha beta",
+            },
+          ],
+          runs: [
+            {
+              blockId: "p0",
+              inlineId: "r0",
+              listItemIndex: null,
+              renderedText: "alpha beta",
+              renderedTextUtf16: [0, 10],
+              semantic: "text",
+              sourceSpanByte: [0, 10],
+              sourceSpanUtf16: [0, 10],
+            },
+          ],
+        })}
+      />,
+    );
+
+    const run = container.querySelector<HTMLElement>("[data-markdown-source-run='true']");
+    expect(container.querySelector(".comment-highlight")).toBeNull();
+    expect(run).toHaveTextContent("alpha beta");
+    expect(run?.children).toHaveLength(0);
+  });
+
   it("matches the output document heading rhythm", () => {
     const { container } = render(
       <ProjectedMarkdownView
@@ -307,7 +851,7 @@ describe("ProjectedMarkdownView", () => {
       />,
     );
 
-    expect(screen.getByText("First paragraph")).toHaveClass("my-3", "leading-relaxed");
+    expect(screen.getByText("First paragraph").closest("p")).toHaveClass("my-3", "leading-relaxed");
     expect(screen.getByRole("list")).toHaveClass("my-3", "ml-6", "list-disc");
     expect(screen.getByText("quoted").closest("blockquote")).toHaveClass(
       "border-l-2",
@@ -954,7 +1498,11 @@ describe("ProjectedMarkdownView", () => {
     );
 
     expect(screen.getByText("value").tagName).toBe("CODE");
-    expect(screen.getByText("value")).toHaveClass("border", "bg-muted/70", "font-mono");
+    expect(screen.getByText("value")).toHaveClass(
+      "border",
+      "bg-muted/70",
+      "[font-family:var(--output-mono-font)]",
+    );
   });
 
   it("renders projected code blocks with visible lab bench controls", () => {
@@ -1099,7 +1647,7 @@ describe("ProjectedMarkdownView", () => {
       />,
     );
 
-    expect(screen.getByText("K and note")).toBeInTheDocument();
+    expect(screen.getByText("K").closest("p")).toHaveTextContent("K and note");
     expect(document.querySelector("kbd")).toBeNull();
     expect(document.querySelector("[title='shortcut']")).toBeNull();
   });

@@ -1,6 +1,6 @@
 # Frontend Sync Bridge and Stable DOM Order
 
-**Status:** Draft, 2026-05-23.
+**Status:** Draft, 2026-05-23. Decision 8 added 2026-07-03.
 
 ## Context
 
@@ -62,7 +62,7 @@ The bridge's responsibilities, in source order:
 - `outputIdChanges$` -> `applyOutputChangeset` (async; logged and swallowed on failure to keep the stream alive).
 - `poolState$` -> `setPoolState`.
 
-Cleanup is one `Subscription.unsubscribe()`. The bridge sets a `stopped` flag before tearing down. `materializeChangeset` checks it before writing to a store; `applyOutputChangeset`'s subscription does **not** check `stopped` (`notebook-sync-store-bridge.ts:163`) — punchlist FSB-1 tracks adding either the guard or a structured retry. The hook's `useEffect` cleanup also calls `handleHost.clear()` (`useAutomergeNotebook.ts:326, :350`, `notebook-handle-host.ts:107, :121`), which nulls and frees the WASM handle. A subsequent re-mount creates a fresh peer, not a reused one.
+Cleanup is one `Subscription.unsubscribe()`. The bridge sets a `stopped` flag before tearing down. `materializeChangeset` checks it before writing to a store; `applyOutputChangeset`'s subscription does **not** check `stopped` (`notebook-sync-store-bridge.ts:163`) — FSB-1 tracks adding either the guard or a structured retry. The hook's `useEffect` cleanup also calls `handleHost.clear()` (`useAutomergeNotebook.ts:326, :350`, `notebook-handle-host.ts:107, :121`), which nulls and frees the WASM handle. A subsequent re-mount creates a fresh peer, not a reused one.
 
 ### Why not just `useEffect` in the hook
 
@@ -88,7 +88,12 @@ Stable-DOM-order rendering keeps every cell's iframe pinned to the same DOM node
 
 ### Why this is load-bearing across the codebase
 
-The invariant lives in `AGENTS.md` (also available through the `CLAUDE.md` symlink). It is asserted three places: the `stableDomOrder` memo at `NotebookView.tsx:519`, the `order: index` style at `NotebookView.tsx:307`, and the parent flex container at `NotebookView.tsx:952`. Any one of them flipping back to "iterate cellIds and let React handle order" reintroduces the iframe reload. CI doesn't catch this; the visible failure is a paper cut that is easy to misdiagnose as "iframes are slow."
+The invariant lives in `AGENTS.md` (also available through the `CLAUDE.md`
+symlink). Three code sites implement it: the `stableDomOrder` memo
+(`NotebookView.tsx`), the `order: index` style, and the parent flex container.
+Any one of them flipping back to "iterate cellIds and let React handle order"
+reintroduces the iframe reload. CI doesn't catch this; the visible failure is a
+paper cut that is easy to misdiagnose as "iframes are slow."
 
 ### Hidden-group rendering composes with this
 
@@ -122,7 +127,12 @@ acts on the request:
 
 The function returns `boolean`, not `void`, because outbound flush is the failure surface where the transport can drop or error. Direct flush callers such as dependency sync and save check `false` and bail before issuing their dependent request. Execute and run-all use the `required_heads` path instead: the daemon fails closed if the triggered flush does not deliver the requested heads before its timeout.
 
-The `required_heads` extension lives in `App.tsx:374`: `NotebookClient` is constructed with `getRequiredHeads: () => getHandle()?.get_heads_hex() ?? []` and `flushBeforeRequiredHeadsRequest: () => getEngine()?.flush()`. Cross-reference `docs/adr/execution-pipeline.md` for the daemon side. The bridge does not own this handshake; it owns the inbound projection that lets a UI read the result.
+The `required_heads` extension lives in `App.tsx`: `NotebookClient` is
+constructed with `getRequiredHeads: () => getHandle()?.get_heads_hex() ?? []`
+and `flushBeforeRequiredHeadsRequest: () => getEngine()?.flush()`.
+Cross-reference `docs/adr/execution-pipeline.md` for the daemon side. The bridge
+does not own this handshake; it owns the inbound projection that lets a UI read
+the result.
 
 ### Why the engine returns `Promise<boolean>` and not a result type
 
@@ -184,6 +194,138 @@ Renderer plugins themselves are out of scope here. See `src/components/isolated/
 The bridge holds a local-actor label so it can filter self-echo attributions. The actor label is sourced from `daemon:ready` payloads and falls back to `desktop:<sessionId>` until the daemon hands one over. Cross-reference Decision 1 of `docs/adr/identity-and-trust.md` for the actor-label format.
 
 This is the one place where editor input bypasses the React render path entirely. CodeMirror's ViewPlugin sees the change before React; the cell-store update happens after, asynchronously, via the bridge's `onSourceChanged` callback. The user sees the keystroke instantly.
+
+## Decision 8: Non-CRDT source state rides the same bridge pattern
+
+The first seven decisions cover Automerge-backed state: WASM peer, engine
+Observables, store bridge, `useSyncExternalStore`. The cloud viewer's other
+async sources - OIDC/app-session auth, access requests, the notebook catalog,
+workstation registry and pairing - grew up separately as per-component
+`useEffect` lifecycles: duplicated renewal timers across four views, three
+hand-rolled chained-`setTimeout` polls, ref mirrors (`authStateRef`,
+`appSessionStatusRef`) reconstructing snapshot reads that a store gives for
+free, and stale-write guards reinvented per effect with uneven coverage.
+
+The same three-layer shape now applies to these sources:
+
+1. **Source driver.** A `createPoll`/`fetchLatest` pipeline
+   (`packages/runtimed/src/poll.ts`), or a hand-wired `exhaustMap` chain where
+   triggers are heterogeneous (OIDC refresh), owns timers, fetches, aborts,
+   and serialization. Drivers live behind an `activate(deps) => dispose` call
+   with injected `scheduler`/`fetch`/`now`, so tests run on virtual time and
+   the browser runs on wall clock.
+2. **Store + deduped projections.** An `ObservableStore<T>` subclass
+   (`packages/runtimed/src/observable-store.ts`) holds one `BehaviorSubject`
+   spine, a `loaded$` gate, synchronous `snapshot`, and
+   `select(project, equals)` projections deduped by named field-by-field
+   comparators.
+3. **React bridge.** Each store exposes named domain hooks
+   (`useCloudAuthState`, `useHostedCatalogAuth`, `useCloudWorkstationsRegistry`, ...)
+   defined next to its module-level projections. The hooks share one internal
+   tearing-safe binding (`src/components/notebook/state/observable-binding.ts`,
+   extracted from the runtime-state binding) but the binding is plumbing, not
+   API: components import domain vocabulary, never raw observables. This
+   matches the existing read surface (`useCell`, `useCellIds`,
+   `useRuntimeState`) and keeps inline `store.select(...)`-per-render - which
+   would defeat the binding cache - out of component bodies.
+
+The Decision 1 invariant extends verbatim: React owns no async source of
+truth. If React state and the store disagree, the store wins.
+
+### Where each idiom applies
+
+RxJS is the idiom wherever time, async, or cancellation is involved: polls,
+fetch lifecycles, renewal timers, reconnect keys, anything holding an
+`AbortController`. The hand-rolled `Map`/`Set` pub/sub stores in
+`src/components/notebook/state/*` (cells, outputs, execution) stay as they
+are: they fan out synchronous per-entity updates where per-subscriber
+granularity is the point and no cancellation exists. That boundary is a
+decision, not an accident.
+
+### Equality convention
+
+`distinctUntilChanged` uses named field-by-field comparators
+(`hostedCatalogAuthEquals`, `cloudAppSessionsEqual`, ...), never deep-equal or
+JSON. Each comparator carries a colocated
+`satisfies Record<keyof T, true>` manifest so adding a field to the projection
+type breaks the build until the comparator is revisited. The manifest forces
+every key to be listed, not every key to be compared - treat a manifest break
+as a review prompt for the comparator body, not proof of correctness.
+
+### Why auth is a module-level BehaviorSubject
+
+`cloudInstantPaintPrincipalMatcher`
+(`apps/notebook-cloud/viewer/instant-paint.ts`) reads the auth principal
+synchronously before React mounts to decide whether instant paint applies. A
+store seeded from React state or a `useEffect` would return
+`skipped_no_principal` on every first paint. Auth state is therefore a
+module-level `BehaviorSubject` seeded synchronously from
+`cloudPrototypeAuthFromWindow()`, activated once at viewer boot (skipped on
+the OIDC callback route, which consumes no store hooks).
+
+### Singletons for lifetime, context for consumption
+
+The module singletons are the boot and instant-paint reality: the drivers
+activate them once at viewer boot, and `instant-paint.ts` reads `authSnapshot`
+before React mounts. Neither can go through a React provider, so the singletons
+stay. What the hook layer adds is a consumption override, not an activation
+override: `cloud-auth-context.ts` creates the always-loaded auth context whose
+default value is `cloudAuthStore`, while `cloud-stores-context.ts` creates the
+lazy context whose default value is the three non-auth store singleton bundle.
+Auth domain hooks and boot-critical snapshot readers use `useCloudAuthStore()`;
+access-request, catalog, and workstations hooks use `useCloudStores()`. No
+provider is mounted on any production path, so production resolves to the
+singletons and behavior is byte-identical. A test, an Elements fixture, or a
+future embedded viewer mounts the matching provider with its own instances and
+the subtree's hooks read those instead; that override's owner activates its own
+instances, because the provider swaps which stores are consumed, not which
+stores are driven. Context is a consumption override with a singleton default,
+never a requirement: the default keeps the hooks provider-free, and the
+singleton keeps owning boot and instant paint.
+
+Boot-path discipline follows from the same split: only the auth store may be
+module-evaluated on the entry chunk (its synchronous seed is what instant paint
+reads). The three non-auth stores stay behind `cloud-stores-context.ts`, which
+is imported only by lazy route chunks, keeping those store modules out of the
+`/n` cold-load static closure (a measured 8.6 kB gzip off the shared icons chunk,
+69.4 -> 60.8 kB).
+Every other store rides its route's chunk - the workstations surface loads with
+the lazy `/workstations` route, not with the notebook or dashboard entry. A new
+store landing in the entry chunk needs an instant-paint-grade reason recorded
+here.
+
+### The convention layer stays a convention layer
+
+The generic surface is deliberately small: `ObservableStore`, `select`,
+`createPoll`/`fetchLatest`, and one internal React binding. Stock RxJS
+composition is the framework; these are conventions over it. Drivers are
+epics in the redux-observable sense (effect streams with injected deps and
+schedulers) without the action bus - stores shard by read pattern instead of
+funneling through one dispatch path, for the same reason Decision 1 rejected
+`useDocument`. If this layer ever wants middleware, a store registry, an
+action bus, or its own devtools protocol, that is the signal to adopt an
+existing system (Effect, NgRx-style tooling) rather than grow a fifth
+primitive here.
+
+### Placement
+
+Mechanism (`ObservableStore`, `select`, `createPoll`, `fetchLatest`) is
+DOM-free and lives in `packages/runtimed`. The React binding imports React and
+lives in shared `src/components/notebook/state/`. The four source stores
+(auth, access-request, catalog, workstations) hold cloud host policy and stay
+in `apps/notebook-cloud/viewer/` per the convergence memo's do-not-converge
+list: shared surfaces consume projected results, never the fetch/mutation
+machinery.
+
+### Follow-ups
+
+- FSB-3: collapse the `useLiveInputs`/render-source straddle when connection
+  facts become store-backed, deleting the two-phase
+  `set(notify:false)`/`flush()` adapter in `cloud-facts-react.ts`.
+- FSB-4: comments store single-writer (`commentsProjection$` as sole source,
+  optimistic re-pull through a `refreshNow()` action).
+- FSB-5: remove the write-only `setCells` force-update in
+  `cloud-viewer-session.ts` once consumers subscribe to view stores.
 
 ## Worked examples
 
@@ -253,9 +395,9 @@ This is the one place where editor input bypasses the React render path entirely
 - `apps/notebook/src/components/NotebookView.tsx:519` - `stableDomOrder` memo and Decision 2 invariant.
 - `apps/notebook/src/components/NotebookView.tsx:307` - `order: index` style.
 - `apps/notebook/src/hooks/useAutomergeNotebook.ts` - WASM handle owner and bridge caller.
-- `apps/notebook/src/hooks/useCrdtBridge.tsx` - CodeMirror -> CRDT bridge.
-- `apps/notebook/src/lib/crdt-editor-bridge.ts` - `splice_source` + remote-change application.
-- `apps/notebook/src/lib/notebook-frame-bus.ts` - module-level pub/sub for broadcasts and presence.
+- `src/components/notebook/crdt-bridge.tsx` - CodeMirror -> CRDT React bridge.
+- `src/components/notebook/crdt-editor-bridge.ts` - `splice_source` + remote-change application.
+- `src/components/notebook/state/notebook-frame-bus.ts` - module-level pub/sub for broadcasts and presence.
 - `apps/notebook/src/lib/notebook-cells.ts` - split cell store (`useCell`, `useCellIds`).
 - `apps/notebook/src/lib/runtime-state.ts` - runtime-state store and `isRuntimeStateLoaded`.
 - `apps/notebook/src/lib/project-runtime-stores.ts` - execution-view projection.

@@ -1,8 +1,9 @@
 # MCP Session Lifecycle and Daemon Supervision
 
-**Status:** Draft, 2026-05-23.
+**Status:** Accepted, 2026-07-13; supersedes Draft from 2026-05-23.
 
 **Neighbors:**
+- `docs/adr/room-source-lifecycle-and-file-recovery.md` - the room-owned source states, recovery journal, and progressive capability gates observed by MCP sessions.
 - `docs/adr/typed-frame-v4-wire-protocol.md` - the wire that backs every `DocHandle` the MCP server holds.
 - `docs/adr/document-split.md` - what `NotebookSession.handle` actually points at (`NotebookDoc`, `RuntimeStateDoc`, plus the runtime broadcast).
 - `docs/adr/execution-pipeline.md` - why a stale `DocHandle` is so painful for the agent: `required_heads`, output sync, and broadcast replay all run through it.
@@ -15,7 +16,7 @@ The MCP server is the agent's only way into a live nteract notebook. It has to s
 
 1. **The MCP client** (Claude Code, the inspector, Codex, Zed). Connects on stdio, sends a stream of tool calls, expects every successful call to map to *some* notebook.
 2. **The runtimed daemon**. Unix-socket server that owns the Automerge rooms, the kernels, and the file watchers. Restarts on user upgrade, on a crash, or because the user toggled debug/release in dev. Versions bump independently of the MCP child.
-3. **The room.** The per-notebook entity inside the daemon. Holds the Automerge doc, the kernel handle, the autosave debouncer, and a peer counter. Survives the last peer disconnecting (for a while) so reconnects are cheap.
+3. **The room.** The per-notebook entity inside the daemon. Holds the Automerge doc, source controller, recovery journal, kernel handle, file checkpoint writer, and peer counter. It survives the last peer disconnecting (for a while) so reconnects are cheap, and its journal survives reaping so acknowledged heads remain recoverable.
 
 The MCP server is the only place all three meet. Tool calls are stateful by convention ("each connection has one active notebook session"), but the connection is a stdio pipe and the session is a `DocHandle` into the daemon. When any of the three layers tears down or restarts, the other two have to find each other again without leaking kernels, dropping outputs, or surprising the agent with a stale `notebook_id`.
 
@@ -177,8 +178,20 @@ This is structurally a workaround for `DaemonConnection`'s API conflating "I'm s
 The daemon's eviction model has three layers:
 
 1. **Kernel teardown** (`peer_eviction.rs`). All peers leave; after `keep_alive_secs` (default 30 s, configurable 5 s to 7 days), the kernel is shut down and the env directory is cleaned up. The room itself stays resident. The autosave debouncer and file watchers also stay alive.
-2. **Ghost-room reaping** (`daemon::ghost_room_reaper_loop`). Every 5 minutes, sweep peer-less rooms whose kernel has been torn down. TTL is 24 hours; cap is 32 peer-less rooms. Aged-out or overflowed rooms are removed from `notebook_rooms` and `path_index` for good.
-3. **Daemon shutdown.** Everything goes.
+2. **Ghost-room reaping** (`daemon::ghost_room_reaper_loop`). Every 5 minutes, sweep peer-less rooms whose kernel has been torn down. TTL is 24 hours; cap is 32 peer-less rooms. Aged-out or overflowed rooms may leave `notebook_rooms` and `path_index` only after the recovery journal covers their current heads.
+3. **Daemon shutdown.** Resident tasks and kernels end, but the shutdown path first requires the same causal journal barrier for accepted room heads.
+
+Reaping and clean shutdown call `await_durable(required_heads)`. A journal
+failure makes room availability `Degraded` and keeps the room resident; it does
+not turn acknowledged work into an evictable in-memory detail. The full
+durability contract is defined in
+[Room Source Lifecycle and File-Backed Recovery](./room-source-lifecycle-and-file-recovery.md).
+The reaper snapshots heads, commits them to the journal, awaits the durable
+barrier, then removes the registry entry only if the final predicate still
+holds: no peers, no reservations, same connection generation, teardown timestamp
+still present, source not loading, and durability not requiring repair.
+Writer-side journaling plus the generation and reservation checks carry the
+post-barrier protection.
 
 **Why the room outlives the kernel.** Reconnects are common. A user closes the desktop window and re-opens it; a Claude Code session ends and a new one begins on the same notebook; a daemon upgrade restarts the child. In every case the agent or the UI wants to land on the same `notebook_id` with the same outputs visible and (where possible) the kernel still warm. Tearing down the room on the last disconnect would force a full re-load of the document, the file watcher rebind, and (if there's no `.ipynb` to reload from) loss of ephemeral cell state. Keeping the room resident makes reconnects cheap and idempotent.
 
@@ -194,12 +207,20 @@ Ephemeral untitled notebooks are rejoined by UUID; file-backed notebooks are rej
 
 | Notebook type | Identified by | Rejoin method | Eviction check |
 |--------------|---------------|---------------|----------------|
-| File-backed | Path (UUID is derived) | `connect_open(path)` | `list_rooms` (only for ephemeral path; file-backed implicitly reloads) |
-| Ephemeral (untitled) | UUID | `connect(uuid)` | Explicit `list_rooms` lookup |
+| File-backed | Path; the UUID is daemon-local and not durable across restarts | `connect_open(path)` | Daemon source controller restores matching journal state or imports disk; conflicts degrade explicitly |
+| Untitled (persisted) | UUID | `connect(uuid)` | Daemon-authoritative (attaches if recoverable, refuses if gone) |
 
-The reason: file-backed rooms persist their state as `.ipynb`, not as a long-lived Automerge `.automerge` blob. When a file-backed room is reaped, its `.automerge` file is deleted; rejoining by UUID would create a new empty room with no cells. `connect_open(path)` triggers the daemon's reload-from-disk path so the agent finds the same cells it left.
+The reason: the path is the durable user-facing identity for a file-backed
+room, while its UUID remains daemon-local. `connect_open(path)` lets the source
+controller bind the current `.ipynb` fingerprint to its Automerge recovery
+journal. A matching pair restores journal state; no journal imports disk; a
+divergent pair preserves both and returns a degraded `source_conflict`. Rejoin
+must not create an empty UUID room or delete unexported heads merely because the
+previous resident room was reaped.
 
-Ephemeral rooms have no on-disk fallback. Their state is in the Automerge `.automerge` blob the daemon writes for resident rooms, which is also deleted on reap. The explicit `list_rooms` lookup avoids the "phantom room" failure mode: connecting to an evicted UUID would create an empty room with no kernel, no history, no outputs, and the agent would have no signal that anything went wrong.
+An untitled notebook is persisted by id to `docs_dir`, so on a daemon restart the daemon can reload it on a connect-by-id. The phantom-room failure mode (`#2088` - connecting to an evicted UUID minting an empty kernel-less room) is handled by `NotebookSync`-by-uuid being **attach-only and daemon-authoritative**: the daemon attaches to a resident room, reloads one still recoverable from its persisted doc, and **refuses** a gone one (a `NotebookConnectionInfo` with `error`, surfaced by the client as `SyncError::Protocol`) rather than minting a phantom. The rejoin just attempts the reconnect: recovered -> keep, refused -> clear `Evicted`. The phantom is prevented at the authoritative layer instead of guessed at by the client. The NotebookSync route to `create_empty_notebook` on a pristine room is not part of this attach-by-id path; `create_empty_notebook` remains the live seeding helper for explicit create/open flows.
+
+**The path has to actually be on the session, or this whole decision is a no-op.** A session established by `connect_notebook(notebook_id=...)` does not learn its path for free - the by-id connect path (`ConnectResult`) has no `notebook_path`, unlike `connect_open`'s `OpenResult`. Until 2026-06, the by-id branch stored `notebook_path: None`, so a file-backed room joined by UUID rejoined by *UUID*, which Decision 8 says creates an empty room. On the nightly channel (frequent daemon upgrades) this was the live "agent sees `cells: []` while the desktop shows the notebook" bug: the desktop kept the path and reloaded, the agent kept the UUID and did not. The fix resolves the room's canonical path from `list_rooms` on a by-id connect and stores it on the session (in-child rejoin), and surfaces `notebook_path` in the connect/create response so the proxy seeds the path (not the UUID) into a respawned child's rejoin target. See `docs/adr/notebook-identity-and-path-binding.md` for why the path, not the UUID, is the durable handle.
 
 ## Decision 9: `SessionDropReason` is the agent-facing recovery hint
 
@@ -213,6 +234,52 @@ When a tool call lands and finds `session = None`, the error has to tell the age
 
 The error message is generated at the point of tool failure (`no_session_error()`), so the agent sees a reason that matches *the most recent* drop. The drop info is best-effort: if the session is cleared twice (e.g., disconnect followed by an evict on rejoin), the second one overwrites the first. The previous `notebook_id` and `notebook_path` are kept so the recovery message can name what was lost.
 
+## Decision 10: Connection activation is progressive and generation-guarded
+
+`session: Some` identifies the selected target; it does not mean every
+subsystem is ready. Each connect activation carries a monotonically increasing
+`session_generation`, the normalized target, a retained daemon projection, and
+separate readiness for room projection, the local NotebookDoc peer, the local
+RuntimeStateDoc peer, and the runtime.
+Pending activation metadata is not a second active session; `session` remains
+the only installed target.
+
+`connect_notebook` remains one call. It returns after the room offers a safe
+projection, either `ProjectionReady` or `Degraded` with a retained projection,
+with stable cell IDs, projection heads and completeness, source state, later
+readiness, and explicit read/mutate/execute capabilities. The local Automerge
+peers continue converging in the background.
+
+Tool handlers use operation-specific gates:
+
+- daemon projection reads require `ProjectionReady`;
+- local NotebookDoc reads and mutations require `Interactive` and any requested
+  causal heads;
+- execution additionally requires runtime readiness and carries
+  `required_heads` through the existing execution gate.
+
+The UI and MCP mutation surface stay read-only before `Interactive`, while the
+low-level sync peer may still accept and durably journal Automerge changes. A
+retained projection is inspectable after local sync failure but never
+authorizes writes or execution against cached source.
+
+Every async wait captures its activation generation and re-checks it before
+installing state or dispatching an operation. A different target supersedes the
+old generation. Concurrent connects for the same canonical path, resident UUID,
+or normalized hosted target coalesce behind one in-flight attach and projection
+result. Path and UUID aliases for a known file-backed room resolve through the
+daemon to the same room key before coalescing. Session locks are not held across
+file loading, socket connection, projection, or sync waits.
+
+Failures are structured as `notebook_not_ready`, `runtime_not_ready`,
+`source_degraded`, `source_conflict`, `session_superseded`, or `sync_failed`.
+`notebook_not_ready` always carries closed mutate/execute capabilities. When
+the document plane is already interactive and only the runtime is missing,
+runtime reads and execution fail as `runtime_not_ready` instead, with mutation
+still open. Projection success followed by local peer failure leaves a
+degraded read-only session; source failure before a projection can be honored
+fails the connection directly.
+
 ## Worked examples
 
 ### Cold start: Claude Code spawns owner-mode proxy
@@ -220,7 +287,7 @@ The error message is generated at the point of tool failure (`no_session_error()
 1. Claude Code spawns `mcp-supervisor` over stdio. The supervisor's internal `McpProxy` reads cached tool list from disk and returns it immediately to the MCP `tools/list` request, so Claude Code's tool registry is populated without waiting on the daemon.
 2. Supervisor receives `notifications/initialized`. Spawns the `runt mcp` child.
 3. Child connects to the daemon socket via peer creds, sees no `NTERACT_MCP_REJOIN_NOTEBOOK`, sits idle with `session = None`.
-4. Agent calls `connect_notebook { path: "/tmp/foo.ipynb" }`. Proxy forwards to child. Child opens a peer connection, daemon creates the room (or rebinds the path index to an existing resident room), child stores the `DocHandle` in `session`, returns the `notebook_id`.
+4. Agent calls `connect_notebook { path: "/tmp/foo.ipynb" }`. Proxy forwards to child. The daemon source controller creates or restores the room, publishes a heads-qualified projection, and the child installs the generation-guarded session. The call returns the `notebook_id` and stable cell projection while local peers continue converging.
 5. Proxy parses the response, stores `notebook_id` in `last_notebook_id`. This is the seed for the next restart.
 6. Subsequent tool calls clone the handle under a read lock and execute.
 
@@ -254,7 +321,7 @@ The error message is generated at the point of tool failure (`no_session_error()
    convergence) errors out. Tool returns failure to the agent.
 4. Daemon comes back (launchd respawn, or user restart). Child's `DaemonConnection` reconnects; emits `Connected`.
 5. Watch loop classifies as `RejoinInitial("/tmp/foo.ipynb")` because `disconnect_target` is set and `was_disconnected = true`. Runs `rejoin()` via `connect_open`, installs new session.
-6. Next tool call from the agent lands on a fresh `DocHandle` for the same notebook. Cells the agent had already authored before the disconnect are still there (loaded from `.ipynb`); cells authored during the disconnect window (there are none, because the agent's tool call failed) are not lost.
+6. Next tool call from the agent lands on a fresh `DocHandle` for the same notebook. Cells the agent had already authored before the disconnect are restored from the matching recovery journal and `.ipynb` checkpoint; cells authored during the disconnect window (there are none, because the agent's tool call failed) are not lost.
 
 ### Two MCP clients, attach mode
 
@@ -274,11 +341,11 @@ These are the architectural gaps surfaced while writing this ADR. None block the
 
 3. **Daemon ownership across attach/owner boundaries.** Attach-mode children do not know who owns the daemon. If the owner exits cleanly, the daemon may or may not exit too depending on whether anyone else is connected. There is no protocol-level "I am the owner, I am exiting now" signal. Today this is fine because the user is responsible for noticing. As we ship more agents that auto-spawn MCP clients, the implicit "first wins, others attach" rule will get racy.
 
-4. **`disconnect_target` precision after a real `Disconnected`.** When the daemon disappears, the child stashes the *last known* notebook target. But the daemon could have been gone for hours; the room may have been reaped during that window. The current `rejoin()` does the right thing for ephemeral notebooks (the `list_rooms` check returns "not present" and clears the session with `Evicted`), but the agent gets a confusing trail: first `Disconnected`, then `Evicted` on the next tool call.
+4. **`disconnect_target` precision after a real `Disconnected`.** When the daemon disappears, the child stashes the *last known* notebook target. But the daemon could have been gone for hours; the room may have been reaped during that window. The current `rejoin()` does the right thing for ephemeral notebooks when daemon attach refuses the room and clears the session with `Evicted`, but the agent gets a confusing trail: first `Disconnected`, then `Evicted` on the next tool call.
 
-5. **`parked_sessions` lifetime.** Capped at `MAX_PARKED_SESSIONS` with arbitrary HashMap-iteration LRU. Every parked session holds a live peer connection to the daemon, which means the daemon's `active_peers` for those rooms stays at 1 even when the agent is not actively using them. That keeps the kernel alive (good if the agent comes back), but it also disables the eviction timer for any notebook the agent has touched in the recent past. Open question: is the kernel-keep-alive the intended cost, or do we want parked sessions to drop the peer connection and rebuild on resume?
+5. **`parked_sessions` lifetime.** Capped at `MAX_PARKED_SESSIONS` with arbitrary HashMap-iteration eviction. Every parked session holds a live peer connection to the daemon, which means the daemon's `active_peers` for those rooms stays at 1 even when the agent is not actively using them. That keeps the kernel alive (good if the agent comes back), but it also disables the eviction timer for any notebook the agent has touched in the recent past. Open question: is the kernel-keep-alive the intended cost, or do we want parked sessions to drop the peer connection and rebuild on resume?
 
-6. **Cross-daemon proxy resumption.** Proxy stamps the reconnection banner from `(old_daemon_version, new_daemon_version)`. If the daemon socket *path* changes (e.g., dev-mode worktree switch in isolated mode), the proxy treats it as a child crash, restarts the child, and the new child sees a fresh daemon. The proxy's `last_notebook_id` is meaningless in the new daemon's room space. There is no current check for this; the rejoin will fail and `SessionDropReason::Evicted` (or `Disconnected`) is recorded.
+6. **Cross-daemon proxy resumption.** Proxy stamps the reconnection banner from `(old_daemon_version, new_daemon_version)`. For **file-backed** notebooks this is now handled: the proxy seeds the *path* (not the UUID) into the respawned child's rejoin target, and the path is meaningful across daemon instances, so the source controller can reconcile the recovery journal and current file (Decision 8; `docs/adr/notebook-identity-and-path-binding.md` Decision 5). The remaining gaps are **ephemeral** notebooks (no path; their UUID is daemon-instance scoped, so a cross-daemon respawn loses them) and a daemon socket *path* change (dev-mode worktree switch in isolated mode), where even a file-backed `last_notebook_id` UUID would be meaningless - tracked as MSL-4.
 
 7. **MCP child as runtime peer.** The child connects as the user's "operator" today, but the daemon has no concept of `runtime_peer` vs `editor` scope (Decision 5 of `identity-and-trust.md`). If we ever split the kernel sidecar off into its own process, that process will connect as `runtime_peer`. The MCP child does both (edits cells and triggers kernel commands). Reconciling that with the per-connection scope model is unresolved.
 
@@ -304,11 +371,3 @@ These are the architectural gaps surfaced while writing this ADR. None block the
 - `crates/runtimed-client/src/daemon_connection.rs` - `DaemonConnection`, heartbeat interval, `DaemonEvent` shape.
 - `crates/mcp-supervisor/src/main.rs` - `DevMode` enum and `NTERACT_DEV_MODE` parsing.
 - `.agents/skills/mcp-session-lifecycle/SKILL.md` - the operating rules; this ADR is the why.
-
-## Tracked follow-ups (from the retired cleanup punchlist)
-
-These items were migrated from `docs/adr/cleanup-punchlist.md` when it was
-retired (2026-06-10). Severity: **Targeted PR** = one-or-two-file fix ready
-to implement; **Design** = needs a decision in this ADR before code moves.
-
-- **MSL-4** (Design; `crates/runt-mcp-proxy/src/proxy.rs`): When a dev worktree daemon's socket path changes (worktree switch in isolated mode, manual relocation), `mcp-supervisor` compares daemon versions across child restart but not socket paths. The `McpProxy.last_notebook_id` from the old daemon is meaningless in the new daemon's room space; rejoin fails with `SessionDropReason::Evicted` and the agent sees a confusing trail.

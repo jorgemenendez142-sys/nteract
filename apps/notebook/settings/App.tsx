@@ -1,8 +1,34 @@
-import { AlertCircle, ChevronDown, Monitor, Moon, Sun, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  AlertCircle,
+  Check,
+  ChevronDown,
+  ChevronsUpDown,
+  Monitor,
+  Moon,
+  Sun,
+  X,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  DEFAULT_FONT_FAMILIES,
+  fontFamilyNameToCssValue,
+  singleFontFamilyFromCssValue,
+  uniqueSortedFontFamilies,
+  useNotebookHost,
+} from "@nteract/notebook-host";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
+import { useNotebookEditorSettings } from "@/components/editor/editor-settings-store";
 import {
   FEATURE_FLAGS,
   isKnownPythonEnv,
@@ -33,6 +59,243 @@ function formatDuration(secs: number): string {
     return remainingSecs > 0 ? `${mins}m ${remainingSecs}s` : `${mins}m`;
   }
   return `${secs}s`;
+}
+
+function useAvailableFontFamilies() {
+  const host = useNotebookHost();
+  const [fontFamilies, setFontFamilies] = useState(() =>
+    uniqueSortedFontFamilies(DEFAULT_FONT_FAMILIES),
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    host.system
+      .getFontFamilies()
+      .then((families) => {
+        if (cancelled) return;
+        setFontFamilies(uniqueSortedFontFamilies([...DEFAULT_FONT_FAMILIES, ...families]));
+      })
+      .catch((error) => {
+        host.log.warn(
+          `[settings] Failed to load system font families: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [host]);
+
+  return fontFamilies;
+}
+
+export function FontFamilyPicker({
+  label,
+  value,
+  onChange,
+  placeholder,
+  description,
+  fontFamilies,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  description: string;
+  fontFamilies: readonly string[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [searchValue, setSearchValue] = useState("");
+  const customInputRef = useRef<HTMLInputElement>(null);
+  const inputId = `editor-${label.toLowerCase().replace(/\s+/g, "-")}`;
+  const listId = `${inputId}-list`;
+
+  const options = useMemo(() => uniqueSortedFontFamilies([...fontFamilies]), [fontFamilies]);
+
+  const currentSingleFamily = singleFontFamilyFromCssValue(value);
+  const isKnownFont =
+    currentSingleFamily != null &&
+    options.some((f) => f.toLocaleLowerCase() === currentSingleFamily.toLocaleLowerCase());
+
+  const [customMode, setCustomMode] = useState(() => value !== "" && !isKnownFont);
+
+  useEffect(() => {
+    if (customMode) customInputRef.current?.focus();
+  }, [customMode]);
+
+  const normalizedSearchValue = searchValue.trim().toLocaleLowerCase();
+  const visibleOptions = useMemo(() => {
+    if (!normalizedSearchValue) return options;
+    return options.filter((f) => f.toLocaleLowerCase().includes(normalizedSearchValue));
+  }, [normalizedSearchValue, options]);
+
+  const displayValue = customMode ? "Custom…" : currentSingleFamily || value || placeholder;
+
+  const clear = useCallback(() => {
+    onChange("");
+    setCustomMode(false);
+  }, [onChange]);
+
+  const selectValue = useCallback(
+    (next: string) => {
+      onChange(next);
+      setSearchValue("");
+      setOpen(false);
+    },
+    [onChange],
+  );
+
+  const selectFontFamily = useCallback(
+    (fontFamily: string) => {
+      setCustomMode(false);
+      selectValue(fontFamilyNameToCssValue(fontFamily));
+    },
+    [selectValue],
+  );
+
+  const selectDefault = useCallback(() => {
+    setCustomMode(false);
+    selectValue("");
+  }, [selectValue]);
+
+  const selectCustomMode = useCallback(() => {
+    if (!customMode) onChange("");
+    setCustomMode(true);
+    setSearchValue("");
+    setOpen(false);
+  }, [customMode, onChange]);
+
+  return (
+    <div className="contents">
+      <span className="text-sm text-muted-foreground whitespace-nowrap self-start pt-1.5 text-right">
+        {label}
+      </span>
+      <div className="space-y-1.5 min-w-0">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <Popover
+            open={open}
+            onOpenChange={(nextOpen) => {
+              setOpen(nextOpen);
+              if (nextOpen) setSearchValue("");
+            }}
+          >
+            <PopoverTrigger asChild>
+              <button
+                id={inputId}
+                type="button"
+                role="combobox"
+                aria-label={label}
+                aria-controls={listId}
+                aria-expanded={open}
+                className={cn(
+                  "flex h-8 min-w-0 flex-1 items-center justify-between rounded-md border border-input bg-background px-3 py-1 text-left text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                  value || customMode ? "text-foreground" : "text-muted-foreground",
+                )}
+              >
+                <span className="min-w-0 truncate font-mono">{displayValue}</span>
+                <ChevronsUpDown className="ml-2 size-3.5 shrink-0 text-muted-foreground" />
+              </button>
+            </PopoverTrigger>
+            <PopoverContent id={listId} align="end" className="w-[min(29rem,calc(100vw-2rem))] p-0">
+              <Command shouldFilter={false}>
+                <CommandInput
+                  value={searchValue}
+                  onValueChange={setSearchValue}
+                  placeholder="Search fonts"
+                />
+                <CommandList className="h-72 max-h-72">
+                  <CommandGroup>
+                    <CommandItem value="__default__" onSelect={selectDefault}>
+                      <Check
+                        className={cn(
+                          "size-3.5",
+                          !customMode && value === "" ? "opacity-100" : "opacity-0",
+                        )}
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate text-sm">Theme default</div>
+                        <div className="truncate font-mono text-[10px] text-muted-foreground">
+                          {placeholder}
+                        </div>
+                      </div>
+                    </CommandItem>
+                    <CommandItem value="__custom__" onSelect={selectCustomMode}>
+                      <Check className={cn("size-3.5", customMode ? "opacity-100" : "opacity-0")} />
+                      <div className="min-w-0">
+                        <div className="truncate text-sm">Custom</div>
+                        <div className="truncate text-[10px] text-muted-foreground">
+                          Enter a CSS font stack
+                        </div>
+                      </div>
+                    </CommandItem>
+                  </CommandGroup>
+                  {visibleOptions.length > 0 ? (
+                    <CommandGroup heading="System fonts">
+                      {visibleOptions.map((fontFamily) => {
+                        const selected = !customMode && currentSingleFamily === fontFamily;
+                        const cssValue = fontFamilyNameToCssValue(fontFamily);
+                        return (
+                          <CommandItem
+                            key={fontFamily}
+                            value={fontFamily}
+                            onSelect={() => selectFontFamily(fontFamily)}
+                            className="items-start"
+                          >
+                            <Check
+                              className={cn(
+                                "mt-0.5 size-3.5",
+                                selected ? "opacity-100" : "opacity-0",
+                              )}
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate text-sm" style={{ fontFamily: cssValue }}>
+                                {fontFamily}
+                              </div>
+                              <div
+                                className="truncate text-[11px] text-muted-foreground"
+                                style={{ fontFamily: cssValue }}
+                              >
+                                Aa The quick brown fox 0123
+                              </div>
+                            </div>
+                          </CommandItem>
+                        );
+                      })}
+                    </CommandGroup>
+                  ) : searchValue.trim() ? null : (
+                    <CommandEmpty>No fonts found.</CommandEmpty>
+                  )}
+                </CommandList>
+              </Command>
+            </PopoverContent>
+          </Popover>
+          {value || customMode ? (
+            <button
+              type="button"
+              aria-label={`Clear ${label.toLowerCase()}`}
+              title="Clear"
+              onClick={clear}
+              className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-input text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <X className="size-3" />
+            </button>
+          ) : null}
+        </div>
+        {customMode ? (
+          <input
+            ref={customInputRef}
+            type="text"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder="e.g. Helvetica, Arial, sans-serif"
+            className="w-full h-7 rounded-md border border-input bg-background px-2 font-mono text-xs text-foreground placeholder:text-muted-foreground shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          />
+        ) : null}
+        <p className="text-[10px] text-muted-foreground/70">{description}</p>
+      </div>
+    </div>
+  );
 }
 
 // Exponential slider constants
@@ -150,6 +413,64 @@ function RuntimeSection({
   );
 }
 
+function EditorSection({
+  codeFontFamily,
+  markdownFontFamily,
+  lineNumbers,
+  onCodeFontFamilyChange,
+  onMarkdownFontFamilyChange,
+  onLineNumbersChange,
+}: {
+  codeFontFamily: string;
+  markdownFontFamily: string;
+  lineNumbers: boolean;
+  onCodeFontFamilyChange: (value: string) => void;
+  onMarkdownFontFamilyChange: (value: string) => void;
+  onLineNumbersChange: (value: boolean) => void;
+}) {
+  const fontFamilies = useAvailableFontFamilies();
+
+  return (
+    <div className="space-y-4 pt-4 border-t border-border/50">
+      <div>
+        <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+          Editor
+        </span>
+      </div>
+
+      <div className="space-y-3">
+        <div className="grid gap-x-3 gap-y-3" style={{ gridTemplateColumns: "auto 1fr" }}>
+          <FontFamilyPicker
+            label="Code font"
+            value={codeFontFamily}
+            onChange={onCodeFontFamilyChange}
+            placeholder='ui-monospace, "SF Mono", monospace'
+            description="Code cells, raw cells, inline code, and code blocks"
+            fontFamilies={fontFamilies}
+          />
+          <FontFamilyPicker
+            label="Markdown font"
+            value={markdownFontFamily}
+            onChange={onMarkdownFontFamilyChange}
+            placeholder="system-ui, sans-serif"
+            description="Rendered Markdown and Markdown input"
+            fontFamilies={fontFamilies}
+          />
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <div className="space-y-0.5">
+            <span className="text-sm text-foreground">Line numbers</span>
+            <p className="text-[10px] text-muted-foreground/70">
+              Show line numbers in notebook editors
+            </p>
+          </div>
+          <Switch checked={lineNumbers} onCheckedChange={onLineNumbersChange} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /** Badge input for managing a list of package names */
 function PackageBadgeInput({
   packages,
@@ -245,6 +566,7 @@ export default function App() {
   // IMPORTANT: Use theme/setTheme/colorTheme/setColorTheme from useSyncedTheme, not a separate
   // useSyncedSettings call, so that setState updates the same instance that applies the DOM theme.
   const { theme, setTheme, colorTheme, setColorTheme } = useSyncedTheme();
+  const editorSettings = useNotebookEditorSettings();
 
   const {
     defaultRuntime,
@@ -261,6 +583,9 @@ export default function App() {
     setInstallDefaultDataPackages,
     keepAliveSecs,
     setKeepAliveSecs,
+    setEditorCodeFontFamily,
+    setEditorMarkdownFontFamily,
+    setEditorLineNumbers,
     featureFlags,
     setFeatureFlag,
     telemetryEnabled,
@@ -516,6 +841,15 @@ export default function App() {
           onRedactEnvValuesInOutputsChange={setRedactEnvValuesInOutputs}
           importShellEnvironment={importShellEnvironment}
           onImportShellEnvironmentChange={setImportShellEnvironment}
+        />
+
+        <EditorSection
+          codeFontFamily={editorSettings.codeFontFamily}
+          markdownFontFamily={editorSettings.markdownFontFamily}
+          lineNumbers={editorSettings.lineNumbers}
+          onCodeFontFamilyChange={setEditorCodeFontFamily}
+          onMarkdownFontFamilyChange={setEditorMarkdownFontFamily}
+          onLineNumbersChange={setEditorLineNumbers}
         />
 
         <PrivacySection

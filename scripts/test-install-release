@@ -59,13 +59,28 @@ make_linux_fixtures() {
   echo "fake appimage" > "$dir/nteract-stable-linux-x64.AppImage"
 }
 
+make_nightly_linux_fixtures() {
+  local dir="$1"
+  local log="$2"
+  mkdir -p "$dir"
+  make_fake_tool "$dir/runt-nightly-linux-x64" "$log"
+  make_fake_tool "$dir/runtimed-nightly-linux-x64" "$log"
+  make_fake_tool "$dir/nteract-mcp-nightly-linux-x64" "$log"
+  echo "fake nightly appimage" > "$dir/nteract-nightly-linux-x64.AppImage"
+}
+
 make_darwin_fixtures() {
   local dir="$1"
   local log="$2"
   local stage="$dir/.stage"
-  mkdir -p "$dir" "$stage/nteract.app/Contents/MacOS"
+  local recorders="$dir/.recorders"
+  mkdir -p "$dir" "$recorders" "$stage/nteract.app/Contents/MacOS"
   for tool in nteract runt runtimed nteract-mcp; do
-    make_fake_tool "$stage/nteract.app/Contents/MacOS/$tool" "$log"
+    # macOS kills shell scripts whose executed path is inside
+    # *.app/Contents/MacOS. Keep the recorder script outside the bundle and
+    # put an executable symlink where the app sidecar would be.
+    make_fake_tool "$recorders/$tool" "$log"
+    ln -s "$recorders/$tool" "$stage/nteract.app/Contents/MacOS/$tool"
   done
   tar -czf "$dir/nteract-stable-darwin-arm64.app.tar.gz" -C "$stage" "nteract.app"
   rm -rf "$stage"
@@ -89,18 +104,59 @@ EOF
   chmod 0755 "$dir/uname"
 }
 
+make_fetch_tool_path_without_curl() {
+  local dir="$1"
+  local assets="$2"
+  local log="$3"
+  mkdir -p "$dir"
+
+  local tool
+  for tool in bash basename chmod cp dirname env ln mkdir mktemp mv rm; do
+    ln -s "$(command -v "$tool")" "$dir/$tool"
+  done
+
+  cat > "$dir/wget" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+url=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    -O)
+      out="\${2:-}"
+      shift 2
+      ;;
+    *)
+      url="\$1"
+      shift
+      ;;
+  esac
+done
+if [[ -z "\$out" || -z "\$url" ]]; then
+  echo "wget shim expected -O <dest> <url>" >&2
+  exit 2
+fi
+asset="\${url##*/}"
+echo "wget \$asset -> \$out" >> "$log"
+cp "$assets/\$asset" "\$out"
+EOF
+  chmod 0755 "$dir/wget"
+}
+
 run_installer() {
   local home="$1"
   shift
   mkdir -p "$home"
-  HOME="$home" XDG_DATA_HOME="" bash "$INSTALLER" "$@"
+  HOME="$home" XDG_DATA_HOME="" bash "${INSTALLER_UNDER_TEST:-$INSTALLER}" "$@"
 }
 
 note "linux desktop install"
 LINUX_HOME="$WORK/linux-home"
 LINUX_LOG="$WORK/linux-calls.log"
 make_linux_fixtures "$WORK/linux-assets" "$LINUX_LOG"
-run_installer "$LINUX_HOME" --from-dir "$WORK/linux-assets" --no-start > "$WORK/linux-out.log"
+make_uname_shim "$WORK/shim-linux" "Linux" "x86_64"
+PATH="$WORK/shim-linux:$PATH" run_installer "$LINUX_HOME" \
+  --from-dir "$WORK/linux-assets" --no-start > "$WORK/linux-out.log"
 PREFIX="$LINUX_HOME/.local/share/nteract/stable"
 assert_file "$PREFIX/nteract.AppImage"
 assert_link "$LINUX_HOME/.local/bin/runt" "$PREFIX/bin/runt"
@@ -108,6 +164,60 @@ assert_link "$LINUX_HOME/.local/bin/runtimed" "$PREFIX/bin/runtimed"
 assert_link "$LINUX_HOME/.local/bin/nteract-mcp" "$PREFIX/bin/nteract-mcp"
 assert_link "$LINUX_HOME/.local/bin/nteract" "$PREFIX/nteract.AppImage"
 grep -q "runt daemon doctor --fix --no-start" "$LINUX_LOG" || fail "linux: daemon doctor --fix --no-start not invoked"
+
+note "linux download install falls back to wget without curl"
+WGET_HOME="$WORK/wget-home"
+WGET_LOG="$WORK/wget-calls.log"
+WGET_DOWNLOAD_LOG="$WORK/wget-downloads.log"
+make_linux_fixtures "$WORK/wget-assets" "$WGET_LOG"
+make_fetch_tool_path_without_curl "$WORK/no-curl-tools" "$WORK/wget-assets" "$WGET_DOWNLOAD_LOG"
+PATH="$WORK/shim-linux:$WORK/no-curl-tools" run_installer "$WGET_HOME" \
+  --tag v9.9.9-stable.202601010101 --no-start > "$WORK/wget-out.log"
+WGET_PREFIX="$WGET_HOME/.local/share/nteract/stable"
+assert_file "$WGET_PREFIX/nteract.AppImage"
+assert_link "$WGET_HOME/.local/bin/runt" "$WGET_PREFIX/bin/runt"
+grep -q "wget runt-linux-x64" "$WGET_DOWNLOAD_LOG" || fail "wget fallback: runt asset was not downloaded with wget"
+grep -q "wget runtimed-linux-x64" "$WGET_DOWNLOAD_LOG" || fail "wget fallback: runtimed asset was not downloaded with wget"
+grep -q "wget nteract-mcp-linux-x64" "$WGET_DOWNLOAD_LOG" || fail "wget fallback: mcp asset was not downloaded with wget"
+grep -q "wget nteract-stable-linux-x64.AppImage" "$WGET_DOWNLOAD_LOG" || fail "wget fallback: appimage asset was not downloaded with wget"
+grep -q "runt daemon doctor --fix --no-start" "$WGET_LOG" || fail "wget fallback: daemon doctor --fix --no-start not invoked"
+
+note "linux nightly desktop install"
+NIGHTLY_HOME="$WORK/nightly-home"
+NIGHTLY_LOG="$WORK/nightly-calls.log"
+make_nightly_linux_fixtures "$WORK/nightly-assets" "$NIGHTLY_LOG"
+STAMPED_NIGHTLY_INSTALLER="$WORK/install-linux-release-nightly"
+sed \
+  -e 's/^DEFAULT_CHANNEL="stable"$/DEFAULT_CHANNEL="nightly"/' \
+  -e 's/^DEFAULT_TAG=""$/DEFAULT_TAG="v9.9.9-nightly.202601010101"/' \
+  "$INSTALLER" > "$STAMPED_NIGHTLY_INSTALLER"
+chmod 0755 "$STAMPED_NIGHTLY_INSTALLER"
+INSTALLER_UNDER_TEST="$STAMPED_NIGHTLY_INSTALLER" PATH="$WORK/shim-linux:$PATH" \
+  run_installer "$NIGHTLY_HOME" --from-dir "$WORK/nightly-assets" --no-start > "$WORK/nightly-out.log"
+NIGHTLY_PREFIX="$NIGHTLY_HOME/.local/share/nteract/nightly"
+assert_file "$NIGHTLY_PREFIX/nteract-nightly.AppImage"
+assert_link "$NIGHTLY_HOME/.local/bin/runt-nightly" "$NIGHTLY_PREFIX/bin/runt-nightly"
+assert_link "$NIGHTLY_HOME/.local/bin/runtimed-nightly" "$NIGHTLY_PREFIX/bin/runtimed-nightly"
+assert_link "$NIGHTLY_HOME/.local/bin/nteract-mcp-nightly" "$NIGHTLY_PREFIX/bin/nteract-mcp-nightly"
+assert_link "$NIGHTLY_HOME/.local/bin/nteract-nightly" "$NIGHTLY_PREFIX/nteract-nightly.AppImage"
+grep -q "runt-nightly daemon doctor --fix --no-start" "$NIGHTLY_LOG" || fail "nightly: daemon doctor --fix --no-start not invoked"
+
+note "linux nightly headless install"
+NIGHTLY_HEADLESS_HOME="$WORK/nightly-headless-home"
+NIGHTLY_HEADLESS_LOG="$WORK/nightly-headless-calls.log"
+make_nightly_linux_fixtures "$WORK/nightly-headless-assets" "$NIGHTLY_HEADLESS_LOG"
+INSTALLER_UNDER_TEST="$STAMPED_NIGHTLY_INSTALLER" PATH="$WORK/shim-linux:$PATH" \
+  run_installer "$NIGHTLY_HEADLESS_HOME" --from-dir "$WORK/nightly-headless-assets" \
+  --headless --no-start > "$WORK/nightly-headless-out.log"
+NIGHTLY_HEADLESS_PREFIX="$NIGHTLY_HEADLESS_HOME/.local/share/nteract/nightly"
+assert_missing "$NIGHTLY_HEADLESS_PREFIX/nteract-nightly.AppImage"
+assert_link "$NIGHTLY_HEADLESS_HOME/.local/bin/runt-nightly" "$NIGHTLY_HEADLESS_PREFIX/bin/runt-nightly"
+assert_link "$NIGHTLY_HEADLESS_HOME/.local/bin/runtimed-nightly" "$NIGHTLY_HEADLESS_PREFIX/bin/runtimed-nightly"
+assert_link "$NIGHTLY_HEADLESS_HOME/.local/bin/nteract-mcp-nightly" "$NIGHTLY_HEADLESS_PREFIX/bin/nteract-mcp-nightly"
+grep -q "runt-nightly daemon doctor --fix --no-start" "$NIGHTLY_HEADLESS_LOG" || fail "nightly headless: daemon doctor --fix --no-start not invoked"
+grep -q "$NIGHTLY_HEADLESS_HOME/.local/bin/runt-nightly\" workstation connect" "$WORK/nightly-headless-out.log" || fail "nightly headless: summary should name the installed channel-specific connect command"
+grep -q "$NIGHTLY_HEADLESS_HOME/.local/bin/runt-nightly\" workstation service install --start" "$WORK/nightly-headless-out.log" || fail "nightly headless: summary should name the installed channel-specific service command"
+grep -q "$NIGHTLY_HEADLESS_HOME/.local/bin/runt-nightly\" workstation run" "$WORK/nightly-headless-out.log" || fail "nightly headless: summary should name the installed channel-specific run command"
 
 note "darwin desktop install (explicit --applications-dir)"
 DARWIN_HOME="$WORK/darwin-home"
@@ -152,7 +262,10 @@ HEADLESS_APP="$HEADLESS_HOME/.local/share/nteract/stable/nteract.app"
 assert_file "$HEADLESS_APP/Contents/MacOS/runtimed"
 assert_missing "$HEADLESS_HOME/Applications"
 assert_link "$HEADLESS_HOME/.local/bin/runt" "$HEADLESS_APP/Contents/MacOS/runt"
-grep -q "workstation connect" "$WORK/headless-out.log" || fail "headless: summary should mention the workstation pairing flow"
+grep -q "$HEADLESS_HOME/.local/bin/runt\" workstation connect" "$WORK/headless-out.log" || fail "headless: summary should mention the installed workstation pairing flow"
+grep -q "$HEADLESS_HOME/.local/bin/runt\" workstation run" "$WORK/headless-out.log" || fail "headless: summary should mention the installed foreground workstation flow"
+grep -q "Persistent workstation service management starts with Linux user systemd" "$WORK/headless-out.log" || fail "headless: summary should explain service platform support"
+grep -q "workstation service install --start" "$WORK/headless-out.log" && fail "darwin headless: summary should not print the Linux-only service command"
 
 note "unsupported platform is rejected with guidance"
 make_uname_shim "$WORK/shim-unsupported" "Linux" "armv7l"

@@ -3,8 +3,13 @@ import {
   IndexedDbStorageAdapter,
   clearPersistedNotebookDoc,
   type BlobResolver,
+  type CellChangeset,
   type CommChanges,
 } from "runtimed";
+import {
+  getCellIdsSnapshot,
+  type NotebookStoreOutput as NotebookStoreJupyterOutput,
+} from "@/components/notebook";
 import {
   applyWidgetCommBroadcastToStore,
   applyWidgetCommChangesToStore,
@@ -12,34 +17,28 @@ import {
 import { setCrdtCommWriter } from "@/components/widgets/crdt-comm-writer";
 import type { WidgetStore } from "@/components/widgets/widget-store";
 import {
+  applyExecutionViewChangeset,
+  applyOutputChangeset,
+} from "@/components/notebook/state/runtime-store-projection";
+import {
   cloudConnectionErrorAcceptsAccessDiagnostic,
   cloudConnectionErrorWithAccessDiagnostic,
   diagnoseCloudConnectionAccess,
   isCloudConnectionAccessDiagnostic,
 } from "./connection-diagnostics";
+import { materializeChangeset } from "../../notebook/src/lib/frame-pipeline";
+import { startCursorDispatch } from "@/components/notebook/cursor-registry";
+import { emitBroadcast, emitPresence } from "@/components/notebook/state/notebook-frame-bus";
+import { resetPoolState, setPoolState } from "@/components/notebook/state/pool-state";
+import { resetRuntimeState, setRuntimeState } from "@/components/notebook/state/runtime-state";
 import {
-  applyExecutionViewChangeset,
-  applyOutputChangeset,
-  emitBroadcast,
-  emitPresence,
-  getCellIdsSnapshot,
-  materializeChangeset,
-  resetPoolState,
-  resetRuntimeState,
-  resetRuntimeStoresProjection,
-  startCursorDispatch,
-  setPoolState,
-  setRuntimeState,
-  type CellChangeset,
-  type JupyterOutput as NotebookStoreJupyterOutput,
-} from "../../notebook/src/notebook-surface";
-import {
+  cloudSyncAuthConnectionKey,
   cloudSyncAuthFromPrototypeAuthState,
   withCloudPrototypeAuthHeaders,
   type CloudPrototypeAuthState,
   type CloudSyncAuth,
 } from "./collaborator-auth";
-import { cloudSyncAuthConnectionKey } from "./session-auth-stability";
+import { useCloudAuthStore } from "./cloud-auth-context";
 import { materializeCloudNotebookView } from "./cloud-view-model";
 import { CloudLivePresenceStore } from "./live-presence";
 import {
@@ -71,6 +70,11 @@ import {
   loadCloudPersistedNotebookSeed,
   type CloudNotebookPersistenceController,
 } from "./notebook-persistence";
+import {
+  clearPendingLocalEditMarker,
+  readPendingLocalEditMarker,
+  writePendingLocalEditMarker,
+} from "./pending-local-edit-marker";
 import { NOTEBOOK_DOC_HEAL_KEY, SyncHealScheduler } from "./sync-heal";
 import { createCloudNotebookTabBridge } from "./tab-bridge";
 import {
@@ -80,11 +84,15 @@ import {
   type OfflineMergeNoticeData,
 } from "./offline-merge-tracker";
 import {
-  cleanupCloudProjectionForRemovedCells,
-  projectCloudCellsIntoNotebookViewStores,
-  resetCloudProjectionUnlessPreserved,
-  resetCloudViewStoreProjection,
-} from "./notebook-view-store-bridge";
+  SUSTAINED_RECONNECTING_DEBOUNCE_MS,
+  SustainedReconnectAccessDiagnosticTracker,
+} from "./use-sustained-reconnecting";
+import {
+  cleanupNotebookProjectionForRemovedCells,
+  projectNotebookCellsIntoViewStores,
+  resetNotebookProjectionStores,
+  resetNotebookProjectionUnlessPreserved,
+} from "@/components/notebook/state/projection-lifecycle";
 import { CloudViewerPresenceStore } from "./presence";
 import { createOutputResolutionCache, type ResolvedCell } from "./render-resolution";
 import { loadRenderSnapshotHandle, loadSnapshotPairHandle } from "./runtimed-wasm-client";
@@ -94,6 +102,7 @@ import { cloudWidgetUpdateManager } from "./widget-runtime";
 import { projectCloudWidgetComms } from "./widget-comm-projection";
 import type { CloudAppSession } from "./app-session";
 import type { CloudAuthRenewalState, ViewerStatus } from "./notice-types";
+import { FrameType } from "../src/protocol";
 
 const quietSyncHealLogger = {
   debug: () => {},
@@ -121,6 +130,7 @@ export interface CloudViewerConfig {
   aclEndpoint: string;
   invitesEndpoint: string;
   accessRequestsEndpoint: string;
+  authorProfilesEndpoint?: string;
   workstationsEndpoint?: string;
   workstationDefaultEndpoint?: string;
   workstationAttachEndpoint?: string;
@@ -128,6 +138,14 @@ export interface CloudViewerConfig {
     canManageSharing?: boolean;
     canSubmitExecutionRequests?: boolean;
   };
+  featureFlags?: {
+    enable_comments?: boolean;
+    disable_auto_format?: boolean;
+  };
+  initialCatalogAccess?: {
+    scope: "viewer" | "editor" | "owner";
+    title?: string | null;
+  } | null;
   session?: CloudAppSession | null;
   syncEndpoint: string;
   blobBasePath: string;
@@ -215,6 +233,14 @@ export function useCloudViewerSession({
   resolveSyncAuth,
   widgetStore,
 }: UseCloudViewerSessionOptions): CloudViewerSession {
+  // Auth snapshot reads below (connection diagnostics, the instant-paint
+  // principal gate, the sync-auth fallback) resolve through the auth context so
+  // a CloudAuthStoreProvider override routes this hook to the same store its
+  // owner activates. The context default is the singleton, a stable reference,
+  // so the `auth` entries added to the effect deps below cannot retrigger a
+  // connect in production; each read still takes the latest snapshot at read
+  // time.
+  const auth = useCloudAuthStore();
   const [status, setStatus] = useState<ViewerStatus>({
     kind: "loading",
     message: loadingPolicy.initialStatusMessage,
@@ -235,7 +261,7 @@ export function useCloudViewerSession({
   // Set when a seeded session's replayed changes were rejected by the room:
   // the next connect attempt must bootstrap (survives the effect re-run).
   const skipSeedOnceRef = useRef(false);
-  // Escalated AUTOMERGE_SYNC rejections quarantine the cross-tab bridge
+  // Escalated materialized sync rejections quarantine the cross-tab bridge
   // for the remainder of the session (page lifetime): the bridge's
   // principal is sender-asserted, so a hostile/buggy same-origin tab can
   // feed changes the room will keep rejecting — without this flag the
@@ -290,17 +316,37 @@ export function useCloudViewerSession({
   const clearOfflineMergeNotice = useCallback(() => {
     setOfflineMergeNotice(null);
   }, []);
+  const markPendingLocalEditForCurrentRuntime = useCallback(() => {
+    if (connectionStatusBridge.getCurrent() !== "reconnecting") return;
+    const liveRuntime = liveRuntimeRef.current;
+    if (!liveRuntime) return;
+    const principal = cloudPrincipalFromActorLabel(liveRuntime.actorLabel);
+    if (isAnonymousCloudPrincipal(principal)) return;
+    const storage = cloudPendingLocalEditMarkerStorage();
+    if (!storage) return;
+    try {
+      writePendingLocalEditMarker(storage, {
+        headsHex: liveRuntime.handle.get_heads_hex(),
+        notebookId: config.notebookId,
+        principal,
+      });
+    } catch (error) {
+      console.warn("[notebook-cloud] failed to mark pending local edit", error);
+    }
+  }, [config.notebookId, connectionStatusBridge]);
   const noteLocalCellEdit = useCallback(
     (cellId: string, options?: OfflineMergeLocalCellEditOptions) => {
       offlineMergeTracker.noteLocalCellEdit(cellId, options);
+      markPendingLocalEditForCurrentRuntime();
     },
-    [offlineMergeTracker],
+    [markPendingLocalEditForCurrentRuntime, offlineMergeTracker],
   );
   const noteLocalCellDelete = useCallback(
     (cellId: string, options?: OfflineMergeLocalCellEditOptions) => {
       offlineMergeTracker.noteLocalCellDelete(cellId, options);
+      markPendingLocalEditForCurrentRuntime();
     },
-    [offlineMergeTracker],
+    [markPendingLocalEditForCurrentRuntime, offlineMergeTracker],
   );
   // Terminal heal-exhaustion surface (one quiet line; see sync-heal.ts).
   const [syncHealStalled, setSyncHealStalled] = useState(false);
@@ -313,15 +359,42 @@ export function useCloudViewerSession({
   // The live-room effect must not depend on raw auth/session object identity:
   // browser auth refreshes can rebuild those objects without changing the
   // effective socket credentials. Key the effect by the transport credential
-  // shape, and read the latest auth through refs at connect/diagnostic time.
-  const authStateRef = useRef(authState);
-  authStateRef.current = authState;
+  // shape, and read the latest auth from the auth store snapshot at
+  // connect/diagnostic time.
   const hasAppSessionRef = useRef(hasAppSession);
   hasAppSessionRef.current = hasAppSession;
   const authRenewalKindRef = useRef(authRenewalKind);
   authRenewalKindRef.current = authRenewalKind;
   const previousAuthRenewalKindRef = useRef(authRenewalKind);
   const syncAuthConnectionKey = cloudSyncAuthConnectionKey(authState, { hasAppSession });
+
+  useEffect(() => {
+    const tracker = new SustainedReconnectAccessDiagnosticTracker({
+      debounceMs: SUSTAINED_RECONNECTING_DEBOUNCE_MS,
+      diagnose: () =>
+        diagnoseCloudConnectionAccess({
+          accessRequestsEndpoint: config.accessRequestsEndpoint,
+          authState: auth.authSnapshot,
+          hasAppSession: hasAppSessionRef.current,
+        }),
+      onDiagnostic: (diagnostic) => {
+        // Sustained reconnect diagnostics run after a runtime has gone live.
+        // Pre-ready access diagnostics still stop their scoped pendingTransport;
+        // once live, the runtime retry loop owns transport teardown while we
+        // replace generic reconnect copy with the access-specific failure.
+        setConnectionError((current) =>
+          cloudConnectionErrorWithAccessDiagnostic(current, diagnostic),
+        );
+      },
+    });
+    const subscription = connectionStatusBridge.subscribe((connectionStatus) => {
+      tracker.next(connectionStatus);
+    });
+    return () => {
+      subscription.unsubscribe();
+      tracker.dispose();
+    };
+  }, [auth, connectionStatusBridge, config.accessRequestsEndpoint]);
 
   useEffect(() => {
     const previousKind = previousAuthRenewalKindRef.current;
@@ -363,7 +436,7 @@ export function useCloudViewerSession({
   const paintedNotebookIdentityRef = useRef<string | null>(null);
   const applyResolvedCells = useCallback(
     (resolvedCells: ResolvedCell[]) => {
-      projectCloudCellsIntoNotebookViewStores(resolvedCells);
+      projectNotebookCellsIntoViewStores(resolvedCells);
       if (resolvedCells.length > 0) {
         paintedNotebookIdentityRef.current = `id:${config.notebookId}`;
       }
@@ -377,9 +450,7 @@ export function useCloudViewerSession({
   // them for same-notebook re-runs, so it cannot be the unmount janitor).
   useEffect(
     () => () => {
-      resetCloudViewStoreProjection();
-      resetRuntimeState();
-      resetRuntimeStoresProjection();
+      resetNotebookProjectionStores();
     },
     [],
   );
@@ -683,6 +754,39 @@ export function useCloudViewerSession({
           clear: () => clearPersistedNotebookDoc(persistenceAdapter, config.notebookId),
         }
       : undefined;
+    const clearPendingLocalEditMarkerForRuntime = (liveRuntime: CloudSyncRuntime) => {
+      const principal = cloudPrincipalFromActorLabel(liveRuntime.actorLabel);
+      if (isAnonymousCloudPrincipal(principal)) return;
+      const storage = cloudPendingLocalEditMarkerStorage();
+      if (!storage) return;
+      try {
+        clearPendingLocalEditMarker(storage, { notebookId: config.notebookId, principal });
+      } catch (error) {
+        console.warn("[notebook-cloud] failed to clear pending local edit marker", error);
+      }
+    };
+    const armRestoredPendingLocalEditMarker = (
+      liveRuntime: CloudSyncRuntime,
+      principal: string,
+    ) => {
+      const storage = cloudPendingLocalEditMarkerStorage();
+      if (!storage) return;
+      let hasPendingMarker = false;
+      try {
+        hasPendingMarker = readPendingLocalEditMarker(storage, {
+          notebookId: config.notebookId,
+          principal,
+          seedMeta: liveRuntime.persistenceSeedMeta,
+        });
+      } catch (error) {
+        console.warn("[notebook-cloud] failed to read pending local edit marker", error);
+      }
+      if (!hasPendingMarker) return;
+      offlineMergeTracker.notePersistedPendingLocalWork();
+      // The transport may already have reached "online" before the runtime
+      // promise resolved; replay the snapshot so the restored marker settles.
+      offlineMergeTracker.noteConnectionStatus(connectionStatusBridge.getCurrent());
+    };
     // Consume the poison-pill marker: after a seeded session's changes were
     // rejected by the room, the next attempt bootstraps even though the
     // adapter is healthy (the record was cleared, but don't race the clear).
@@ -840,7 +944,7 @@ export function useCloudViewerSession({
         ranConnectionDiagnostics = true;
         void diagnoseCloudConnectionAccess({
           accessRequestsEndpoint: config.accessRequestsEndpoint,
-          authState: authStateRef.current,
+          authState: auth.authSnapshot,
           hasAppSession: hasAppSessionRef.current,
         })
           .then((diagnostic) => {
@@ -992,7 +1096,7 @@ export function useCloudViewerSession({
       if (disposed || sequence !== materializeSequence) return;
 
       if (changeset?.removed.length) {
-        cleanupCloudProjectionForRemovedCells(changeset.removed);
+        cleanupNotebookProjectionForRemovedCells(changeset.removed);
       }
       applyExecutionViewChangeset(liveRuntime.handle.project_execution_view_changeset?.());
 
@@ -1045,7 +1149,7 @@ export function useCloudViewerSession({
       // null (no derivable principal) skips the paint. Shared with the
       // storage bindings, which use it to pick the matching principal's
       // chunk sub-range.
-      const instantPaintMatcher = cloudInstantPaintPrincipalMatcher(authStateRef.current, {
+      const instantPaintMatcher = cloudInstantPaintPrincipalMatcher(auth.authSnapshot, {
         hasAppSession: hasAppSessionRef.current,
       });
       await runCloudInstantPaint({
@@ -1134,9 +1238,9 @@ export function useCloudViewerSession({
     // when the painted cells belong to a different notebook (or nothing
     // usable is painted); a same-notebook re-run's paint survives untouched
     // and is replaced wholesale by this run's materialization.
-    const preservedAcrossRuns = resetCloudProjectionUnlessPreserved({
-      paintedNotebookIdentity: paintedNotebookIdentityRef.current,
-      nextNotebookIdentity: `id:${config.notebookId}`,
+    const preservedAcrossRuns = resetNotebookProjectionUnlessPreserved({
+      previousIdentity: paintedNotebookIdentityRef.current,
+      nextIdentity: `id:${config.notebookId}`,
     });
     if (!preservedAcrossRuns) {
       paintedNotebookIdentityRef.current = null;
@@ -1162,7 +1266,7 @@ export function useCloudViewerSession({
         resolveAuth: (attemptSessionId) =>
           resolveSyncAuth
             ? resolveSyncAuth(attemptSessionId)
-            : cloudSyncAuthFromPrototypeAuthState(authStateRef.current),
+            : cloudSyncAuthFromPrototypeAuthState(auth.authSnapshot),
       }),
       runtimedWasmModulePath: config.runtimedWasmModulePath,
       runtimedWasmPath: config.runtimedWasmPath,
@@ -1254,12 +1358,12 @@ export function useCloudViewerSession({
                 disposeCurrentRuntime,
                 persistenceSeed.clear,
               );
-            } else if (!liveRuntime) {
+            } else if (!liveRuntime && message.frame_type === FrameType.AUTOMERGE_SYNC) {
               // A rejection before the runtime resolved means the in-flight
-              // bootstrap flush was refused. We cannot tell from here
-              // whether that attempt was seeded, so bootstrap the next one
-              // either way — a non-seeded attempt bootstraps identically,
-              // and a healthy record is re-persisted after convergence.
+              // NotebookDoc bootstrap flush was refused. We cannot tell from
+              // here whether that attempt was seeded, so bootstrap the next one
+              // either way. RuntimeStateDoc/CommsDoc rejections do not
+              // incriminate the persisted NotebookDoc seed.
               skipSeedOnceRef.current = true;
             }
             scheduleReconnect(reason);
@@ -1276,6 +1380,11 @@ export function useCloudViewerSession({
         }
         liveRuntimeRef.current = liveRuntime;
         installCloudWidgetCommWriter(liveRuntime);
+        const runtimePrincipal = cloudPrincipalFromActorLabel(liveRuntime.actorLabel);
+        const offlineMergeEligible = !isAnonymousCloudPrincipal(runtimePrincipal);
+        // Anonymous sessions are out of scope for offline-merge surfacing
+        // (per-connection principals; persistence never arms for them).
+        offlineMergeTracker.noteSessionEligibility(offlineMergeEligible);
         armPersistence(liveRuntime);
         armTabBridge(liveRuntime);
         // Arm convergence verification for the INITIAL bootstrap exchange.
@@ -1286,11 +1395,6 @@ export function useCloudViewerSession({
         // or surface — and the cold load is the most common connection
         // event.
         syncHeal.noteResyncKicked(NOTEBOOK_DOC_HEAL_KEY);
-        // Anonymous sessions are out of scope for offline-merge surfacing
-        // (per-connection principals; persistence never arms for them).
-        offlineMergeTracker.noteSessionEligibility(
-          !isAnonymousCloudPrincipal(cloudPrincipalFromActorLabel(liveRuntime.actorLabel)),
-        );
         const stopWidgetLiveRuntimeDiagnostics =
           installCloudWidgetLiveRuntimeDiagnostics(liveRuntime);
         setConnectionScope(liveRuntime.connectionScope);
@@ -1407,12 +1511,18 @@ export function useCloudViewerSession({
           liveRuntime.engine.notebookDocChanged$.subscribe(() => {
             offlineMergeTracker.noteLocalDocActivity();
           }),
+          liveRuntime.engine.notebookDocFlushDelivered$.subscribe(() => {
+            clearPendingLocalEditMarkerForRuntime(liveRuntime);
+          }),
           liveRuntime.engine.cellChanges$.subscribe((changeset) => {
             offlineMergeTracker.noteRemoteCellChanges(changeset);
           }),
           { unsubscribe: () => stopCursorDispatch() },
           { unsubscribe: stopWidgetLiveRuntimeDiagnostics },
         ];
+        if (offlineMergeEligible) {
+          armRestoredPendingLocalEditMarker(liveRuntime, runtimePrincipal);
+        }
         liveRuntime.engine.reProjectComms();
         materializeLiveCellsSafely(liveRuntime);
       })
@@ -1437,7 +1547,7 @@ export function useCloudViewerSession({
         if (cloudConnectionErrorAcceptsAccessDiagnostic(message)) {
           void diagnoseCloudConnectionAccess({
             accessRequestsEndpoint: config.accessRequestsEndpoint,
-            authState: authStateRef.current,
+            authState: auth.authSnapshot,
             hasAppSession: hasAppSessionRef.current,
           })
             .then((diagnostic) => {
@@ -1518,9 +1628,9 @@ export function useCloudViewerSession({
       // with visible cells ⇒ preserve"; REAL notebook switches are cleared
       // by the next run's body gate, and true unmount clears via the
       // mount-scoped effect above.
-      resetCloudProjectionUnlessPreserved({
-        paintedNotebookIdentity: paintedNotebookIdentityRef.current,
-        nextNotebookIdentity: `id:${config.notebookId}`,
+      resetNotebookProjectionUnlessPreserved({
+        previousIdentity: paintedNotebookIdentityRef.current,
+        nextIdentity: `id:${config.notebookId}`,
       });
       resetPoolState();
       livePresenceStore = null;
@@ -1529,6 +1639,7 @@ export function useCloudViewerSession({
       setConnectionPeerLabel(null);
     };
   }, [
+    auth,
     blobResolver,
     config.accessRequestsEndpoint,
     config.blobBasePath,
@@ -1735,6 +1846,14 @@ function summarizeWidgetStateDiagnostic(state: unknown): unknown {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function cloudPendingLocalEditMarkerStorage(): Storage | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
 }
 
 function isConfiguredBlobUrl(value: string, blobBasePath: string): boolean {

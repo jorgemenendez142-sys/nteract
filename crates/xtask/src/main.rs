@@ -215,8 +215,7 @@ Other:
                              renderer plugin so it re-embeds fresh wasm-bindgen glue.
   wasm runtimed              Rebuild only runtimed-wasm
   wasm sift                  Rebuild only sift-wasm (bindings for @nteract/sift);
-                             also copies the binary to crates/runt-mcp/assets/plugins/
-                             and rebuilds the sift renderer plugin.
+                             also rebuilds the sift renderer plugin.
   wasm --skip-renderer-plugins
                              Skip the chained renderer-plugins rebuild (escape hatch
                              for intentionally testing drift between the two).
@@ -225,11 +224,11 @@ Other:
   artifacts verify [scopes]  Strictly verify generated artifacts; exits non-zero
                              when anything is missing, stale, or lacks fingerprints.
                              Scopes: runtime, sift, renderer, mcp-widget, all.
-  renderer-plugins           Rebuild pre-built renderer plugins (notebook + MCP)
+  renderer-plugins           Rebuild pre-built renderer plugins
   renderer-plugins --only sift
                              Rebuild one renderer plugin target. Valid targets:
-                             isolated-renderer, core, markdown, plotly, vega,
-                             leaflet, sift.
+                             isolated-renderer, core, markdown, plotly, bokeh,
+                             panel, vega, leaflet, sift.
   verify-plugins             Check renderer plugin bundles match their wasm artifacts
                              (every wasm-bindgen import in the plugin JS must be
                              exported by the paired wasm binary). Catches #2048-style
@@ -391,12 +390,248 @@ fn require_cargo_subcommand(name: &str, install_hint: &str) {
     }
 }
 
-const PNPM_INSTALL: &str = "brew install pnpm  (or: npm install -g pnpm)";
+const PNPM_INSTALL: &str = "corepack enable  (or install the pnpm version pinned in package.json)";
 const TAURI_INSTALL: &str = "cargo install tauri-cli";
 const WASM_PACK_INSTALL: &str = "cargo install wasm-pack --version 0.15.0 --locked";
 
-fn require_pnpm() {
-    require_tool(pnpm_bin(), PNPM_INSTALL);
+fn require_pnpm() -> PnpmCommand {
+    let pnpm = resolve_pnpm_command_or_exit();
+    println!("Using pnpm {} via {}", pnpm.version, pnpm.display_name());
+    pnpm
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PnpmSource {
+    Corepack,
+    Direct,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PnpmCommand {
+    source: PnpmSource,
+    version: String,
+}
+
+impl PnpmCommand {
+    fn command(&self) -> Command {
+        let mut command = Command::new(self.program());
+        command.args(self.prefix_args());
+        if self.source == PnpmSource::Corepack {
+            command.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+        }
+        command
+    }
+
+    fn program(&self) -> &'static str {
+        match self.source {
+            PnpmSource::Corepack => corepack_bin(),
+            PnpmSource::Direct => pnpm_bin(),
+        }
+    }
+
+    fn prefix_args(&self) -> &'static [&'static str] {
+        match self.source {
+            PnpmSource::Corepack => &["pnpm"],
+            PnpmSource::Direct => &[],
+        }
+    }
+
+    fn display_name(&self) -> &'static str {
+        match self.source {
+            PnpmSource::Corepack => "corepack pnpm",
+            PnpmSource::Direct => "pnpm",
+        }
+    }
+
+    fn display_with_args(&self, args: &[&str]) -> String {
+        let mut parts = Vec::with_capacity(1 + args.len());
+        parts.push(self.display_name().to_string());
+        parts.extend(args.iter().map(|arg| (*arg).to_string()));
+        parts.join(" ")
+    }
+}
+
+fn resolve_pnpm_command_or_exit() -> PnpmCommand {
+    let expected = expected_pnpm_version_or_exit();
+    let root = workspace_root_or_exit();
+
+    let corepack_version = probe_pnpm_version(corepack_bin(), &["pnpm"], &root);
+    if version_matches(&corepack_version, &expected) {
+        return PnpmCommand {
+            source: PnpmSource::Corepack,
+            version: expected,
+        };
+    }
+
+    let direct_version = probe_pnpm_version(pnpm_bin(), &[], &root);
+
+    match choose_pnpm_source(&expected, &corepack_version, &direct_version) {
+        Some(PnpmSource::Corepack) => PnpmCommand {
+            source: PnpmSource::Corepack,
+            version: expected,
+        },
+        Some(PnpmSource::Direct) => PnpmCommand {
+            source: PnpmSource::Direct,
+            version: expected,
+        },
+        None => {
+            eprintln!(
+                "Error: package.json pins `pnpm@{expected}`, but xtask could not resolve that pnpm version."
+            );
+            eprintln!(
+                "  corepack pnpm --version: {}",
+                describe_pnpm_probe(&corepack_version)
+            );
+            eprintln!(
+                "  {} --version: {}",
+                pnpm_bin(),
+                describe_pnpm_probe(&direct_version)
+            );
+            eprintln!();
+            eprintln!("  Install:  {PNPM_INSTALL}");
+            eprintln!("  Or put a pnpm {expected} shim before other pnpm binaries in PATH.");
+            eprintln!();
+            eprintln!(
+                "Refusing to run a mismatched ambient pnpm because it may reinstall node_modules."
+            );
+            exit(1);
+        }
+    }
+}
+
+fn choose_pnpm_source(
+    expected: &str,
+    corepack_version: &Result<String, String>,
+    direct_version: &Result<String, String>,
+) -> Option<PnpmSource> {
+    if version_matches(corepack_version, expected) {
+        Some(PnpmSource::Corepack)
+    } else if version_matches(direct_version, expected) {
+        Some(PnpmSource::Direct)
+    } else {
+        None
+    }
+}
+
+fn version_matches(version: &Result<String, String>, expected: &str) -> bool {
+    matches!(version, Ok(actual) if actual == expected)
+}
+
+fn expected_pnpm_version_or_exit() -> String {
+    expected_pnpm_version().unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        exit(1);
+    })
+}
+
+fn expected_pnpm_version() -> Result<String, String> {
+    let root = workspace_root_or_exit();
+    let package_json = root.join("package.json");
+    let contents = fs::read_to_string(&package_json)
+        .map_err(|error| format!("failed to read {}: {error}", package_json.display()))?;
+    let manifest: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|error| format!("failed to parse {}: {error}", package_json.display()))?;
+    let package_manager = manifest
+        .get("packageManager")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{} is missing `packageManager`", package_json.display()))?;
+
+    parse_pnpm_package_manager_version(package_manager).map(str::to_string)
+}
+
+fn parse_pnpm_package_manager_version(package_manager: &str) -> Result<&str, String> {
+    let version = package_manager.strip_prefix("pnpm@").ok_or_else(|| {
+        format!("`packageManager` must be a pnpm spec like `pnpm@11.9.0`, got `{package_manager}`")
+    })?;
+    let version = version.split('+').next().unwrap_or(version);
+    if version.is_empty() {
+        Err("`packageManager` must include a pnpm version".to_string())
+    } else {
+        Ok(version)
+    }
+}
+
+fn probe_pnpm_version(program: &str, prefix_args: &[&str], root: &Path) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command
+        .args(prefix_args)
+        .arg("--version")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to start: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "exited with status {}{}",
+            output.status,
+            command_output_summary(&output.stdout, &output.stderr)
+        ));
+    }
+
+    last_non_empty_line(&output.stdout)
+        .or_else(|| last_non_empty_line(&output.stderr))
+        .ok_or_else(|| "succeeded but printed no version".to_string())
+}
+
+fn last_non_empty_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+fn command_output_summary(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut lines = Vec::new();
+    if let Some(line) = last_non_empty_line(stdout) {
+        lines.push(line);
+    }
+    if let Some(line) = last_non_empty_line(stderr) {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", lines.join("; "))
+    }
+}
+
+fn describe_pnpm_probe(result: &Result<String, String>) -> String {
+    match result {
+        Ok(version) => format!("reported pnpm {version}"),
+        Err(error) => error.clone(),
+    }
+}
+
+fn run_pnpm(args: &[&str]) {
+    let pnpm = resolve_pnpm_command_or_exit();
+    let mut command = pnpm.command();
+    command.args(args);
+
+    let status = command.status().unwrap_or_else(|error| {
+        eprintln!("Failed to run {}: {error}", pnpm.display_name());
+        exit(1);
+    });
+
+    if !status.success() {
+        eprintln!("Command failed: {}", pnpm.display_with_args(args));
+        exit(status.code().unwrap_or(1));
+    }
+}
+
+fn run_pnpm_ok(args: &[&str]) -> bool {
+    let pnpm = resolve_pnpm_command_or_exit();
+    let mut command = pnpm.command();
+    command.args(args);
+
+    command.status().map(|s| s.success()).unwrap_or_else(|e| {
+        eprintln!("Failed to run {}: {e}", pnpm.display_name());
+        false
+    })
 }
 
 /// Name to invoke pnpm under for `Command::new`.
@@ -412,6 +647,18 @@ fn pnpm_bin() -> &'static str {
         "pnpm.cmd"
     } else {
         "pnpm"
+    }
+}
+
+/// Name to invoke Corepack under for `Command::new`.
+///
+/// Corepack is also installed as a `.cmd` shim on Windows, so use the same
+/// explicit extension pattern as pnpm to avoid relying on PATHEXT expansion.
+fn corepack_bin() -> &'static str {
+    if cfg!(windows) {
+        "corepack.cmd"
+    } else {
+        "corepack"
     }
 }
 
@@ -587,7 +834,7 @@ fn run_notebook_dev_app(notebook: Option<&str>, attach: bool, force_dev_mode: bo
 }
 
 fn cmd_vite() {
-    require_pnpm();
+    let pnpm = require_pnpm();
 
     println!("Starting Vite dev server...");
     println!("This server will keep running independently of Tauri.");
@@ -599,24 +846,26 @@ fn cmd_vite() {
         println!("Using RUNTIMED_VITE_PORT={port}");
     }
 
-    let mut command = Command::new("pnpm");
-    command.args(["--filter", "notebook-ui", "dev"]);
+    let args = ["--filter", "notebook-ui", "dev"];
+    let mut command = pnpm.command();
+    command.args(args);
     apply_worktree_env(&mut command, true);
     if let Some(ref port) = vite_port {
         command.env("RUNTIMED_VITE_PORT", port);
     }
 
     let status = command.status().unwrap_or_else(|e| {
-        eprintln!("Failed to run pnpm dev: {e}");
+        eprintln!("Failed to run {}: {e}", pnpm.display_with_args(&args));
         exit(1);
     });
-    exit_on_failed_status("pnpm dev", status);
+    let label = pnpm.display_with_args(&args);
+    exit_on_failed_status(&label, status);
 }
 
 fn ensure_pnpm_install() {
     if let Some(reason) = pnpm_install_reason() {
         println!("Running pnpm install ({reason})...");
-        run_cmd("pnpm", &["install"]);
+        run_pnpm(&["install"]);
     } else {
         println!("Skipping pnpm install (node_modules is up to date).");
     }
@@ -1169,8 +1418,10 @@ fn run_e2e_session(
     }
 
     // Run pnpm test:e2e
-    let mut test_cmd = Command::new("pnpm");
-    test_cmd.args(["test:e2e"]).env("WEBDRIVER_PORT", "4445");
+    let pnpm = resolve_pnpm_command_or_exit();
+    let args = ["test:e2e"];
+    let mut test_cmd = pnpm.command();
+    test_cmd.args(args).env("WEBDRIVER_PORT", "4445");
     if let Some(spec) = spec_path {
         test_cmd.env("E2E_SPEC", spec);
     }
@@ -1187,7 +1438,7 @@ fn run_e2e_session(
             }
         }
         Err(e) => {
-            eprintln!("Failed to run pnpm test:e2e: {e}");
+            eprintln!("Failed to run {}: {e}", pnpm.display_with_args(&args));
             1
         }
     };
@@ -1733,7 +1984,9 @@ fn parse_renderer_plugin_targets(args: &[String]) -> Vec<String> {
         if arg == "--help" || arg == "-h" {
             eprintln!("Usage: cargo xtask renderer-plugins [--only <target>[,<target>...]]");
             eprintln!();
-            eprintln!("Targets: isolated-renderer, core, markdown, plotly, vega, leaflet, sift");
+            eprintln!(
+                "Targets: isolated-renderer, core, markdown, plotly, bokeh, panel, vega, leaflet, sift"
+            );
             exit(0);
         }
         if arg == "--only" {
@@ -1882,6 +2135,10 @@ const GENESIS_SEEDS_IN_WASM: &[(&str, &str)] = &[
     (
         "comms-doc genesis",
         "crates/runtime-doc/assets/comms_doc_genesis_v1.am",
+    ),
+    (
+        "comments-doc genesis",
+        "crates/comments-doc/assets/comments_doc_genesis_v1.am",
     ),
 ];
 
@@ -2595,19 +2852,21 @@ fn cmd_mcp_inspector() {
     println!();
 
     let config_str = config_path.to_string_lossy().to_string();
-    let mut command = Command::new("pnpm");
-    command.args([
+    let pnpm = resolve_pnpm_command_or_exit();
+    let args = [
         "exec",
         "inspector",
         "--config",
         &config_str,
         "--server",
         "nteract",
-    ]);
+    ];
+    let mut command = pnpm.command();
+    command.args(args);
     apply_worktree_env(&mut command, true);
 
     let status = command.status().unwrap_or_else(|e| {
-        eprintln!("Failed to run inspector: {e}");
+        eprintln!("Failed to run {}: {e}", pnpm.display_with_args(&args));
         eprintln!("Ensure @mcpjam/inspector is in devDependencies and run `pnpm install`.");
         exit(1);
     });
@@ -2648,10 +2907,7 @@ fn cmd_pi(pi_args: &[String]) {
     }
 
     println!("Building @runtimed/node debug binding...");
-    run_cmd(
-        pnpm_bin(),
-        &["--dir", "packages/runtimed-node", "build:debug"],
-    );
+    run_pnpm(&["--dir", "packages/runtimed-node", "build:debug"]);
 
     if !dev_daemon_running() {
         eprintln!("Error: no dev daemon detected for this worktree.");
@@ -3050,12 +3306,18 @@ fn cmd_lint(fix: bool) {
     }
     println!();
 
+    println!("=== Raw control bytes ===");
+    if !check_raw_control_bytes() {
+        failed = true;
+    }
+    println!();
+
     // JavaScript/TypeScript with Vite Plus
     println!("=== JavaScript/TypeScript (vp check) ===");
     let vp_ok = if fix {
-        run_cmd_ok(pnpm_bin(), &["exec", "vp", "check", "--fix"])
+        run_pnpm_ok(&["exec", "vp", "check", "--fix"])
     } else {
-        run_cmd_ok(pnpm_bin(), &["exec", "vp", "check"])
+        run_pnpm_ok(&["exec", "vp", "check"])
     };
     if !vp_ok {
         failed = true;
@@ -3120,6 +3382,193 @@ fn cmd_lint(fix: bool) {
     }
 
     println!("All checks passed!");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawControlByte {
+    byte: u8,
+    offset: usize,
+    line: usize,
+    column: usize,
+}
+
+fn first_raw_control_byte(bytes: &[u8]) -> Option<RawControlByte> {
+    let mut line = 1usize;
+    let mut column = 1usize;
+
+    for (offset, &byte) in bytes.iter().enumerate() {
+        if byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r') {
+            return Some(RawControlByte {
+                byte,
+                offset,
+                line,
+                column,
+            });
+        }
+
+        if byte == b'\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+
+    None
+}
+
+fn normalized_repo_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn is_known_generated_text_bundle(path: &Path) -> bool {
+    let path = normalized_repo_path(path);
+    path.starts_with("apps/notebook/src/renderer-plugins/")
+        || path.starts_with("apps/elements/public/wasm/")
+}
+
+fn should_scan_for_raw_control_bytes(path: &Path) -> bool {
+    if is_known_generated_text_bundle(path) {
+        return false;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if matches!(
+        file_name,
+        ".env"
+            | ".env.example"
+            | ".gitattributes"
+            | ".gitignore"
+            | ".npmrc"
+            | ".yarnrc"
+            | "AGENTS.md"
+            | "Cargo.lock"
+            | "Dockerfile"
+            | "README.md"
+            | "package.json"
+            | "pnpm-lock.yaml"
+            | "pyproject.toml"
+    ) {
+        return true;
+    }
+
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some(
+            "bash"
+                | "cfg"
+                | "cjs"
+                | "css"
+                | "env"
+                | "fish"
+                | "html"
+                | "ini"
+                | "js"
+                | "json"
+                | "jsonl"
+                | "jsx"
+                | "lock"
+                | "md"
+                | "mdx"
+                | "mjs"
+                | "py"
+                | "rs"
+                | "sh"
+                | "sql"
+                | "toml"
+                | "ts"
+                | "tsx"
+                | "txt"
+                | "yaml"
+                | "yml"
+                | "zsh"
+        )
+    )
+}
+
+fn tracked_files() -> Result<Vec<PathBuf>, String> {
+    let output = Command::new("git")
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|error| format!("failed to run git ls-files: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!("git ls-files failed with status {}", output.status));
+    }
+
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
+        .collect())
+}
+
+fn check_raw_control_bytes() -> bool {
+    let files = match tracked_files() {
+        Ok(files) => files,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
+
+    let mut violations = Vec::new();
+    let mut read_errors = Vec::new();
+
+    for path in files {
+        if !should_scan_for_raw_control_bytes(&path) {
+            continue;
+        }
+
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                read_errors.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+        };
+
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+
+        match fs::read(&path) {
+            Ok(bytes) => {
+                if let Some(control) = first_raw_control_byte(&bytes) {
+                    violations.push((path, control));
+                }
+            }
+            Err(error) => read_errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+
+    if read_errors.is_empty() && violations.is_empty() {
+        println!("No raw control bytes found in tracked source text.");
+        return true;
+    }
+
+    for error in read_errors {
+        eprintln!("Failed to read tracked source text file: {error}");
+    }
+
+    for (path, control) in violations {
+        eprintln!(
+            "{}:{}:{}: raw control byte 0x{:02X}; use the \\u escape instead of a literal control character",
+            path.display(),
+            control.line,
+            control.column,
+            control.byte
+        );
+    }
+
+    false
 }
 
 fn cmd_clippy() {
@@ -3313,7 +3762,7 @@ fn run_wasm_pack(needs_c_toolchain: bool, cmd: &str, args: &[&str]) {
 ///
 /// - **Renderer plugin bundles** split into stable LFS-tracked third-party
 ///   outputs (`plotly.js`, `vega.js`, `leaflet.*`) and generated local outputs
-///   (`isolated-renderer.*`, `markdown.*`, `sift.*`). We rebuild generated
+///   (`isolated-renderer.*`, `markdown.*`, `bokeh.js`, `panel.js`, `sift.*`). We rebuild generated
 ///   outputs when they're missing or pointer-shaped, and rebuild sift when it
 ///   is stale relative to sift-wasm source.
 ///
@@ -3337,6 +3786,8 @@ fn ensure_renderer_artifacts_current(sift_wasm_rebuilt: bool) {
         "isolated-renderer.css",
         "markdown.js",
         "markdown.css",
+        "bokeh.js",
+        "panel.js",
     ];
     let missing_lfs_tracked: Vec<&str> = lfs_tracked_probes
         .iter()
@@ -3428,6 +3879,12 @@ fn ensure_renderer_artifacts_current(sift_wasm_rebuilt: bool) {
             {
                 targets.push("markdown");
             }
+            if generated_needs_rebuild.contains(&"bokeh.js") {
+                targets.push("bokeh");
+            }
+            if generated_needs_rebuild.contains(&"panel.js") {
+                targets.push("panel");
+            }
             if sift_missing || sift_source_changed || sift_wasm_rebuilt {
                 targets.push("sift");
             }
@@ -3456,6 +3913,9 @@ const RUNTIMED_WASM_INPUTS: &[&str] = &[
     "crates/automerge-recovery/src",
     "crates/automunge/Cargo.toml",
     "crates/automunge/src",
+    "crates/comments-doc/Cargo.toml",
+    "crates/comments-doc/assets",
+    "crates/comments-doc/src",
     "crates/notebook-doc/Cargo.toml",
     "crates/notebook-doc/assets",
     "crates/notebook-doc/src",
@@ -3510,6 +3970,8 @@ const GENERATED_RENDERER_PLUGIN_OUTPUTS: &[&str] = &[
     "apps/notebook/src/renderer-plugins/isolated-renderer.css",
     "apps/notebook/src/renderer-plugins/markdown.js",
     "apps/notebook/src/renderer-plugins/markdown.css",
+    "apps/notebook/src/renderer-plugins/bokeh.js",
+    "apps/notebook/src/renderer-plugins/panel.js",
     "apps/notebook/src/renderer-plugins/sift.js",
     "apps/notebook/src/renderer-plugins/sift.css",
 ];
@@ -3519,6 +3981,8 @@ const RENDERER_PLUGIN_OUTPUTS: &[&str] = &[
     "apps/notebook/src/renderer-plugins/isolated-renderer.css",
     "apps/notebook/src/renderer-plugins/markdown.js",
     "apps/notebook/src/renderer-plugins/markdown.css",
+    "apps/notebook/src/renderer-plugins/bokeh.js",
+    "apps/notebook/src/renderer-plugins/panel.js",
     "apps/notebook/src/renderer-plugins/plotly.js",
     "apps/notebook/src/renderer-plugins/vega.js",
     "apps/notebook/src/renderer-plugins/leaflet.js",
@@ -4112,6 +4576,8 @@ fn mcp_widget_needs_rebuild() -> Option<&'static str> {
         Path::new("src/build/renderer-plugin-builder.ts"),
         Path::new("apps/notebook/src/renderer-plugins/markdown.js"),
         Path::new("apps/notebook/src/renderer-plugins/markdown.css"),
+        Path::new("apps/notebook/src/renderer-plugins/bokeh.js"),
+        Path::new("apps/notebook/src/renderer-plugins/panel.js"),
         Path::new("apps/notebook/src/renderer-plugins/plotly.js"),
         Path::new("apps/notebook/src/renderer-plugins/vega.js"),
         Path::new("apps/notebook/src/renderer-plugins/leaflet.js"),
@@ -4170,7 +4636,7 @@ fn build_mcp_widget() {
         println!("Building MCP Apps widget ({reason})...");
         require_pnpm();
         ensure_pnpm_install();
-        run_cmd(pnpm_bin(), &["exec", "vp", "run", "nteract-mcp-app#build"]);
+        run_pnpm(&["exec", "vp", "run", "nteract-mcp-app#build"]);
         let dest = Path::new("python/nteract/src/nteract/_widget.html");
         if !dest.exists() {
             eprintln!("Error: MCP widget build did not produce _widget.html");
@@ -4184,19 +4650,21 @@ fn build_mcp_widget() {
 
 fn run_frontend_build(debug_bundle: bool) {
     ensure_build_artifacts();
-    let mut command = Command::new("pnpm");
-    command.arg("build");
+    let pnpm = resolve_pnpm_command_or_exit();
+    let args = ["build"];
+    let mut command = pnpm.command();
+    command.args(args);
     if debug_bundle {
         command.env("RUNT_NOTEBOOK_DEBUG_BUILD", "1");
     }
 
     let status = command.status().unwrap_or_else(|e| {
-        eprintln!("Failed to run pnpm build: {e}");
+        eprintln!("Failed to run {}: {e}", pnpm.display_with_args(&args));
         exit(1);
     });
 
     if !status.success() {
-        eprintln!("Command failed: pnpm build");
+        eprintln!("Command failed: {}", pnpm.display_with_args(&args));
         exit(status.code().unwrap_or(1));
     }
 }
@@ -4865,6 +5333,101 @@ mod tests {
                 skip_build: true,
             }
         );
+    }
+
+    #[test]
+    fn parse_pnpm_package_manager_version_accepts_pnpm_specs() {
+        assert_eq!(
+            parse_pnpm_package_manager_version("pnpm@11.9.0").unwrap(),
+            "11.9.0"
+        );
+        assert_eq!(
+            parse_pnpm_package_manager_version("pnpm@11.9.0+sha512.test").unwrap(),
+            "11.9.0"
+        );
+    }
+
+    #[test]
+    fn parse_pnpm_package_manager_version_rejects_non_pnpm_specs() {
+        assert!(parse_pnpm_package_manager_version("npm@11.0.0").is_err());
+        assert!(parse_pnpm_package_manager_version("pnpm@").is_err());
+    }
+
+    #[test]
+    fn choose_pnpm_source_prefers_matching_corepack_over_wrong_direct_pnpm() {
+        let corepack = Ok("11.9.0".to_string());
+        let direct = Ok("11.7.0".to_string());
+
+        assert_eq!(
+            choose_pnpm_source("11.9.0", &corepack, &direct),
+            Some(PnpmSource::Corepack)
+        );
+    }
+
+    #[test]
+    fn choose_pnpm_source_accepts_direct_pnpm_only_when_it_matches_pin() {
+        let corepack = Err("failed to start: corepack not found".to_string());
+        let direct = Ok("11.9.0".to_string());
+
+        assert_eq!(
+            choose_pnpm_source("11.9.0", &corepack, &direct),
+            Some(PnpmSource::Direct)
+        );
+    }
+
+    #[test]
+    fn choose_pnpm_source_rejects_mismatched_versions() {
+        let corepack = Err("failed to start: corepack not found".to_string());
+        let direct = Ok("11.7.0".to_string());
+
+        assert_eq!(choose_pnpm_source("11.9.0", &corepack, &direct), None);
+    }
+
+    #[test]
+    fn last_non_empty_line_uses_final_version_line() {
+        assert_eq!(
+            last_non_empty_line(b"Preparing pnpm...\n11.9.0\n"),
+            Some("11.9.0".to_string())
+        );
+    }
+
+    #[test]
+    fn raw_control_byte_detector_allows_common_whitespace() {
+        assert_eq!(first_raw_control_byte(b"alpha\tbeta\r\ngamma"), None);
+    }
+
+    #[test]
+    fn raw_control_byte_detector_reports_literal_control_bytes() {
+        assert_eq!(
+            first_raw_control_byte(b"alpha\nbe\0ta"),
+            Some(RawControlByte {
+                byte: 0,
+                offset: 8,
+                line: 2,
+                column: 3,
+            })
+        );
+        assert_eq!(
+            first_raw_control_byte(b"alpha\x1fbeta").map(|control| control.byte),
+            Some(0x1f)
+        );
+    }
+
+    #[test]
+    fn raw_control_byte_path_filter_scans_source_not_generated_bundles() {
+        assert!(should_scan_for_raw_control_bytes(Path::new(
+            "apps/notebook/src/App.tsx"
+        )));
+        assert!(should_scan_for_raw_control_bytes(Path::new(
+            ".github/workflows/build.yml"
+        )));
+        assert!(should_scan_for_raw_control_bytes(Path::new("Cargo.lock")));
+        assert!(!should_scan_for_raw_control_bytes(Path::new(
+            "crates/comments-doc/assets/comments_doc_genesis_v1.am"
+        )));
+        assert!(!should_scan_for_raw_control_bytes(Path::new(
+            "apps/notebook/src/renderer-plugins/plotly.js"
+        )));
     }
 
     #[test]

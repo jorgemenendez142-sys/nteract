@@ -14,12 +14,12 @@
 - the Durable Object can accept typed-frame v4 WebSockets, rewrite CBOR
   presence, enforce frame-size caps, and reject obvious read-only violations.
 
-The next phase should turn that prototype into one hosted room model instead of
-two nearby products. A published read-only notebook, an authenticated editor, a
-future runtime peer, and an anonymous public viewer should all connect to the
-same room abstraction with different scopes. The Worker authenticates the
-connection. D1 decides what that principal can do in this room. The Durable
-Object hosts the live document and persists snapshots.
+The materialized Durable Object room host unifies those pieces. A published
+read-only notebook, an authenticated editor, a future runtime peer, and an
+anonymous public viewer all connect to the same room abstraction with different
+scopes. The Worker authenticates the connection. D1 decides what that principal
+can do in this room. The Durable Object hosts the live document and persists
+snapshots.
 
 Neighbors:
 
@@ -158,8 +158,7 @@ validation exists, hosted rooms deny editor uploads entirely. That is the
 shipped policy: `allowsBlobUpload` permits only `runtime_peer` and `owner`,
 enforced at both the `PUT_BLOB` frame prefilter and the HTTP upload route.
 Editor upload and reference-path validation ship together in one change set,
-or not at all. Tracked as `HCA-3` in
-the "Tracked follow-ups" section below.
+or not at all. Tracked as `HCA-3` in the "Open Follow-ups" section below.
 
 The provider gives a maximum capability set for the credential. The ACL gives
 one or more room grants. A connection also has a requested role. Anonymous
@@ -323,7 +322,7 @@ with a collaborator is the baseline expectation for an editable notebook, so the
 editor write surface is not restricted to markdown. Everything else at the
 document root stays owner-authored: notebook metadata (kernelspec, trust,
 environment, path, project) and the document-identity roots `schema_version`,
-`notebook_id`, and `runtime_state_doc_id`.
+`notebook_id`, `runtime_state_doc_id`, and `comms_doc_id`.
 
 UI-only hiding is not an authorization boundary. A malicious browser can send
 arbitrary `NotebookDoc` sync frames, so the room host enforces the editor
@@ -331,8 +330,9 @@ surface server-side with a semantic diff validator: it clone-previews the
 incoming `NotebookDoc` message, diffs it against the heads before the change,
 and accepts it only if every patch lands inside the `cells` map. The policy is
 an allowlist, not a metadata denylist: any other root write — notebook
-metadata, `schema_version`, `notebook_id`, `runtime_state_doc_id`, or a
-root-level replace/delete of the `cells` map itself — is rejected. Owners skip
+metadata, `schema_version`, `notebook_id`, `runtime_state_doc_id`,
+`comms_doc_id`, or a root-level replace/delete of the `cells` map itself — is
+rejected. Owners skip
 the validator (they may write all notebook changes). This is
 `validate_editor_notebook_changes` in `runtimed-wasm`, reached from
 `receive_notebook_sync` whenever `can_write_all_notebook_changes` is false. The
@@ -358,12 +358,14 @@ widening the editor document surface.
 
 The editor `RuntimeStateDoc` write surface is closed by the shared runtime-doc
 policy used by the hosted room host and daemon. Editor and owner scopes write
-mutable widget state through `CommsDoc`; `RuntimeStateDoc` remains runtime-owned
-for lifecycle, execution status, comm topology, and output routing. In a
-multi-user room, an editor sending arbitrary `RuntimeStateDoc` sync changes
-would be privilege escalation into runtime lifecycle, execution status, or
-fabricated outputs, so frames that touch those fields are rejected before the
-real room document mutates.
+mutable widget state through `CommsDoc`; runtime peers may write only
+policy-allowed lifecycle, execution status, comm topology, output routing, and
+output updates for accepted work. Execution intent/provenance plus room-host
+facts stay outside the runtime-peer write surface. In a multi-user room, an
+editor sending arbitrary `RuntimeStateDoc` sync changes would be privilege
+escalation into runtime lifecycle, execution status, or fabricated outputs, so
+frames that touch those fields are rejected before the real room document
+mutates.
 
 Locking the surface down further is a future owner capability, not the baseline:
 an owner-only "freeze structure" or metadata-edit grant can narrow what editors
@@ -376,7 +378,8 @@ bridge, or JupyterHub sidecar. A runtime peer:
 
 - can send `RuntimeStateDoc` sync frames;
 - can upload blobs referenced by runtime output manifests;
-- can emit kernel lifecycle broadcasts;
+- can author kernel lifecycle/progress through policy-validated
+  `RuntimeStateDoc` sync;
 - cannot edit `NotebookDoc`;
 - cannot mutate ACLs or publish revisions unless it also has owner capability.
 
@@ -404,44 +407,6 @@ published demo notebooks only when the room has public-read ACL. Private
 notebooks need viewer-or-better auth, signed URLs, or an output origin that can
 enforce equivalent access.
 
-## Implementation Sequence
-
-1. **ADR and docs.** Land this document, cross-reference it from
-   `identity-and-trust.md` and `hosted-notebook-artifacts.md`.
-2. **ACL schema, lookup, and side-effect removal.** Add `notebook_acl`, a
-   storage helper, and unit tests for principal rows, public-read rows, and
-   missing ACL rejection. This PR must also remove or guard the existing
-   WebSocket `ensureNotebook()` side effect; do not ship an ACL table while
-   `/n/:id/sync` can still mint notebook rows before authorization.
-3. **Auth refactor.** Change Worker auth so dev/OIDC/JupyterHub authenticate a
-   principal and operator first; route handlers call
-   `authorizeNotebookAccess()` to derive final scope.
-4. **Public viewer as ACL.** Seed demo/public notebooks with the public ACL
-   row, and make anonymous render/sync fail without that row.
-5. **Publish/create owner ACL.** Publish/import creates the notebook row and
-   owner ACL row atomically before recording the first revision. Existing
-   notebook creation helpers should be renamed or split so call sites choose
-   between creation, touch/update, and authorization.
-6. **DO snapshot materialization.** Load latest snapshot bundle into
-   `runtimed-wasm` inside the DO and use it as the room state, initially still
-   without kernels.
-7. **Editor RuntimeStateDoc path enforcement.** Done in the shared
-   runtime-doc policy: editor/owner `RuntimeStateDoc` sync is rejected for
-   widget state and other runtime-owned fields. Mutable widget state lives in
-   `CommsDoc`; queue, execution, kernel, environment, output routing, comm
-   topology, and schema/root writes remain runtime-owned.
-8. **Editor cell-editing slice.** Server-side semantic gate
-   (`validate_editor_notebook_changes`) accepts full cell editing (any cell
-   type, source, and structure) from authenticated `editor`/`owner`
-   connections while rejecting notebook-level metadata edits from non-owners.
-9. **Runtime peer ingress.** Allow runtime peers to attach and update
-   `RuntimeStateDoc` plus blobs without notebook edits.
-10. **Direct OIDC and app sessions.** Wire real provider validation after ACL
-   lookup is in place. Browser app APIs and live-room WebSockets follow
-   `hosted-credential-transport.md`: OIDC bootstraps first-party app-session
-   cookies, cookie-backed WebSockets require trusted origins, explicit bearer
-   subprotocols remain available for compatible browser/native flows, and
-   native/system clients may use headers.
 
 ## Prototype-only behavior to remove
 
@@ -472,13 +437,3 @@ enforce equivalent access.
    immediately through a `SESSION_CONTROL` close frame or only take effect on
    the next connection attempt. `identity-and-trust.md` defers general
    revocation, but hosted ACL mutation makes the decision visible earlier.
-
-## Tracked follow-ups (from the retired cleanup punchlist)
-
-These items were migrated from `docs/adr/cleanup-punchlist.md` when it was
-retired (2026-06-10). Severity: **Targeted PR** = one-or-two-file fix ready
-to implement; **Design** = needs a decision in this ADR before code moves.
-
-- **HCA-1** (Targeted PR; `apps/notebook-cloud/src/identity.ts`, `apps/notebook-cloud/test/identity.test.ts`, `docs/runbooks/hosted-direct-oidc-demo-runbook.md`): Mixed hosted credentials are documented as reject-by-default in `hosted-credential-transport.md`, but the current notebook-cloud prototype still needs complete mixed-credential rejection coverage. The direct-OIDC implementation should reject mixed identity-bearing credentials unless a deployment proves they are one credential.
-- **HCA-3** (Targeted PR; `apps/notebook-cloud/src/identity.ts`, `docs/adr/hosted-room-authorization.md`): **Decided** as the staged policy, recorded in `hosted-room-authorization.md` Decision 3: editors cannot upload blobs until server-side reference-path validation lands; the two ship together in one change set. Stage 1 is already enforced uniformly (`identity.ts::allowsBlobUpload` permits only `runtime_peer`/`owner`, checked at both the `PUT_BLOB` frame prefilter and the HTTP upload route). The remaining row is the stage-2 Targeted PR: editor upload plus reference-path validation together.
-- **HCA-4** (Targeted PR; `crates/notebook-doc/src/lib.rs`, `crates/runtime-doc/src/doc.rs`, `docs/adr/identity-and-trust.md`): Live peer validators must reject incoming changes authored by `system`/legacy schema actors. Schema/system actors are tolerated only as trusted seed or import history already present before peer ingress, not as newly received peer-authored deltas.

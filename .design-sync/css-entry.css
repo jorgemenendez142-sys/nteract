@@ -1,0 +1,37 @@
+/* Design-sync compile entry for the nteract Elements component library.
+   Tailwind v4 source file. Compiled to .design-sync/compiled.css (cfg.cssEntry)
+   via cfg.buildCmd. Pulls in the authoritative token set + @theme mapping from
+   notebook-tokens.css, then scans the shipped ui components and the authored
+   previews so every utility class they use lands in the compiled stylesheet.
+   source(none) keeps the output deterministic — only the @source dirs below. */
+@import "tailwindcss" source(none);
+@import "../src/styles/notebook-tokens.css";
+/* ANSI 16-color palette + .ansi-* classes the output renderers apply. The app
+   ships these via the isolated renderer; the DS closure needs them too or every
+   AnsiOutput/AnsiStreamOutput renders colorless. */
+@import "../src/styles/ansi.css";
+/* Comment affordance + highlight visuals. Both are shared surfaces the app
+   ships once and tunes in Elements: the affordance dot/bubble morph and the
+   open/resolved/pending highlight treatments. */
+@import "../src/styles/comment-affordance.css";
+@import "../src/styles/comment-highlight.css";
+/* Dashboard atom vocabulary (composition ticks, runtime dot, language marks) -
+   shared with the cloud dashboard via src/styles/dashboard-atoms.css. */
+@import "../src/styles/dashboard-atoms.css";
+
+@source "../src/components/ui";
+@source "../src/components/cell";
+@source "../src/components/outputs";
+@source "../src/components/comments";
+@source "../src/components/notebook/NotebookCellStrip.tsx";
+@source "../src/components/notebook/NotebookCompositionTicks.tsx";
+@source "../src/components/runtime";
+@source "./previews";
+
+/* Safelist the semantic token vocabulary the conventions header documents, so a
+   design built with these classes renders even though Claude Design ships only
+   the static compiled CSS (no Tailwind recompile). Keep in sync with
+   conventions.md's token table. */
+@source inline("{hover:,}{bg,text}-{background,foreground,card,card-foreground,popover,popover-foreground,primary,primary-foreground,secondary,secondary-foreground,muted,muted-foreground,accent,accent-foreground,destructive,destructive-foreground,uv}");
+@source inline("{border,ring}-{border,input,ring,primary,destructive}");
+@source inline("rounded-{sm,md,lg,xl}");

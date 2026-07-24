@@ -1,26 +1,24 @@
 //! Daemon watch loop driven by `DaemonConnection` events.
 //!
-//! Replaces the old `health.rs` ping-and-backoff loop. `DaemonConnection`
-//! (in `runtimed-client`) already maintains a long-lived supervisor that
-//! caches `DaemonInfo` and emits `Connected`/`Upgraded`/`Disconnected`.
-//! This module consumes that stream and performs the two actions that are
-//! specific to the MCP server:
+//! `DaemonConnection` maintains a long-lived supervisor that caches
+//! `DaemonInfo` and emits `Connected`/`Upgraded`/`Disconnected`. This module
+//! consumes that stream and performs the two actions specific to the MCP server:
 //!
 //! 1. Exit the process on a version change so the proxy respawns us with
 //!    the new binary.
 //! 2. Re-join the active notebook session when the daemon comes back
 //!    (either after a brief disconnect, or after a same-version restart).
 //!
-//! Tool dispatch is no longer gated on a locally-tracked state — under
-//! sustained concurrent load the old loop could stall in `Reconnecting`
-//! while the daemon was actually healthy, short-circuiting every tool
-//! call. See #2000.
+//! Tool dispatch asks the daemon directly instead of gating on a local
+//! connection state. Under sustained concurrent load, local gating can stall in
+//! `Reconnecting` while the daemon is healthy, short-circuiting every tool call.
+//! See #2000.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use runtimed_client::client::PoolClient;
 use runtimed_client::daemon_connection::{DaemonConnection, DaemonEvent};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
@@ -175,6 +173,7 @@ pub async fn watch(
     peer_label: Arc<RwLock<String>>,
     last_session_drop: Arc<RwLock<Option<SessionDropInfo>>>,
     parked_sessions: Arc<RwLock<HashMap<String, NotebookSession>>>,
+    session_intent_epoch: Arc<AtomicU64>,
 ) -> i32 {
     let mut rx = daemon_conn.subscribe();
     let mut initial_target: Option<String> = std::env::var(REJOIN_ENV_VAR).ok();
@@ -193,6 +192,7 @@ pub async fn watch(
     // the next Connected/Upgraded event can rejoin without requiring an
     // initial_target from the proxy.
     let mut disconnect_target: Option<String> = None;
+    let mut observed_intent_epoch = session_intent_epoch.load(Ordering::Acquire);
 
     loop {
         let event = match rx.recv().await {
@@ -214,6 +214,19 @@ pub async fn watch(
                 guard.as_ref().is_some_and(|session| !session.is_hosted()),
             )
         };
+
+        let current_intent_epoch = session_intent_epoch.load(Ordering::Acquire);
+        if current_intent_epoch != observed_intent_epoch {
+            info!(
+                previous_epoch = observed_intent_epoch,
+                current_epoch = current_intent_epoch,
+                "Clearing automatic rejoin state after explicit session intent"
+            );
+            observed_intent_epoch = current_intent_epoch;
+            initial_target = None;
+            disconnect_target = None;
+            was_disconnected = false;
+        }
 
         // Once a tool call (connect_notebook / create_notebook) has
         // established a live session, the proxy's initial handoff target
@@ -262,6 +275,8 @@ pub async fn watch(
                     &peer_label,
                     &last_session_drop,
                     Some(target),
+                    &session_intent_epoch,
+                    observed_intent_epoch,
                 )
                 .await;
                 // Only clear the disconnect flag and consume the initial
@@ -283,6 +298,8 @@ pub async fn watch(
                     &peer_label,
                     &last_session_drop,
                     None,
+                    &session_intent_epoch,
+                    observed_intent_epoch,
                 )
                 .await;
                 if ok {
@@ -297,14 +314,14 @@ pub async fn watch(
                 // to come back. Save the notebook target so we can rejoin
                 // when the daemon reconnects.
                 let old_session = {
-                    let guard = session.read().await;
-                    guard.as_ref().and_then(|s| {
-                        if s.is_hosted() {
-                            None
-                        } else {
-                            Some((s.notebook_id.clone(), s.notebook_path.clone()))
-                        }
-                    })
+                    let mut guard = session.write().await;
+                    if guard.as_ref().is_some_and(NotebookSession::is_hosted) {
+                        None
+                    } else {
+                        guard.take().map(|session| {
+                            (session.notebook_id.clone(), session.notebook_path.clone())
+                        })
+                    }
                 };
                 if let Some((notebook_id, notebook_path)) = old_session {
                     info!(
@@ -321,7 +338,6 @@ pub async fn watch(
                         notebook_path: notebook_path.clone(),
                         rejoin_target: disconnect_target.clone(),
                     });
-                    *session.write().await = None;
                 }
                 // Also clear parked local sessions — their DocHandles are dead
                 // too. Hosted parked sessions do not depend on this daemon.
@@ -362,10 +378,12 @@ fn looks_like_uuid(target: &str) -> bool {
 /// reloads from disk (the UUID-only path would yield an empty document
 /// because file-backed rooms' `.automerge` persist files are deleted).
 ///
-/// For ephemeral notebooks, checks `list_rooms` first to verify the room
-/// still exists in the daemon. If the room was evicted during the
-/// disconnect, the session is cleared immediately without creating a new
-/// peer connection — avoiding the creation of phantom rooms (#2088).
+/// For untitled (UUID-only) notebooks, the rejoin is daemon-authoritative: it
+/// just attempts the reconnect and trusts the daemon, which attaches a resident
+/// or recoverable room (untitled notebooks reload from their persisted doc) and
+/// refuses a gone one. A refusal surfaces as `SyncError::NotebookUnavailable`
+/// and the session is cleared as `Evicted` without retries; the phantom-room
+/// guard (#2088) now lives in the daemon, not a client `list_rooms` heuristic.
 ///
 /// Returns `true` if the rejoin succeeded or the session was explicitly
 /// cleared (room evicted). Returns `false` if retries were exhausted
@@ -377,7 +395,12 @@ async fn rejoin(
     peer_label: &Arc<RwLock<String>>,
     last_session_drop: &Arc<RwLock<Option<SessionDropInfo>>>,
     override_target: Option<String>,
+    session_intent_epoch: &Arc<AtomicU64>,
+    expected_intent_epoch: u64,
 ) -> bool {
+    if session_intent_epoch.load(Ordering::Acquire) != expected_intent_epoch {
+        return true;
+    }
     if let Some(target) = override_target.as_deref() {
         match cloud::parse_connect_target(Some(target), None, None, None) {
             Ok(NotebookTarget::Hosted {
@@ -385,8 +408,16 @@ async fn rejoin(
                 notebook_id,
                 ..
             }) => {
-                return rejoin_hosted(session, peer_label, last_session_drop, domain, notebook_id)
-                    .await;
+                return rejoin_hosted(
+                    session,
+                    peer_label,
+                    last_session_drop,
+                    domain,
+                    notebook_id,
+                    session_intent_epoch,
+                    expected_intent_epoch,
+                )
+                .await;
             }
             Ok(NotebookTarget::LocalPath(_)) | Ok(NotebookTarget::LocalNotebookId(_)) => {}
             Err(e) if target.starts_with("http://") || target.starts_with("https://") => {
@@ -397,7 +428,6 @@ async fn rejoin(
                     notebook_path: None,
                     rejoin_target: Some(target.to_string()),
                 });
-                *session.write().await = None;
                 return false;
             }
             Err(_) => {}
@@ -420,46 +450,19 @@ async fn rejoin(
         }
     };
 
-    // For ephemeral notebooks (no file path), verify the room still exists
-    // in the daemon before attempting to rejoin. This is the explicit signal
-    // that the room was evicted — no heuristics needed. Without this check,
-    // a `connect(uuid)` to an evicted room would create a new empty room,
-    // wasting a kernel and preventing proper eviction (#2088).
-    let has_file = notebook_path
-        .as_ref()
-        .is_some_and(|p| std::path::Path::new(p.as_str()).exists());
-    if !has_file {
-        let client = PoolClient::new(socket_path.to_path_buf());
-        match client.list_rooms().await {
-            Ok(rooms) => {
-                if !rooms.iter().any(|r| r.notebook_id == notebook_id) {
-                    info!(
-                        "Room {notebook_id} no longer exists in daemon; \
-                         clearing session (notebook was evicted)"
-                    );
-                    *last_session_drop.write().await = Some(SessionDropInfo {
-                        reason: SessionDropReason::Evicted,
-                        notebook_id: notebook_id.clone(),
-                        notebook_path: notebook_path.clone(),
-                        rejoin_target: Some(
-                            notebook_path.clone().unwrap_or_else(|| notebook_id.clone()),
-                        ),
-                    });
-                    *session.write().await = None;
-                    return true; // Session cleared intentionally
-                }
-            }
-            Err(e) => {
-                warn!("list_rooms failed during rejoin check: {e}");
-                // Can't verify — fall through to the connect attempt which
-                // will also fail if the daemon is truly unreachable.
-            }
-        }
-    }
-
+    // The daemon is authoritative about whether a notebook still exists.
+    // NotebookSync attach reloads a resident-or-recoverable room and refuses a
+    // gone one. `list_rooms` cannot distinguish an evicted UUID from a dormant
+    // untitled notebook that is recoverable from docs_dir, which is the #2088
+    // case. A refusal is handled in the retry loop below as Evicted with no
+    // retry.
     let label = peer_label.read().await.clone();
 
     for attempt in 0..=REJOIN_MAX_RETRIES {
+        if session_intent_epoch.load(Ordering::Acquire) != expected_intent_epoch {
+            info!("Automatic notebook rejoin cancelled by explicit session intent");
+            return true;
+        }
         let use_path = notebook_path
             .as_ref()
             .filter(|p| std::path::Path::new(p.as_str()).exists());
@@ -474,7 +477,6 @@ async fn rejoin(
             {
                 Ok(r) => {
                     let handle = r.handle;
-                    let broadcast_rx = r.broadcast_rx;
                     if let Err(e) = handle
                         .await_session_ready_timeout(REJOIN_SESSION_READY_TIMEOUT)
                         .await
@@ -482,7 +484,7 @@ async fn rejoin(
                         Err(e)
                     } else {
                         let cell_count = handle.get_cells().len();
-                        Ok((handle, broadcast_rx, cell_count, r.info.notebook_id))
+                        Ok((handle, cell_count, r.info.notebook_id))
                     }
                 }
                 Err(e) => Err(e),
@@ -497,7 +499,6 @@ async fn rejoin(
             {
                 Ok(r) => {
                     let handle = r.handle;
-                    let broadcast_rx = r.broadcast_rx;
                     if let Err(e) = handle
                         .await_session_ready_timeout(REJOIN_SESSION_READY_TIMEOUT)
                         .await
@@ -505,7 +506,7 @@ async fn rejoin(
                         Err(e)
                     } else {
                         let cell_count = handle.get_cells().len();
-                        Ok((handle, broadcast_rx, cell_count, notebook_id.clone()))
+                        Ok((handle, cell_count, notebook_id.clone()))
                     }
                 }
                 Err(e) => Err(e),
@@ -513,40 +514,55 @@ async fn rejoin(
         };
 
         match result {
-            Ok((handle, broadcast_rx, new_cell_count, new_notebook_id)) => {
+            Ok((handle, new_cell_count, new_notebook_id)) => {
                 crate::presence::announce(&handle, &label).await;
 
-                // Guard: only install the rejoined session if no tool call
-                // (connect_notebook / create_notebook) established a
-                // different session while we were awaiting the connection
-                // + initial load. If the session is now Some with a
-                // different notebook_id, the user's explicit choice wins
-                // and we drop the rejoined peer connection.
-                {
-                    let guard = session.read().await;
-                    if let Some(existing) = guard.as_ref() {
-                        if existing.notebook_id != new_notebook_id {
-                            info!(
-                                "Rejoin target {new_notebook_id} superseded by active session {}; \
-                                 dropping rejoined connection",
-                                existing.notebook_id
-                            );
-                            return true;
-                        }
-                    }
+                let new_session =
+                    NotebookSession::local(handle, new_notebook_id, notebook_path.clone());
+                // Hold the publication lock across the check/install. Any
+                // active session is authoritative, even for the same UUID:
+                // an explicit tool activation may carry retained projection
+                // heads/generation that a background rejoin must not erase.
+                let mut guard = session.write().await;
+                if session_intent_epoch.load(Ordering::Acquire) != expected_intent_epoch {
+                    info!("Dropping automatic rejoin superseded by explicit disconnect");
+                    return true;
                 }
-
-                let new_session = NotebookSession::local(
-                    handle,
-                    broadcast_rx,
-                    new_notebook_id,
-                    notebook_path.clone(),
-                );
-                *session.write().await = Some(new_session);
+                if let Some(existing) = guard.as_ref() {
+                    info!(
+                        "Rejoin target {} superseded by active session {}; \
+                         dropping rejoined connection",
+                        new_session.notebook_id, existing.notebook_id
+                    );
+                    return true;
+                }
+                *guard = Some(new_session);
                 info!("Rejoined notebook session ({new_cell_count} cells)");
                 return true;
             }
             Err(e) => {
+                if session_intent_epoch.load(Ordering::Acquire) != expected_intent_epoch {
+                    info!("Automatic notebook rejoin cancelled by explicit session intent");
+                    return true;
+                }
+                // A daemon refusal (the notebook is gone) is definitive - the
+                // handshake completed and the daemon said no. Don't burn retries
+                // on it; clear the session as Evicted with a recovery hint. Only
+                // the refusal is treated this way: transient failures (daemon down
+                // to Io/DaemonUnavailable, streaming-load failure to Protocol)
+                // still retry below.
+                if matches!(e, notebook_sync::SyncError::NotebookUnavailable(_)) {
+                    info!("Rejoin refused by daemon (notebook gone): {e}");
+                    *last_session_drop.write().await = Some(SessionDropInfo {
+                        reason: SessionDropReason::Evicted,
+                        notebook_id: notebook_id.clone(),
+                        notebook_path: notebook_path.clone(),
+                        rejoin_target: Some(
+                            notebook_path.clone().unwrap_or_else(|| notebook_id.clone()),
+                        ),
+                    });
+                    return true;
+                }
                 if attempt < REJOIN_MAX_RETRIES {
                     warn!(
                         "Rejoin attempt {} failed (retrying in {}s): {e}",
@@ -566,7 +582,6 @@ async fn rejoin(
                             notebook_path.clone().unwrap_or_else(|| notebook_id.clone()),
                         ),
                     });
-                    *session.write().await = None;
                 }
             }
         }
@@ -581,6 +596,8 @@ async fn rejoin_hosted(
     last_session_drop: &Arc<RwLock<Option<SessionDropInfo>>>,
     domain: String,
     notebook_id: String,
+    session_intent_epoch: &Arc<AtomicU64>,
+    expected_intent_epoch: u64,
 ) -> bool {
     let target = cloud::hosted_notebook_url(&domain, &notebook_id);
     let registry = match cloud::CloudRegistry::load_default() {
@@ -610,35 +627,42 @@ async fn rejoin_hosted(
     };
 
     for attempt in 0..=REJOIN_MAX_RETRIES {
+        if session_intent_epoch.load(Ordering::Acquire) != expected_intent_epoch {
+            info!("Automatic hosted rejoin cancelled by explicit session intent");
+            return true;
+        }
         match cloud::connect_hosted_notebook(&domain_config, &notebook_id).await {
             Ok(result) => {
                 let label = peer_label.read().await.clone();
                 crate::presence::announce(&result.handle, &label).await;
 
-                {
-                    let guard = session.read().await;
-                    if let Some(existing) = guard.as_ref() {
-                        if existing.session_key() != target {
-                            info!(
-                                "Hosted rejoin target {target} superseded by active session {}; \
-                                 dropping rejoined connection",
-                                existing.session_key()
-                            );
-                            return true;
-                        }
-                    }
-                }
-
-                *session.write().await = Some(NotebookSession::hosted(
+                let new_session = NotebookSession::hosted(
                     result.handle,
-                    result.broadcast_rx,
                     notebook_id.clone(),
                     domain_config.base_url.clone(),
-                ));
+                );
+                let mut guard = session.write().await;
+                if session_intent_epoch.load(Ordering::Acquire) != expected_intent_epoch {
+                    info!("Dropping hosted rejoin superseded by explicit disconnect");
+                    return true;
+                }
+                if let Some(existing) = guard.as_ref() {
+                    info!(
+                        "Hosted rejoin target {target} superseded by active session {}; \
+                         dropping rejoined connection",
+                        existing.session_key()
+                    );
+                    return true;
+                }
+                *guard = Some(new_session);
                 info!("Rejoined hosted notebook session {target}");
                 return true;
             }
             Err(e) => {
+                if session_intent_epoch.load(Ordering::Acquire) != expected_intent_epoch {
+                    info!("Automatic hosted rejoin cancelled by explicit session intent");
+                    return true;
+                }
                 if attempt < REJOIN_MAX_RETRIES {
                     warn!(
                         "Hosted rejoin attempt {} failed (retrying in {}s): {e}",
@@ -654,7 +678,6 @@ async fn rejoin_hosted(
                         notebook_path: None,
                         rejoin_target: Some(target.clone()),
                     });
-                    *session.write().await = None;
                 }
             }
         }
@@ -820,18 +843,18 @@ mod tests {
         );
     }
 
-    /// Connected events AFTER a Disconnected should trigger
-    /// RejoinContinuation — the peer connection was actually lost.
+    /// Connected events after a lagged disconnect should trigger
+    /// RejoinContinuation because the peer connection was actually lost.
     #[test]
-    fn reconnect_after_disconnect_triggers_rejoin() {
+    fn lagged_connected_after_disconnect_triggers_rejoin_continuation() {
         let connected = DaemonEvent::Connected {
             info: info_with("1.0.0", 100),
         };
         let initial = None;
         let disconnect = None;
 
-        // After disconnect, Connected should trigger rejoin — session
-        // still live (legacy path before immediate-clear).
+        // After disconnect, Connected should trigger rejoin while the session
+        // is still live.
         assert_eq!(
             classify(&connected, &initial, true, true, &disconnect),
             WatchDecision::RejoinContinuation

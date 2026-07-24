@@ -1,6 +1,5 @@
 import { before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import type {
   D1Database,
   D1PreparedStatement,
@@ -18,18 +17,14 @@ import { FrameType, encodeTypedFrame, type FrameTypeValue } from "../src/protoco
 import { RoomMaterializer } from "../src/room-materializer.ts";
 import {
   createEmptyRoomHost,
-  initializeRuntimedWasm,
   loadRoomHostSnapshot,
   NotebookHandle,
   RuntimeStatePeerHandle,
 } from "../src/runtimed-wasm.ts";
-
-const wasmBytes = await readFile(
-  new URL("../../notebook/src/wasm/runtimed-wasm/runtimed_wasm_bg.wasm", import.meta.url),
-);
+import { initializeTestRuntimedWasm } from "./runtimed-wasm-test-loader.ts";
 
 before(async () => {
-  await initializeRuntimedWasm(wasmBytes);
+  await initializeTestRuntimedWasm();
 });
 
 type TestConnectionScope = "viewer" | "editor" | "runtime_peer" | "owner";
@@ -723,6 +718,7 @@ describe("RoomMaterializer", () => {
     const keys = [...(await state.storage.list({ prefix: "room-host:" })).keys()].sort();
     assert.deepEqual(keys, [
       "room-host:checkpoint",
+      "room-host:comments-doc",
       "room-host:comms-doc",
       "room-host:notebook-doc",
       "room-host:runtime-state-doc",
@@ -747,6 +743,35 @@ describe("RoomMaterializer", () => {
     assert.equal(cells[0].source, "Durable room checkpoint\n");
     assert.match(cells[1].id, /^cell-/);
     assert.equal(cells[1].source, "");
+  });
+
+  it("projects comment author labels from the room-host CommentsDoc", async () => {
+    const state = fakeState();
+    const materializer = new RoomMaterializer("demo", state, {} as Env);
+    const editorIdentity = authenticateDevRequest(
+      new Request("https://cloud.test/n/demo/sync?user=alice&operator=desktop:a&scope=editor"),
+    );
+    const editorPeer = {
+      id: "peer-editor",
+      identity: editorIdentity,
+    };
+    const editor = NotebookHandle.create_bootstrap(editorIdentity.actorLabel);
+    editor.init_comments_sync_target("comments:demo");
+
+    await syncCommentsMaterializerWithClient(materializer, editorPeer, editor);
+    editor.create_comment_thread(
+      "thread-1",
+      "message-1",
+      { kind: "notebook" },
+      "Can this profile be hydrated?",
+      undefined,
+      "2026-06-23T00:00:00.000Z",
+    );
+
+    const result = await applyCommentsClientChangesToMaterializer(materializer, editorPeer, editor);
+
+    assert.equal(result.changed, true);
+    assert.deepEqual(await materializer.getCommentAuthorActorLabels(), [editorIdentity.actorLabel]);
   });
 
   it("ignores unversioned prototype checkpoints so published snapshots can hydrate rooms", async () => {
@@ -1345,6 +1370,167 @@ describe("RoomMaterializer", () => {
     assert.deepEqual([...(await state.storage.list({ prefix: "room-host:" })).keys()], []);
   });
 
+  it("recovers unpublished rooms by reloading the durable checkpoint", async () => {
+    const state = fakeState();
+    const checkpointSnapshot = await createNotebookRoomSnapshot(
+      "demo",
+      "checkpoint-cell",
+      "Recovered checkpoint without published snapshot\n",
+    );
+    await Promise.all([
+      state.storage.put(
+        "room-host:notebook-doc",
+        arrayBufferFromBytes(checkpointSnapshot.notebookBytes),
+      ),
+      state.storage.put(
+        "room-host:runtime-state-doc",
+        arrayBufferFromBytes(checkpointSnapshot.runtimeStateBytes),
+      ),
+      state.storage.put("room-host:checkpoint", {
+        version: 4,
+        notebook_heads: checkpointSnapshot.notebookHeads,
+        runtime_state_heads: checkpointSnapshot.runtimeStateHeads,
+        saved_at: "2026-05-28T00:00:00.000Z",
+        published_revision_id: null,
+        published_notebook_heads: null,
+        published_runtime_state_heads: null,
+      }),
+    ]);
+
+    const reloaded = new RoomMaterializer("demo", state, {} as Env);
+    const checkpointHost = await (
+      reloaded as unknown as {
+        loadHost(): Promise<{ sync_peer: (peerId: string, connectionScope: string) => unknown }>;
+      }
+    ).loadHost();
+    checkpointHost.sync_peer = () => {
+      throw new Error("recursive use of an object detected which would lead to unsafe aliasing");
+    };
+
+    const viewer = NotebookHandle.create_bootstrap("user:dev:bob/desktop:b");
+    await syncMaterializerWithClient(
+      reloaded,
+      {
+        id: "peer-viewer",
+        identity: authenticateDevRequest(
+          new Request("https://cloud.test/n/demo/sync?user=bob&operator=desktop:b&scope=viewer"),
+        ),
+      },
+      viewer,
+    );
+
+    const cells = JSON.parse(viewer.get_cells_json()) as Array<{ id: string; source: string }>;
+    assert.deepEqual(
+      cells.map((cell) => [cell.id, cell.source]),
+      [["checkpoint-cell", "Recovered checkpoint without published snapshot\n"]],
+    );
+    assert.deepEqual(
+      [...(await state.storage.list({ prefix: "room-host:" })).keys()].sort(),
+      ["room-host:checkpoint", "room-host:notebook-doc", "room-host:runtime-state-doc"],
+      "checkpoint reload should keep the durable checkpoint in place",
+    );
+  });
+
+  it("recovers from a checkpoint host that fails while receiving a peer sync frame", async () => {
+    const state = fakeState();
+    const checkpointSnapshot = await createNotebookRoomSnapshot(
+      "demo",
+      "checkpoint-cell",
+      "Unreachable checkpoint edit\n",
+    );
+    const publishedSnapshot = await createNotebookRoomSnapshot(
+      "demo",
+      "published-cell",
+      "Recovered published snapshot after receive\n",
+    );
+    await Promise.all([
+      state.storage.put(
+        "room-host:notebook-doc",
+        arrayBufferFromBytes(checkpointSnapshot.notebookBytes),
+      ),
+      state.storage.put(
+        "room-host:runtime-state-doc",
+        arrayBufferFromBytes(checkpointSnapshot.runtimeStateBytes),
+      ),
+      state.storage.put("room-host:checkpoint", {
+        version: 4,
+        notebook_heads: checkpointSnapshot.notebookHeads,
+        runtime_state_heads: checkpointSnapshot.runtimeStateHeads,
+        saved_at: "2026-05-28T00:00:00.000Z",
+        published_revision_id: "revision-current",
+        published_notebook_heads: publishedSnapshot.notebookHeads,
+        published_runtime_state_heads: publishedSnapshot.runtimeStateHeads,
+      }),
+    ]);
+
+    const env = fakePublishedSnapshotEnv({
+      notebookId: "demo",
+      revisionId: "revision-current",
+      actorLabel: "user:dev:publisher/agent:runt-publish",
+      notebookBytes: publishedSnapshot.notebookBytes,
+      runtimeStateBytes: publishedSnapshot.runtimeStateBytes,
+    });
+
+    const materializer = new RoomMaterializer("demo", state, env);
+    const checkpointHost = await (
+      materializer as unknown as {
+        loadHost(): Promise<{
+          receive_peer_frame: (
+            peerId: string,
+            principal: string,
+            actorLabel: string,
+            connectionScope: string,
+            canWriteAllNotebookChanges: boolean,
+            encoded: Uint8Array,
+          ) => unknown;
+        }>;
+      }
+    ).loadHost();
+    checkpointHost.receive_peer_frame = () => {
+      throw new Error("recursive use of an object detected which would lead to unsafe aliasing");
+    };
+
+    const peer = {
+      id: "peer-viewer",
+      identity: authenticateDevRequest(
+        new Request("https://cloud.test/n/demo/sync?user=bob&operator=desktop:b&scope=viewer"),
+      ),
+    };
+    const viewer = NotebookHandle.create_bootstrap("user:dev:bob/desktop:b");
+
+    let result = await materializer.receiveFrame(peer, {
+      type: FrameType.AUTOMERGE_SYNC,
+      payload: new Uint8Array([1, 2, 3]),
+    });
+    for (let round = 0; round < 8; round += 1) {
+      const replies = applyOutboundToClient(result.outbound, peer.id, viewer);
+      if (replies.length === 0) {
+        break;
+      }
+      const outbound = [];
+      for (const reply of replies) {
+        const next = await materializer.receiveFrame(peer, {
+          type: FrameType.AUTOMERGE_SYNC,
+          payload: reply.slice(1),
+        });
+        outbound.push(...next.outbound);
+      }
+      result = {
+        changed: false,
+        notebook_changed: false,
+        runtime_state_changed: false,
+        outbound,
+      };
+    }
+
+    const cells = JSON.parse(viewer.get_cells_json()) as Array<{ id: string; source: string }>;
+    assert.deepEqual(
+      cells.map((cell) => [cell.id, cell.source]),
+      [["published-cell", "Recovered published snapshot after receive\n"]],
+    );
+    assert.deepEqual([...(await state.storage.list({ prefix: "room-host:" })).keys()], []);
+  });
+
   it("recovers from a published snapshot when stale checkpoint cleanup is over quota", async () => {
     const state = fakeState();
     const checkpointSnapshot = await createNotebookRoomSnapshot(
@@ -1508,12 +1694,24 @@ describe("RoomMaterializer", () => {
       status_message: null,
       cpu_count: null,
       memory_bytes: null,
+      accelerators: [
+        {
+          kind: "gpu",
+          vendor: "NVIDIA",
+          model: "A100",
+          count: 1,
+          memory_bytes_per_device: 80 * 1024 ** 3,
+          readiness: "ready" as const,
+          diagnostic: null,
+        },
+      ],
       working_directory: null,
       updated_at: "2026-06-07T00:00:00.000Z",
     };
     const result = await materializer.setWorkstationAttachment(attachment);
 
     assert.equal(result.changed, true);
+    assert.equal(result.ignored_stale, false);
     assert.equal(result.runtime_state_changed, true);
     assert.ok(
       result.outbound.some(
@@ -1524,14 +1722,67 @@ describe("RoomMaterializer", () => {
     );
     applyRuntimeOutboundToClient(result.outbound, viewerPeer.id, viewer);
     const runtimeState = viewer.get_runtime_state() as {
-      workstation?: { workstation_id?: string; status?: string } | null;
+      workstation?: {
+        workstation_id?: string;
+        status?: string;
+        accelerators?: Array<{ model?: string; count?: number }> | null;
+      } | null;
     };
     assert.equal(runtimeState.workstation?.workstation_id, "runtime-peer");
     assert.equal(runtimeState.workstation?.status, "ready");
+    assert.deepEqual(runtimeState.workstation?.accelerators, [
+      {
+        kind: "gpu",
+        vendor: "NVIDIA",
+        model: "A100",
+        count: 1,
+        memory_bytes_per_device: 80 * 1024 ** 3,
+        readiness: "ready",
+        diagnostic: null,
+      },
+    ]);
 
     const again = await materializer.setWorkstationAttachment(attachment);
     assert.equal(again.changed, false, "same attachment is idempotent");
+    assert.equal(again.ignored_stale, false);
     assert.deepEqual(again.outbound, []);
+  });
+
+  it("passes through ignored stale workstation attachment publishes", async () => {
+    const state = fakeState();
+    const materializer = new RoomMaterializer("demo", state, {} as Env);
+    const current = {
+      workstation_id: "ws-current",
+      display_name: "Current workstation",
+      provider: "runtime_peer",
+      default_environment_label: "Current Python",
+      environment_policy: "runtime_peer",
+      status: "ready",
+      status_message: null,
+      cpu_count: null,
+      memory_bytes: null,
+      accelerators: null,
+      working_directory: null,
+      updated_at: "2026-06-07T00:00:02.000Z",
+      runtime_session_id: "job-current",
+    };
+    const seeded = await materializer.setWorkstationAttachment(current);
+    assert.equal(seeded.changed, true);
+    assert.equal(seeded.ignored_stale, false);
+
+    const stale = {
+      ...current,
+      workstation_id: "ws-stale",
+      display_name: "Stale workstation",
+      updated_at: "2026-06-07T00:00:01.000Z",
+      runtime_session_id: "job-stale",
+    };
+    const ignored = await materializer.setWorkstationAttachment(stale);
+
+    assert.equal(ignored.changed, false);
+    assert.equal(ignored.ignored_stale, true);
+    assert.deepEqual(ignored.outbound, []);
+    assert.deepEqual(await materializer.getWorkstationAttachment(), current);
   });
 
   it("allows owner-scoped CommsDoc changes to existing runtime comm topology", async () => {
@@ -1904,6 +2155,75 @@ async function applyCommsClientChangesToMaterializer(
   return result;
 }
 
+async function syncCommentsMaterializerWithClient(
+  materializer: RoomMaterializer,
+  peer: { id: string; identity: ReturnType<typeof authenticateDevRequest> },
+  client: NotebookHandle,
+): Promise<void> {
+  let result = await materializer.syncPeer(peer);
+  for (let round = 0; round < 8; round += 1) {
+    const replies = applyCommentsOutboundToClient(result.outbound, peer.id, client);
+    if (replies.length === 0) {
+      return;
+    }
+    const outbound = [];
+    for (const reply of replies) {
+      const next = await materializer.receiveFrame(peer, {
+        type: FrameType.COMMENTS_DOC_SYNC,
+        payload: reply.slice(1),
+      });
+      outbound.push(...next.outbound);
+    }
+    result = {
+      changed: false,
+      notebook_changed: false,
+      runtime_state_changed: false,
+      outbound,
+    };
+  }
+}
+
+async function applyCommentsClientChangesToMaterializer(
+  materializer: RoomMaterializer,
+  peer: { id: string; identity: ReturnType<typeof authenticateDevRequest> },
+  client: NotebookHandle,
+) {
+  const message = client.flush_comments_doc_sync();
+  assert.ok(message);
+  let result = await materializer.receiveFrame(peer, {
+    type: FrameType.COMMENTS_DOC_SYNC,
+    payload: message,
+  });
+
+  for (let round = 0; round < 8 && !result.changed; round += 1) {
+    const replies = applyCommentsOutboundToClient(result.outbound, peer.id, client);
+    if (replies.length === 0) {
+      break;
+    }
+    const outbound = [];
+    for (const reply of replies) {
+      const next = await materializer.receiveFrame(peer, {
+        type: FrameType.COMMENTS_DOC_SYNC,
+        payload: reply.slice(1),
+      });
+      if (next.changed) {
+        result = next;
+      }
+      outbound.push(...next.outbound);
+    }
+    if (!result.changed) {
+      result = {
+        changed: false,
+        notebook_changed: false,
+        runtime_state_changed: false,
+        outbound,
+      };
+    }
+  }
+
+  return result;
+}
+
 async function applyRuntimePeerChangesToMaterializer(
   materializer: RoomMaterializer,
   peer: { id: string; identity: ReturnType<typeof authenticateDevRequest> },
@@ -2162,6 +2482,28 @@ function applyOutboundToClient(
     for (const event of events ?? []) {
       if (event.type === "sync_applied" && event.reply) {
         replies.push(encodeTypedFrame(FrameType.AUTOMERGE_SYNC, new Uint8Array(event.reply)));
+      }
+    }
+  }
+  return replies;
+}
+
+function applyCommentsOutboundToClient(
+  outbound: Array<{ peer_id: string; frame_type: FrameTypeValue; payload: Uint8Array | number[] }>,
+  peerId: string,
+  client: NotebookHandle,
+): Uint8Array[] {
+  const replies: Uint8Array[] = [];
+  for (const frame of outbound) {
+    if (frame.peer_id !== peerId || frame.frame_type !== FrameType.COMMENTS_DOC_SYNC) {
+      continue;
+    }
+    const events = client.receive_frame(
+      encodeTypedFrame(frame.frame_type, new Uint8Array(frame.payload)),
+    ) as Array<{ type: string; reply?: number[] }>;
+    for (const event of events ?? []) {
+      if (event.type === "comments_doc_sync_applied" && event.reply) {
+        replies.push(encodeTypedFrame(FrameType.COMMENTS_DOC_SYNC, new Uint8Array(event.reply)));
       }
     }
   }
@@ -2429,9 +2771,11 @@ function fakePublishedSnapshotEnv(input: {
         notebook_heads_hash: "heads-published",
         runtime_heads_hash: "runtime-published",
         comms_heads_hash: null,
+        comments_heads_hash: null,
         snapshot_key: snapshotKey,
         runtime_snapshot_key: runtimeSnapshotKey,
         comms_snapshot_key: null,
+        comments_snapshot_key: null,
         actor_label: input.actorLabel,
         created_at: "2026-05-28T00:00:00.000Z",
       },
@@ -2480,9 +2824,11 @@ class FakeCatalogD1 implements D1Database {
         notebook_heads_hash: string;
         runtime_heads_hash: string;
         comms_heads_hash: string | null;
+        comments_heads_hash: string | null;
         snapshot_key: string;
         runtime_snapshot_key: string;
         comms_snapshot_key: string | null;
+        comments_snapshot_key: string | null;
         actor_label: string;
         created_at: string;
       };
@@ -2534,6 +2880,8 @@ class FakeCatalogStatement implements D1PreparedStatement {
         { name: "runtime_state_doc_id" },
         { name: "comms_heads_hash" },
         { name: "comms_snapshot_key" },
+        { name: "comments_heads_hash" },
+        { name: "comments_snapshot_key" },
       ] as T[]);
     }
     if (/FROM notebook_revisions/s.test(this.query)) {

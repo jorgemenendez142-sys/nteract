@@ -27,16 +27,17 @@ import type {
   GitInfo,
   HostBlobResolver,
   HostBlobs,
+  HostSyncedSettings,
   HostUpdaterState,
   NotebookHost,
   TyposquatWarning,
   Unlisten,
 } from "../types";
+import { DEFAULT_FONT_FAMILIES, uniqueSortedFontFamilies } from "../font-families";
 
 const DEFAULT_CONFIG_URL = "/__nteract_dev_relay/config";
 const FRAME_TYPE_REQUEST = 0x01;
 const FRAME_TYPE_RESPONSE = 0x02;
-
 interface BrowserRelayConfig {
   websocket_url: string;
   token: string;
@@ -62,6 +63,38 @@ export interface CreateBrowserHostOptions {
   fetchImpl?: typeof fetch;
   /** Test seam. */
   WebSocketImpl?: typeof WebSocket;
+}
+
+type BrowserFontAccess = {
+  query?: () => Promise<Iterable<{ family?: string }>>;
+};
+
+async function getBrowserFontFamilies(): Promise<string[]> {
+  const fontFamilies: string[] = [...DEFAULT_FONT_FAMILIES];
+  const fontAccess =
+    typeof navigator !== "undefined"
+      ? (navigator as Navigator & { fonts?: BrowserFontAccess }).fonts
+      : undefined;
+
+  if (typeof fontAccess?.query === "function") {
+    try {
+      const availableFonts = await fontAccess.query();
+      for (const font of availableFonts) {
+        if (font.family) fontFamilies.push(font.family);
+      }
+    } catch {
+      // The Font Access API is optional and permission-gated; loaded CSS fonts
+      // and the curated defaults still give the picker useful options.
+    }
+  }
+
+  if (typeof document !== "undefined" && "fonts" in document) {
+    document.fonts.forEach((fontFace) => {
+      if (fontFace.family) fontFamilies.push(fontFace.family);
+    });
+  }
+
+  return uniqueSortedFontFamilies(fontFamilies);
 }
 
 interface PendingEntry {
@@ -133,6 +166,34 @@ function makeUnavailable(message: string): DaemonUnavailablePayload {
     message,
     guidance: "Start the dev daemon with `cargo xtask dev-daemon`, then run `cargo xtask vite`.",
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function setSyncedSettingValue(
+  snapshot: HostSyncedSettings,
+  key: string,
+  value: unknown,
+): HostSyncedSettings {
+  const path = key.split(".");
+  if (path.length === 1 || path.some((part) => part.length === 0)) {
+    return { ...snapshot, [key]: value };
+  }
+
+  const nextSnapshot: Record<string, unknown> = { ...snapshot };
+  let target = nextSnapshot;
+
+  for (const part of path.slice(0, -1)) {
+    const current = target[part];
+    const next = isRecord(current) ? { ...current } : {};
+    target[part] = next;
+    target = next;
+  }
+
+  target[path[path.length - 1]] = value;
+  return nextSnapshot as HostSyncedSettings;
 }
 
 class BrowserDevTransport implements NotebookTransport {
@@ -416,6 +477,13 @@ export async function createBrowserHost(
 
   const idleUpdaterState: HostUpdaterState = { status: "idle", version: null, error: null };
   const commands = createCommandRegistry();
+  let syncedSettingsSnapshot: HostSyncedSettings = {};
+  const settingsSubscribers = new Set<(settings: HostSyncedSettings) => void>();
+
+  const emitSettingsChanged = () => {
+    const snapshot = { ...syncedSettingsSnapshot };
+    for (const cb of settingsSubscribers) cb(snapshot);
+  };
 
   const browserBlobHost: HostBlobs = {
     async port() {
@@ -509,6 +577,9 @@ export async function createBrowserHost(
       async openInNewWindow() {
         throw new Error("Open in new window is not available in the browser dev host");
       },
+      async openHostedInNewWindow() {
+        throw new Error("Opening hosted notebooks is not available in the browser dev host");
+      },
       async cloneToEphemeral() {
         throw new Error("Clone is not available in the browser dev host");
       },
@@ -520,6 +591,7 @@ export async function createBrowserHost(
       async setTitle(title) {
         document.title = title;
       },
+      async setTheme() {},
       onFocusChange(cb) {
         const onFocus = () => cb(true);
         const onBlur = () => cb(false);
@@ -538,6 +610,7 @@ export async function createBrowserHost(
       async getUsername() {
         return "browser";
       },
+      getFontFamilies: getBrowserFontFamilies,
     },
     dialog: {
       async openFile() {
@@ -569,6 +642,25 @@ export async function createBrowserHost(
     settings: {
       async openWindow() {
         window.open("/settings/", "_blank", "noopener,noreferrer");
+      },
+      async getSynced() {
+        return { ...syncedSettingsSnapshot };
+      },
+      async setSynced(key, value) {
+        syncedSettingsSnapshot = setSyncedSettingValue(syncedSettingsSnapshot, key, value);
+        emitSettingsChanged();
+      },
+      async rotateInstallId() {
+        const installId = crypto.randomUUID();
+        syncedSettingsSnapshot = { ...syncedSettingsSnapshot, install_id: installId };
+        emitSettingsChanged();
+        return installId;
+      },
+      onChanged(cb) {
+        settingsSubscribers.add(cb);
+        return () => {
+          settingsSubscribers.delete(cb);
+        };
       },
     },
     commands,

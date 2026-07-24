@@ -28,12 +28,13 @@ import {
 } from "@/components/isolated/rpc-methods";
 import { createWidgetStore, type WidgetStore } from "@/components/widgets/widget-store";
 
-function isLocalDaemonBlobUrl(value: string): boolean {
+export function isLocalDaemonBlobUrl(value: string): boolean {
   try {
     const url = new URL(value);
+    const host = url.hostname.toLowerCase();
     return (
       (url.protocol === "http:" || url.protocol === "https:") &&
-      url.hostname === "127.0.0.1" &&
+      (host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1") &&
       url.port.length > 0 &&
       url.search === "" &&
       url.hash === "" &&
@@ -137,13 +138,14 @@ export function createWidgetBridgeClient(transport: JsonRpcTransport): WidgetBri
   });
 
   transport.onNotification(NTERACT_COMM_OPEN, async (params) => {
-    const { commId, state, bufferPaths } = params as {
+    const { commId, targetName, state, bufferPaths } = params as {
       commId: string;
+      targetName?: string;
       state: Record<string, unknown>;
       bufferPaths?: string[][];
     };
     await resolveBlobUrlsInPlace(state, bufferPaths);
-    store.createModel(commId, state, bufferPaths);
+    store.createModel(commId, state, bufferPaths, targetName);
   });
 
   transport.onNotification(NTERACT_COMM_MSG, async (params) => {
@@ -171,6 +173,7 @@ export function createWidgetBridgeClient(transport: JsonRpcTransport): WidgetBri
     const { models } = params as {
       models: Array<{
         commId: string;
+        targetName?: string;
         state: Record<string, unknown>;
         bufferPaths?: string[][];
       }>;
@@ -178,7 +181,7 @@ export function createWidgetBridgeClient(transport: JsonRpcTransport): WidgetBri
     await Promise.all(
       models.map(async (model) => {
         await resolveBlobUrlsInPlace(model.state, model.bufferPaths);
-        store.createModel(model.commId, model.state, model.bufferPaths);
+        store.createModel(model.commId, model.state, model.bufferPaths, model.targetName);
       }),
     );
   });

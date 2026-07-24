@@ -2,6 +2,7 @@
 // Do not edit by hand.
 
 import type {
+  HostedBridgeStatus,
   InitialLoadPhase,
   NotebookDocPhase,
   RuntimeStatePhase,
@@ -23,9 +24,11 @@ export const NOTEBOOK_REQUEST_TYPES = [
   "run_all_cells",
   "run_all_cells_guarded",
   "send_comm",
+  "apply_bokeh_session_patch",
   "get_history",
   "complete",
   "save_notebook",
+  "reconcile_notebook_source",
   "clone_as_ephemeral",
   "sync_environment",
   "approve_trust",
@@ -54,12 +57,16 @@ export const NOTEBOOK_RESPONSE_RESULTS = [
   "guard_rejected",
   "all_cells_queued",
   "notebook_saved",
-  "save_error",
+  "notebook_already_current",
+  "notebook_save_blocked",
+  "notebook_source_reconciled",
+  "notebook_source_reconciliation_blocked",
   "notebook_cloned",
   "ok",
   "error",
   "history_result",
   "completion_result",
+  "bokeh_session_patch",
   "sync_environment_complete",
   "sync_environment_failed",
   "doc_bytes",
@@ -77,10 +84,13 @@ export const NOTEBOOK_RESPONSE_RESULTS_EXHAUSTIVE: MissingUnionMember<
   ? true
   : never = true;
 
-export type SessionControlMessage = { type: "sync_status" } & SessionStatus;
+export type SessionControlMessage =
+  | ({ type: "sync_status" } & SessionStatus)
+  | { type: "hosted_bridge_status"; status: HostedBridgeStatus };
 
 export const SESSION_CONTROL_TYPES = [
   "sync_status",
+  "hosted_bridge_status",
 ] as const satisfies readonly SessionControlMessage["type"][];
 
 export const NOTEBOOK_DOC_PHASES = [

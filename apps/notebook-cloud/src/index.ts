@@ -1,4 +1,11 @@
-import type { Env, ExecutionContext, ExportedHandler, WorkerAssets } from "./cloudflare-types.ts";
+import type {
+  DurableObjectStub,
+  Env,
+  ExecutionContext,
+  ExportedHandler,
+  WorkerAssets,
+} from "./cloudflare-types.ts";
+import type { NotebookComputeSessionSummary } from "runtimed";
 import { projectNotebookWorkstationAttachmentFromClaim, type BlobRef } from "runtimed";
 import { NotebookRoom } from "./notebook-room.ts";
 import {
@@ -11,6 +18,7 @@ import {
   DEV_AUTH_TOKEN_PROTOCOL_PREFIX,
   isAnonymousViewer,
   NOTEBOOK_CLOUD_WEBSOCKET_PROTOCOL,
+  parseActorLabel,
   parseScope,
   stampTrustedIdentity,
   type AuthenticatedConnection,
@@ -21,6 +29,7 @@ import {
 import {
   AuthorizationError,
   authorizeNotebookAccess,
+  authorizeNotebookAccessWithNotebook,
   type AuthorizeNotebookAccessOptions,
 } from "./authorization.ts";
 import {
@@ -34,6 +43,7 @@ import {
   getNotebookAclRows,
   getNotebookRow,
   getNotebookCatalog,
+  getNotebookRevisionRow,
   getPublicPublishedNotebookRow,
   getWorkstationRow,
   grantNotebookAclRow,
@@ -44,17 +54,24 @@ import {
   recordRevision,
   registerWorkstation,
   revokeNotebookAclRow,
+  roomSummaryKey,
   runtimeStateSnapshotKey,
   snapshotKey,
   setDefaultWorkstation,
+  updateNotebookRevisionCover,
+  updateNotebookSnapshotSummary,
   updateNotebookTitle,
   updateWorkstationAttachJobStatus,
   type ListedNotebookRow,
   type NotebookAclRow,
   type NotebookAccessRequestRow,
   type NotebookAccessRequestStatus,
+  type NotebookRoomSummary,
+  type NotebookRoomSummaryOccupant,
   type WorkstationAttachJobRow,
   type WorkstationAttachJobStatus,
+  type WorkstationAccelerator,
+  type WorkstationAcceleratorReadiness,
   type WorkstationRegistrationInput,
   type WorkstationRow,
   type WorkstationStatus,
@@ -70,7 +87,32 @@ import {
   workstationCredentialTokenFromRequest,
   workstationPairingStatus,
 } from "./workstation-credentials.ts";
-import { materializeSnapshotPairRender } from "./snapshot-render.ts";
+import {
+  WorkstationEvents,
+  workstationEventsObjectName,
+  type WorkstationAttachJobNotification,
+} from "./workstation-events.ts";
+import {
+  getLatestWorkstationBuildsForEnv,
+  isWorkstationBuildOutdated,
+  latestWorkstationBuildForChannel,
+  latestWorkstationBuildVersionsByChannel,
+  type LatestWorkstationBuildMap,
+} from "./latest-workstation-builds.ts";
+import {
+  OwnerComputeIndex,
+  deleteWorkstationLease,
+  listOwnerComputeSessions,
+  listWorkstationLeases,
+  upsertWorkstationLease,
+  type WorkstationLeaseRecord,
+} from "./compute-session-index.ts";
+import {
+  SNAPSHOT_PREVIEW_TEXT_MAX_LENGTH,
+  materializeSnapshotPairRenderWithSummary,
+  type SnapshotNotebookPreviewCell,
+  type SnapshotNotebookSummary,
+} from "./snapshot-render.ts";
 import { notebookRouteSegmentTitle } from "./notebook-route-title.ts";
 import {
   createNotebookCloudBlobResolver,
@@ -124,11 +166,13 @@ import {
   NOTEBOOK_CLOUD_APP_SESSION_COOKIE_NAME,
   NOTEBOOK_CLOUD_APP_SESSION_MAX_AGE_SECONDS,
   appSessionConfigured,
+  appSessionRenewalCookie,
   clearCloudAppSessionCookie,
   createCloudAppSessionCookie,
   readCloudAppSession,
   type CloudAppSession,
 } from "./app-session.ts";
+import { authenticateHostSessionRequest, hostSessionHealth } from "./host-session.ts";
 import {
   NOTEBOOK_CLOUD_DEV_TOKEN_STORAGE_KEY,
   NOTEBOOK_CLOUD_SCOPE_STORAGE_KEY,
@@ -139,8 +183,9 @@ import {
   isLoopbackWorkerRequest,
   trustsLoopbackRequestHeaders,
 } from "./loopback.ts";
+import { handleLocalOidcRequest, localOidcEnabled } from "./dev-oidc.ts";
 
-export { NotebookRoom };
+export { NotebookRoom, WorkstationEvents, OwnerComputeIndex };
 
 // `/plugins/*` is a raw static asset path in deployed Workers. Use a
 // Worker-owned route by default so sandboxed srcdoc iframes can fetch sidecar
@@ -166,6 +211,18 @@ const SNAPSHOT_BLOB_HEAD_CONCURRENCY = 16;
 // operations. Sized ~10x the largest blob_ref_count observed in
 // snapshot_pair.validation.completed logs; raise it if legitimate notebooks hit it.
 const MAX_SNAPSHOT_BLOB_REFS = 2000;
+const DEFAULT_BLOB_UPLOAD_CONTENT_TYPE = "application/octet-stream";
+const ALLOWED_EXACT_BLOB_UPLOAD_CONTENT_TYPES = new Set([
+  DEFAULT_BLOB_UPLOAD_CONTENT_TYPE,
+  "application/ecmascript",
+  "application/javascript",
+  "application/json",
+  "application/pdf",
+  "application/vnd.apache.arrow.stream",
+  "application/vnd.apache.parquet",
+  "application/wasm",
+]);
+const ALLOWED_PREFIXED_BLOB_UPLOAD_CONTENT_TYPES = ["audio/", "image/", "text/", "video/"];
 const ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const CREATE_NOTEBOOK_ID_ATTEMPTS = 8;
 
@@ -204,6 +261,7 @@ const rendererSidecarAssetNamesCache = new WeakMap<
 type SnapshotPairValidationResult =
   | {
       ok: true;
+      summary: SnapshotNotebookSummary;
     }
   | {
       ok: false;
@@ -225,7 +283,8 @@ const NOTEBOOK_CLOUD_ROUTES: readonly WorkerRoute[] = [
   {
     match: exactPath("/api/auth/session"),
     methods: ["GET", "POST", "DELETE"],
-    handler: (_match, request, env) => routeAppSession(request, env),
+    handler: async (_match, request, env, ctx) =>
+      withNoStore(await routeAppSession(request, env, ctx)),
   },
   {
     match: exactPath("/local-auth", "/dev/local-auth"),
@@ -243,18 +302,29 @@ const NOTEBOOK_CLOUD_ROUTES: readonly WorkerRoute[] = [
     handler: (_match, request, env) => notebookListViewer(request, env),
   },
   {
+    match: exactPath("/workstations", "/workstations/"),
+    methods: ["GET", "HEAD"],
+    handler: (_match, request, env) => workstationsViewer(request, env),
+  },
+  {
     match: exactPath("/oidc"),
     methods: ["GET", "HEAD"],
     handler: (_match, request, env) => oidcCallbackViewer(request, env),
   },
   {
     match: routePath("/n/:notebookId/sync", { trailingSlash: "optional" }),
-    handler: (_match, request, env) => routeRoomSync(request, env),
+    handler: (_match, request, env, ctx) => routeRoomSync(request, env, ctx),
   },
   {
     match: routePath("/n/:notebookId/debug", { trailingSlash: "optional" }),
     methods: ["GET", "HEAD"],
     handler: ({ params }, request) => debugViewer(params.notebookId, request),
+  },
+  {
+    match: routePath("/n/:notebookId/r/latest/ogImage.png"),
+    methods: ["GET", "HEAD"],
+    handler: ({ params }, request, env) =>
+      routeLatestNotebookOgImage(request, env, params.notebookId),
   },
   {
     match: routePath("/n/:notebookId/r/:revision", { trailingSlash: "optional" }),
@@ -280,7 +350,7 @@ const NOTEBOOK_CLOUD_ROUTES: readonly WorkerRoute[] = [
   {
     match: exactPath("/api/workstations"),
     methods: ["GET", "POST"],
-    handler: (_match, request, env) => routeWorkstations(request, env),
+    handler: (_match, request, env, ctx) => routeWorkstations(request, env, ctx),
   },
   {
     match: exactPath("/api/workstations/default"),
@@ -317,6 +387,22 @@ const NOTEBOOK_CLOUD_ROUTES: readonly WorkerRoute[] = [
     methods: ["POST"],
     handler: ({ params }, request, env) =>
       routeWorkstationCredentialRevoke(request, env, params.credentialId),
+  },
+  {
+    match: routePath("/api/workstations/:workstationId", {
+      trailingSlash: "optional",
+    }),
+    methods: ["DELETE"],
+    handler: ({ params }, request, env) =>
+      routeWorkstationDeregister(request, env, params.workstationId),
+  },
+  {
+    match: routePath("/api/workstations/:workstationId/events", {
+      trailingSlash: "optional",
+    }),
+    methods: ["GET"],
+    handler: ({ params }, request, env) =>
+      routeWorkstationEvents(request, env, params.workstationId),
   },
   {
     match: routePath("/api/workstations/:workstationId/attach-jobs/:jobId", {
@@ -362,6 +448,12 @@ const NOTEBOOK_CLOUD_ROUTES: readonly WorkerRoute[] = [
     match: routePath("/api/n/:notebookId/access-requests", { trailingSlash: "optional" }),
     handler: ({ params }, request, env) =>
       routeNotebookAccessRequests(request, env, params.notebookId),
+  },
+  {
+    match: routePath("/api/n/:notebookId/author-profiles", { trailingSlash: "optional" }),
+    methods: ["GET"],
+    handler: ({ params }, request, env) =>
+      routeNotebookAuthorProfiles(request, env, params.notebookId),
   },
   {
     match: routePath("/api/n/:notebookId/workstation-attachments", { trailingSlash: "optional" }),
@@ -415,6 +507,13 @@ const worker: ExportedHandler<Env> = {
       return assetResponse;
     }
 
+    // Dev-only OIDC issuer. Off unless NOTEBOOK_CLOUD_LOCAL_OIDC is set, in which
+    // case it owns `/dev/oidc/*`; otherwise the request falls through to the 404.
+    const localOidcResponse = await handleLocalOidcRequest(request, env);
+    if (localOidcResponse) {
+      return localOidcResponse;
+    }
+
     const routeResponse = await dispatchWorkerRoute(NOTEBOOK_CLOUD_ROUTES, request, env, ctx);
     if (routeResponse) {
       return routeResponse;
@@ -443,6 +542,7 @@ async function routeHealth(
     auth: {
       anaconda_api_key: anacondaApiKeyHealth(env),
       app_session: appSessionHealth(env),
+      host_session: hostSessionHealth(env),
       oidc: oidcHealth(env),
     },
   });
@@ -655,7 +755,7 @@ function assetKind(pathname: string): string {
   return "viewer_asset";
 }
 
-async function routeRoomSync(request: Request, env: Env): Promise<Response> {
+async function routeRoomSync(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
     return json({ error: "expected WebSocket upgrade" }, 426);
   }
@@ -673,22 +773,42 @@ async function routeRoomSync(request: Request, env: Env): Promise<Response> {
   const appSessionIdentity = await appSessionIdentityFromWebSocketRequest(request, env);
   const identity =
     appSessionIdentity ??
-    (await authenticateRequestOrResponse(request, env, { allowWorkstationCredential: true }));
+    (await authenticateRequestOrResponse(request, env, {
+      allowWorkstationCredential: true,
+      syncProfile: false,
+    }));
   if (identity instanceof Response) {
     return identity;
   }
-  const authorizedIdentity = await authorizeIdentityOrResponse(
+  const roomAuthorizationOptions = {
+    allowViewerDowngrade: true,
+    allowLiveScopeDowngrade: true,
+  } satisfies AuthorizeNotebookAccessOptions;
+  let profileSyncedBeforeAuthorization = false;
+  let authorizedIdentity = await authorizeIdentityOrResponse(
     env,
     notebookId,
     identity,
     identity.scope,
-    {
-      allowViewerDowngrade: true,
-      allowLiveScopeDowngrade: true,
-    },
+    roomAuthorizationOptions,
   );
+  if (authorizedIdentity instanceof Response && authorizedIdentity.status === 403) {
+    await syncAuthenticatedProfile(env, identity);
+    profileSyncedBeforeAuthorization = true;
+    authorizedIdentity = await authorizeIdentityOrResponse(
+      env,
+      notebookId,
+      identity,
+      identity.scope,
+      roomAuthorizationOptions,
+    );
+  }
   if (authorizedIdentity instanceof Response) {
     return authorizedIdentity;
+  }
+
+  if (!profileSyncedBeforeAuthorization) {
+    ctx.waitUntil(syncAuthenticatedProfile(env, authorizedIdentity));
   }
 
   const id = env.NOTEBOOK_ROOMS.idFromName(notebookId);
@@ -921,10 +1041,73 @@ function appSessionHealth(env: Env): { status: "configured" | "disabled" } {
   return { status: appSessionConfigured(env) ? "configured" : "disabled" };
 }
 
-async function routeAppSession(request: Request, env: Env): Promise<Response> {
+function withNoStore(response: Response): Response {
+  response.headers.set("Cache-Control", "no-store");
+  return response;
+}
+
+/**
+ * Server-Timing phase timers for the session endpoint. Cloudflare advances
+ * `Date.now()` only across I/O, so each phase reports the awaited upstream or
+ * database time it wrapped; a near-zero `total` against a slow client-side
+ * trace points at scheduling upstream of the handler. Metric names are stable
+ * so traces stay comparable: `session_read`, `host_bootstrap`, `renew_cookie`
+ * (GET), `auth_validate`, `profile_sync`, `cookie_create` (POST), and `total`
+ * on every method.
+ */
+function appSessionServerTiming(): {
+  time<T>(name: string, op: () => Promise<T>): Promise<T>;
+  apply(response: Response): Response;
+} {
+  const startedAt = Date.now();
+  const phases: string[] = [];
+  return {
+    async time<T>(name: string, op: () => Promise<T>): Promise<T> {
+      const phaseStartedAt = Date.now();
+      try {
+        return await op();
+      } finally {
+        phases.push(`${name};dur=${Date.now() - phaseStartedAt}`);
+      }
+    },
+    apply(response: Response): Response {
+      response.headers.set(
+        "Server-Timing",
+        [...phases, `total;dur=${Date.now() - startedAt}`].join(", "),
+      );
+      return response;
+    },
+  };
+}
+
+async function routeAppSession(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const timing = appSessionServerTiming();
+
   if (request.method === "GET") {
-    const session = appSessionConfigured(env) ? await readCloudAppSession(env, request) : null;
-    return json({ ok: true, session: session ? appSessionResponse(session) : null });
+    const existingSession = appSessionConfigured(env)
+      ? await timing.time("session_read", () => readCloudAppSession(env, request))
+      : null;
+    const bootstrapped =
+      existingSession || !appSessionConfigured(env)
+        ? null
+        : await timing.time("host_bootstrap", () => hostSessionAppSessionCookie(request, env));
+    const session = existingSession ?? bootstrapped?.session ?? null;
+    const response = await timing.time("renew_cookie", () =>
+      withAppSessionRenewalCookie(
+        json({ ok: true, session: session ? appSessionResponse(session) : null }),
+        env,
+        session,
+      ),
+    );
+    if (bootstrapped?.cookie) {
+      response.headers.append("Set-Cookie", bootstrapped.cookie);
+      ctx.waitUntil(syncAuthenticatedProfile(env, bootstrapped.identity));
+    }
+    return timing.apply(response);
   }
 
   const originRejection = rejectUntrustedMutationOrigin(request, env);
@@ -935,7 +1118,7 @@ async function routeAppSession(request: Request, env: Env): Promise<Response> {
   if (request.method === "DELETE") {
     const response = json({ ok: true });
     response.headers.append("Set-Cookie", clearCloudAppSessionCookie());
-    return response;
+    return timing.apply(response);
   }
 
   if (request.method !== "POST") {
@@ -945,27 +1128,59 @@ async function routeAppSession(request: Request, env: Env): Promise<Response> {
     return json({ error: "app sessions are not configured" }, 503);
   }
 
-  const identity = await authenticateRequestOrResponse(request, env);
+  // Same operations and ordering as `authenticateRequestOrResponse` with its
+  // default profile sync, split so each awaited phase reports its own timing.
+  const identity = await timing.time("auth_validate", () =>
+    authenticateRequestOrResponse(request, env, { syncProfile: false }),
+  );
   if (identity instanceof Response) {
-    return identity;
+    return timing.apply(identity);
   }
+  await timing.time("profile_sync", () => syncAuthenticatedProfile(env, identity));
   if (identity.metadata.provider !== "oidc") {
-    return json({ error: "app sessions require OIDC sign-in" }, 403);
+    return timing.apply(json({ error: "app sessions require OIDC sign-in" }, 403));
   }
 
-  const cookie = await createCloudAppSessionCookie(env, identity);
+  const cookie = await timing.time("cookie_create", () =>
+    createCloudAppSessionCookie(env, identity),
+  );
   const response = json({
     ok: true,
     expires_in: NOTEBOOK_CLOUD_APP_SESSION_MAX_AGE_SECONDS,
   });
   response.headers.append("Set-Cookie", cookie);
-  return response;
+  return timing.apply(response);
+}
+
+async function hostSessionAppSessionCookie(
+  request: Request,
+  env: Env,
+): Promise<{ cookie: string; identity: AuthenticatedConnection; session: CloudAppSession } | null> {
+  const identity = await authenticateHostSessionRequest(request, env);
+  if (!identity) {
+    return null;
+  }
+
+  const appSessionCookie = await createCloudAppSessionCookie(env, identity);
+  const session = await readCloudAppSession(
+    env,
+    new Request(request.url, {
+      headers: {
+        Cookie: appSessionCookie.split(";", 1)[0] ?? "",
+      },
+    }),
+  );
+  if (!session) {
+    return null;
+  }
+  return { cookie: appSessionCookie, identity, session };
 }
 
 function appSessionResponse(session: CloudAppSession): Record<string, unknown> {
   return {
     provider: session.provider,
     expires_at: session.expiresAt,
+    cache_key: session.cacheKey,
   };
 }
 
@@ -1113,6 +1328,9 @@ async function routeCreateNotebook(request: Request, env: Env): Promise<Response
 
 const DEFAULT_NOTEBOOK_LIST_LIMIT = 100;
 const MAX_NOTEBOOK_LIST_LIMIT = 500;
+const NOTEBOOK_LIST_ROOM_SUMMARY_LIMIT = 200;
+const NOTEBOOK_LIST_ROOM_SUMMARY_CONCURRENCY = 20;
+const ROOM_SUMMARY_FRESH_MS = 150_000;
 
 async function routeListNotebooks(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") {
@@ -1146,21 +1364,263 @@ async function routeListNotebooks(request: Request, env: Env): Promise<Response>
     await syncStoredAppSessionProfile(env, appSession);
   }
 
-  const notebooks = await listNotebooksForPrincipal(env, principal, limit);
-  return json({
-    ok: true,
-    notebooks: notebookListResponseRows(request, notebooks, env),
-  });
+  const notebookList = await listNotebooksForPrincipal(env, principal, limit);
+  const { notebooks, totalCount } = notebookList;
+  // The hydrations are independent fan-outs (owner-bucketed DO calls, bounded
+  // R2 GETs, one batched D1 profile lookup) - overlap them instead of paying
+  // the latencies in series.
+  const [computeSessions, roomPresence, principalDisplays] = await Promise.all([
+    listNotebookComputeSessionsForOwnedRows(env, notebooks),
+    listNotebookRoomPresenceForRows(env, notebooks, {
+      actorLabel: isAnonymousViewer(identity) ? null : identity.actorLabel,
+      principal,
+    }),
+    listNotebookPrincipalDisplays(env, notebooks, principal),
+  ]);
+  // Same resolution chain the viewer shell uses: live identity metadata, then
+  // the app session's captured display name, then the profile store.
+  const currentUserProfile = principalDisplays.get(principal);
+  const currentUserDisplay =
+    (!isAnonymousViewer(identity) ? identity.metadata.displayName?.trim() : undefined) ||
+    appSession?.displayName?.trim() ||
+    currentUserProfile?.displayName ||
+    undefined;
+  const currentUserAvatar =
+    (!isAnonymousViewer(identity) ? identity.metadata.avatarUrl?.trim() : undefined) ||
+    currentUserProfile?.avatarUrl ||
+    undefined;
+  return withAppSessionRenewalCookie(
+    json({
+      ok: true,
+      notebooks: notebookListResponseRows(
+        request,
+        notebooks,
+        env,
+        computeSessions,
+        roomPresence,
+        principalDisplays,
+      ),
+      total_count: totalCount,
+      current_user_principal: principal,
+      ...(currentUserDisplay ? { current_user_display: currentUserDisplay } : {}),
+      ...(currentUserAvatar ? { current_user_avatar: currentUserAvatar } : {}),
+    }),
+    env,
+    appSession,
+  );
 }
+
+// Owner name cards resolve through the unified user store (principal_profiles),
+// not the raw principal string. Fail-open: no profile data degrades to the
+// client's principal-derived fallback, never a failed list.
+async function listNotebookPrincipalDisplays(
+  env: Env,
+  notebooks: readonly ListedNotebookRow[],
+  requesterPrincipal: string,
+): Promise<Map<string, { displayName: string | null; avatarUrl: string | null }>> {
+  const displays = new Map<string, { displayName: string | null; avatarUrl: string | null }>();
+  try {
+    const principals = Array.from(
+      new Set([...notebooks.map((notebook) => notebook.owner_principal), requesterPrincipal]),
+    );
+    const profiles = await getPrincipalProfiles(env, principals);
+    for (const profile of profiles) {
+      const displayName = profile.display_name?.trim() || null;
+      const avatarUrl = profile.avatar_url?.trim() || null;
+      displays.set(profile.principal, { displayName, avatarUrl });
+    }
+  } catch (error) {
+    cloudLog("warn", "notebook.list.profile_hydration_failed", {
+      error: errorMessage(error),
+      counter: "notebook_list_profile_hydration_failures",
+      counter_delta: 1,
+    });
+  }
+  return displays;
+}
+
+async function listNotebookComputeSessionsForOwnedRows(
+  env: Env,
+  notebooks: readonly ListedNotebookRow[],
+): Promise<Map<string, NotebookComputeSessionSummary>> {
+  const idsByOwner = new Map<string, string[]>();
+  for (const notebook of notebooks) {
+    if (notebook.scope !== "owner") {
+      continue;
+    }
+    const ids = idsByOwner.get(notebook.owner_principal) ?? [];
+    ids.push(notebook.id);
+    idsByOwner.set(notebook.owner_principal, ids);
+  }
+  const entries = await Promise.all(
+    Array.from(idsByOwner, async ([ownerPrincipal, notebookIds]) =>
+      listOwnerComputeSessions(env, ownerPrincipal, notebookIds),
+    ),
+  );
+  const sessions = new Map<string, NotebookComputeSessionSummary>();
+  for (const ownerSessions of entries) {
+    for (const [notebookId, session] of ownerSessions) {
+      sessions.set(notebookId, session);
+    }
+  }
+  return sessions;
+}
+
+interface NotebookListRequesterPresence {
+  actorLabel: string | null;
+  principal: string;
+}
+
+async function listNotebookRoomPresenceForRows(
+  env: Env,
+  notebooks: readonly ListedNotebookRow[],
+  requester: NotebookListRequesterPresence,
+): Promise<Map<string, NotebookRoomSummaryOccupant[]>> {
+  const bucket = env.NOTEBOOK_SNAPSHOTS;
+  if (!bucket || notebooks.length === 0) {
+    return new Map();
+  }
+
+  const hydrated = notebooks.slice(0, NOTEBOOK_LIST_ROOM_SUMMARY_LIMIT);
+  if (notebooks.length > hydrated.length) {
+    cloudLog("info", "notebook_list.room_presence_hydration_capped", {
+      row_count: notebooks.length,
+      hydrated_count: hydrated.length,
+      skipped_count: notebooks.length - hydrated.length,
+      counter: "notebook_list_room_presence_hydration_capped",
+      counter_delta: 1,
+    });
+  }
+
+  const presence = new Map<string, NotebookRoomSummaryOccupant[]>();
+  for (let index = 0; index < hydrated.length; index += NOTEBOOK_LIST_ROOM_SUMMARY_CONCURRENCY) {
+    const chunk = hydrated.slice(index, index + NOTEBOOK_LIST_ROOM_SUMMARY_CONCURRENCY);
+    await Promise.all(
+      chunk.map(async (notebook) => {
+        try {
+          const object = await bucket.get(roomSummaryKey(notebook.id));
+          if (!object) {
+            return;
+          }
+          const summary = parseNotebookRoomSummary(await object.text(), notebook.id);
+          if (!summary || roomSummaryIsStale(summary.updated_at)) {
+            return;
+          }
+          const peers = summary.occupants.filter(
+            (occupant) =>
+              isEditingRoomSummaryOccupant(occupant) &&
+              !roomSummaryOccupantMatchesRequester(occupant, requester),
+          );
+          if (peers.length > 0) {
+            presence.set(notebook.id, peers);
+          }
+        } catch (error) {
+          cloudLog("warn", "notebook_list.room_presence_hydration_failed", {
+            notebook_id: notebook.id,
+            error: errorMessage(error),
+            counter: "notebook_list_room_presence_hydration_failures",
+            counter_delta: 1,
+          });
+        }
+      }),
+    );
+  }
+
+  return presence;
+}
+
+function parseNotebookRoomSummary(value: string, notebookId: string): NotebookRoomSummary | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  const candidate = parsed as Partial<NotebookRoomSummary>;
+  if (
+    candidate.version !== 1 ||
+    candidate.notebook_id !== notebookId ||
+    typeof candidate.updated_at !== "string" ||
+    Number.isNaN(Date.parse(candidate.updated_at)) ||
+    !Array.isArray(candidate.occupants)
+  ) {
+    return null;
+  }
+  const occupants = candidate.occupants.filter(isNotebookRoomSummaryOccupant);
+  return {
+    version: 1,
+    notebook_id: notebookId,
+    occupants,
+    updated_at: candidate.updated_at,
+  };
+}
+
+function roomSummaryIsStale(updatedAt: string): boolean {
+  return Date.now() - Date.parse(updatedAt) > ROOM_SUMMARY_FRESH_MS;
+}
+
+function isNotebookRoomSummaryOccupant(value: unknown): value is NotebookRoomSummaryOccupant {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<NotebookRoomSummaryOccupant>;
+  return (
+    typeof candidate.participant_key === "string" &&
+    typeof candidate.actor_label === "string" &&
+    (candidate.display_name === undefined || typeof candidate.display_name === "string") &&
+    typeof candidate.connection_scope === "string"
+  );
+}
+
+// Dashboard presence means "editing now": only editor/owner occupants count.
+// Viewers (including anonymous public viewers) are recorded in the room
+// summary for a future viewing/editing split but must not mark a notebook
+// Active or read as editing here.
+function isEditingRoomSummaryOccupant(occupant: NotebookRoomSummaryOccupant): boolean {
+  return occupant.connection_scope === "editor" || occupant.connection_scope === "owner";
+}
+
+function roomSummaryOccupantMatchesRequester(
+  occupant: NotebookRoomSummaryOccupant,
+  requester: NotebookListRequesterPresence,
+): boolean {
+  if (occupant.participant_key === requester.principal) {
+    return true;
+  }
+  return Boolean(requester.actorLabel && occupant.actor_label === requester.actorLabel);
+}
+
+// The row UI shows three avatars + "+N"; eight keeps headroom without letting
+// a crowded room bloat every list payload.
+const MAX_NOTEBOOK_LIST_PEERS_PER_ROW = 8;
 
 function notebookListResponseRows(
   request: Request,
   notebooks: ListedNotebookRow[],
   env?: Env,
+  computeSessions: ReadonlyMap<string, NotebookComputeSessionSummary> = new Map(),
+  roomPresence: ReadonlyMap<string, NotebookRoomSummaryOccupant[]> = new Map(),
+  principalDisplays: ReadonlyMap<
+    string,
+    { displayName: string | null; avatarUrl: string | null }
+  > = new Map(),
 ): Array<Record<string, unknown>> {
   return notebooks.map((notebook) => {
     const notebookPathId = encodeURIComponent(notebook.id);
     const apiBasePath = `/api/n/${notebookPathId}`;
+    const composition = parseNotebookCellComposition(notebook.cell_composition);
+    const preview = parseNotebookPreviewCells(notebook.preview_cells);
+    const computeSession =
+      notebook.owner_principal === computeSessions.get(notebook.id)?.owner_principal
+        ? computeSessions.get(notebook.id)
+        : null;
+    const cover = notebookCoverResponse(notebook);
+    const peers = (roomPresence.get(notebook.id) ?? []).slice(0, MAX_NOTEBOOK_LIST_PEERS_PER_ROW);
+    const ownerProfile = principalDisplays.get(notebook.owner_principal);
+    const ownerResolved = principalDisplays.has(notebook.owner_principal);
     return {
       notebook_id: notebook.id,
       title: notebook.title,
@@ -1169,6 +1629,15 @@ function notebookListResponseRows(
       created_at: notebook.created_at,
       updated_at: notebook.updated_at,
       latest_revision_id: notebook.latest_revision_id,
+      ...(ownerProfile?.displayName ? { owner_display: ownerProfile.displayName } : {}),
+      ...(ownerProfile?.avatarUrl ? { owner_avatar: ownerProfile.avatarUrl } : {}),
+      owner_resolved: ownerResolved,
+      ...(composition ? { composition } : {}),
+      ...(preview?.length ? { preview } : {}),
+      ...(cover ? { cover } : {}),
+      ...(typeof notebook.language === "string" ? { language: notebook.language } : {}),
+      compute_session: computeSession,
+      ...(peers.length ? { peers } : {}),
       viewer_url: viewerUrlForRequest(request, notebook.id, notebook.title, env),
       endpoints: {
         catalog: apiBasePath,
@@ -1177,6 +1646,136 @@ function notebookListResponseRows(
       },
     };
   });
+}
+
+function notebookCoverResponse(notebook: {
+  cover_blob_hash?: string | null;
+  cover_mime?: string | null;
+}): { blob_hash: string; mime: "image/png" | "image/jpeg" | "image/svg+xml" } | undefined {
+  if (typeof notebook.cover_blob_hash !== "string" || !isNotebookCoverMime(notebook.cover_mime)) {
+    return undefined;
+  }
+  return { blob_hash: notebook.cover_blob_hash, mime: notebook.cover_mime };
+}
+
+function isNotebookCoverMime(
+  value: unknown,
+): value is "image/png" | "image/jpeg" | "image/svg+xml" {
+  return value === "image/png" || value === "image/jpeg" || value === "image/svg+xml";
+}
+
+function isRasterCoverMime(value: unknown): value is "image/png" | "image/jpeg" {
+  return value === "image/png" || value === "image/jpeg";
+}
+
+function normalizedBlobUploadContentType(contentType: string | null): string | null {
+  const mediaType =
+    contentType == null
+      ? DEFAULT_BLOB_UPLOAD_CONTENT_TYPE
+      : (contentType.split(";")[0]?.trim().toLowerCase() ?? "");
+  if (mediaType.length === 0) {
+    return null;
+  }
+  if (ALLOWED_EXACT_BLOB_UPLOAD_CONTENT_TYPES.has(mediaType)) {
+    return mediaType;
+  }
+  if (ALLOWED_PREFIXED_BLOB_UPLOAD_CONTENT_TYPES.some((prefix) => mediaType.startsWith(prefix))) {
+    return mediaType;
+  }
+  if (mediaType.startsWith("application/") && mediaType.endsWith("+json")) {
+    return mediaType;
+  }
+  return null;
+}
+
+function parseNotebookCellComposition(
+  value: string | null,
+): { code: number; markdown: number; raw: number } | undefined {
+  if (!value) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return undefined;
+  }
+  const composition = parsed as { code?: unknown; markdown?: unknown; raw?: unknown };
+  if (
+    isNotebookCellCount(composition.code) &&
+    isNotebookCellCount(composition.markdown) &&
+    isNotebookCellCount(composition.raw)
+  ) {
+    return {
+      code: composition.code,
+      markdown: composition.markdown,
+      raw: composition.raw,
+    };
+  }
+  return undefined;
+}
+
+function isNotebookCellCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function parseNotebookPreviewCells(
+  value: string | null,
+): SnapshotNotebookPreviewCell[] | undefined {
+  if (!value) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed) || parsed.length > 2) {
+    return undefined;
+  }
+  const preview: SnapshotNotebookPreviewCell[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object") {
+      return undefined;
+    }
+    const candidate = entry as {
+      execution_count?: unknown;
+      kind?: unknown;
+      text?: unknown;
+    };
+    if (candidate.kind !== "markdown" && candidate.kind !== "code") {
+      return undefined;
+    }
+    if (typeof candidate.text !== "string" || candidate.text.length === 0) {
+      return undefined;
+    }
+    const text = candidate.text.slice(0, SNAPSHOT_PREVIEW_TEXT_MAX_LENGTH);
+    if (candidate.kind === "markdown") {
+      if (candidate.execution_count !== undefined) {
+        return undefined;
+      }
+      preview.push({ kind: "markdown", text });
+      continue;
+    }
+    if (candidate.execution_count === undefined) {
+      preview.push({ kind: "code", text });
+      continue;
+    }
+    const executionCount = candidate.execution_count;
+    if (
+      typeof executionCount !== "number" ||
+      !Number.isSafeInteger(executionCount) ||
+      executionCount <= 0
+    ) {
+      return undefined;
+    }
+    preview.push({ kind: "code", text, execution_count: executionCount });
+  }
+  return preview;
 }
 
 function parseNotebookListLimit(request: Request): number | Response {
@@ -1192,10 +1791,27 @@ function parseNotebookListLimit(request: Request): number | Response {
   return Math.min(limit, MAX_NOTEBOOK_LIST_LIMIT);
 }
 
-const WORKSTATION_HEARTBEAT_STALE_MS = 90_000;
+const WORKSTATION_HEARTBEAT_STALE_MS = 3 * 60_000;
+// The lease a heartbeat renews in the registry DO expires after the same
+// window the lazy read-time check uses, so alarm-swept offline and read-time
+// offline agree. The DO's alarm makes the transition proactive instead of
+// only-on-read.
+const WORKSTATION_LEASE_TTL_MS = WORKSTATION_HEARTBEAT_STALE_MS;
 const MAX_WORKSTATION_ATTACH_JOBS_LIMIT = 25;
+const MISSING_WORKSTATION_RETRY_AFTER_SECONDS = 15 * 60;
+const MAX_WORKSTATION_ACCELERATORS = 16;
+const MAX_WORKSTATION_ACCELERATOR_COUNT = 1_024;
 
-async function routeWorkstations(request: Request, env: Env): Promise<Response> {
+interface WorkstationEventPresence {
+  connected: boolean;
+  connections: number;
+}
+
+async function routeWorkstations(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
   if (!env.DB) {
     return json({ error: "D1 binding DB is not configured" }, 503);
   }
@@ -1223,17 +1839,31 @@ async function routeWorkstations(request: Request, env: Env): Promise<Response> 
   const ownerPrincipal = await canonicalPrincipalForIdentity(env, identity);
 
   if (request.method === "GET") {
-    const [workstations, defaultWorkstationId] = await Promise.all([
+    const [workstations, defaultWorkstationId, leases, latestBuilds] = await Promise.all([
       listWorkstationsForPrincipal(env, ownerPrincipal),
       getDefaultWorkstationId(env, ownerPrincipal),
+      listWorkstationLeases(env, ownerPrincipal),
+      getLatestWorkstationBuildsForEnv(env, ctx),
     ]);
+    const now = Date.now();
+    const presenceByWorkstationId = await workstationEventPresenceById(
+      env,
+      ownerPrincipal,
+      workstations,
+      leases,
+      now,
+    );
     return json({
       ok: true,
       default_workstation_id: defaultWorkstationId,
+      latest_builds: latestWorkstationBuildVersionsByChannel(latestBuilds),
       workstations: workstations.map((workstation) =>
         workstationResponseRow(workstation, {
           defaultWorkstationId,
-          now: Date.now(),
+          now,
+          eventPresence: presenceByWorkstationId.get(workstation.workstation_id) ?? null,
+          lease: leases.get(workstation.workstation_id) ?? null,
+          latestBuilds,
         }),
       ),
     });
@@ -1256,6 +1886,15 @@ async function routeWorkstations(request: Request, env: Env): Promise<Response> 
   if (!workstation) {
     return json({ error: "workstation was not registered" }, 500);
   }
+  // Renew the registry-DO liveness lease alongside the D1 row. Best-effort:
+  // registration already succeeded, and the lazy read-time staleness check
+  // still stands if this write is dropped.
+  await upsertWorkstationLease(
+    env,
+    ownerPrincipal,
+    workstation.workstation_id,
+    WORKSTATION_LEASE_TTL_MS,
+  );
   if (identity.metadata.workstationPairingCodeId) {
     await linkWorkstationToPairing(
       env,
@@ -1274,16 +1913,82 @@ async function routeWorkstations(request: Request, env: Env): Promise<Response> 
     counter: "workstation_registrations",
     counter_delta: 1,
   });
+  const latestBuilds = await getLatestWorkstationBuildsForEnv(env, ctx);
   return json(
     {
       ok: true,
+      latest_builds: latestWorkstationBuildVersionsByChannel(latestBuilds),
       workstation: workstationResponseRow(workstation, {
         defaultWorkstationId,
         now: Date.now(),
+        eventPresence: null,
+        latestBuilds,
       }),
     },
     201,
   );
+}
+
+async function routeWorkstationDeregister(
+  request: Request,
+  env: Env,
+  workstationIdParam: string,
+): Promise<Response> {
+  if (!env.DB) {
+    return json({ error: "D1 binding DB is not configured" }, 503);
+  }
+
+  const originRejection = rejectUntrustedMutationOrigin(request, env);
+  if (originRejection) {
+    return originRejection;
+  }
+
+  const workstationId = boundedStringField(workstationIdParam, "workstation_id", 128);
+  if (workstationId instanceof Response) {
+    return workstationId;
+  }
+
+  const identity = await authenticateRequestOrAppSessionOrResponse(request, env, "owner", {
+    allowWorkstationCredential: true,
+  });
+  if (identity instanceof Response) {
+    return identity;
+  }
+  if (isAnonymousViewer(identity)) {
+    return json({ error: "sign in to deregister a workstation" }, 401);
+  }
+
+  const ownerPrincipal = await canonicalPrincipalForIdentity(env, identity);
+  const workstation = await getWorkstationRow(env, ownerPrincipal, workstationId);
+  if (!workstation) {
+    return missingWorkstationResponse();
+  }
+
+  const leaseDelete = await deleteWorkstationLease(env, ownerPrincipal, workstationId);
+  const deleted = await deleteRegisteredWorkstation(env, ownerPrincipal, workstationId);
+  if (!deleted) {
+    return missingWorkstationResponse();
+  }
+  if (leaseDelete.went_offline) {
+    await notifyWorkstationWentOffline(
+      env,
+      ownerPrincipal,
+      workstationId,
+      leaseDelete.reason ?? "workstation deregistered",
+    );
+  }
+
+  cloudLog("info", "workstation.deregistered", {
+    principal: ownerPrincipal,
+    workstation_id: workstationId,
+    counter: "workstation_deregistrations",
+    counter_delta: 1,
+  });
+  return json({
+    ok: true,
+    workstation_id: workstationId,
+    deregistered: true,
+  });
 }
 
 async function routeDefaultWorkstation(request: Request, env: Env): Promise<Response> {
@@ -1552,43 +2257,55 @@ async function routeNotebookWorkstationAttachment(
     return identity;
   }
 
-  const payload = await readOptionalJsonObject(request, "workstation attachment body");
+  const payload = await readRequiredJsonObject(request, "workstation attachment body");
   if (payload instanceof Response) {
     return payload;
   }
 
   const ownerPrincipal = await canonicalPrincipalForIdentity(env, identity);
-  const explicitWorkstationId = optionalBoundedStringField(
-    payload?.workstation_id ?? payload?.workstationId,
+  const workstationId = boundedStringField(
+    payload.workstation_id ?? payload.workstationId,
     "workstation_id",
     128,
   );
-  if (explicitWorkstationId instanceof Response) {
-    return explicitWorkstationId;
-  }
-  const workstationId =
-    explicitWorkstationId ?? (await getDefaultWorkstationId(env, ownerPrincipal));
-  if (!workstationId) {
-    return json({ error: "choose a default workstation before attaching compute" }, 409);
+  if (workstationId instanceof Response) {
+    return workstationId;
   }
   const replaceExisting =
-    payload?.replace_existing === true ||
-    payload?.replaceExisting === true ||
-    payload?.intent === "restart";
+    payload.replace_existing === true ||
+    payload.replaceExisting === true ||
+    payload.intent === "restart";
 
   const workstation = await getWorkstationRow(env, ownerPrincipal, workstationId);
   if (!workstation) {
     return json({ error: "workstation not found" }, 404);
   }
 
-  const projectedStatus = workstationStatusForResponse(workstation, Date.now());
+  const [defaultWorkstationId, eventPresence, leases] = await Promise.all([
+    getDefaultWorkstationId(env, ownerPrincipal),
+    workstationEventPresence(env, ownerPrincipal, workstationId),
+    listWorkstationLeases(env, ownerPrincipal),
+  ]);
+  const lease = leases.get(workstationId) ?? null;
+  const projectedStatus = workstationStatusForResponse(
+    workstation,
+    Date.now(),
+    eventPresence,
+    lease,
+  );
   if (projectedStatus !== "online") {
+    await repairNotebookRuntimeStateIfNoRuntimePeer(env, notebookId, {
+      reason: `workstation ${workstationId} is not online while attaching compute`,
+      operation: "offline_workstation_attach",
+    });
     return json(
       {
         error: "workstation is not online",
         workstation: workstationResponseRow(workstation, {
-          defaultWorkstationId: workstationId,
+          defaultWorkstationId,
           now: Date.now(),
+          eventPresence,
+          lease,
         }),
       },
       409,
@@ -1602,20 +2319,30 @@ async function routeNotebookWorkstationAttachment(
     scope: "runtime_peer",
     actorLabel: identity.actorLabel,
   });
-  const job = await createWorkstationAttachJob(env, {
+  const attachJob = await createWorkstationAttachJob(env, {
     notebookId,
     ownerPrincipal,
     replaceActive: replaceExisting,
+    trigger: "user_attach",
     workstationId,
     actorLabel: identity.actorLabel,
   });
-  if (!job) {
+  if (!attachJob) {
     return json({ error: "workstation attach job was not created" }, 500);
   }
+  const { job } = attachJob;
+  const switchedWorkstations =
+    attachJob.cancelledActiveJob !== null &&
+    attachJob.cancelledActiveJob.workstation_id !== workstationId;
   await publishWorkstationAttachJobRuntimeState(env, job, workstation, {
-    closeRuntimePeers: replaceExisting,
-    closeReason: replaceExisting ? "workstation restart requested" : undefined,
+    closeRuntimePeers: replaceExisting || switchedWorkstations,
+    closeReason: replaceExisting
+      ? "workstation restart requested"
+      : switchedWorkstations
+        ? "workstation attachment switched"
+        : undefined,
   });
+  await notifyWorkstationAttachJob(env, ownerPrincipal, job);
 
   cloudLog("info", "workstation.attach.requested", {
     notebook_id: notebookId,
@@ -1631,8 +2358,10 @@ async function routeNotebookWorkstationAttachment(
       ok: true,
       job: workstationAttachJobResponseRow(request, job),
       workstation: workstationResponseRow(workstation, {
-        defaultWorkstationId: workstationId,
+        defaultWorkstationId,
         now: Date.now(),
+        eventPresence,
+        lease,
       }),
     },
     202,
@@ -1699,6 +2428,48 @@ async function routeNotebookRuntimeStateRepair(
   return json(body, response.status);
 }
 
+async function routeWorkstationEvents(
+  request: Request,
+  env: Env,
+  workstationId: string,
+): Promise<Response> {
+  if (!env.DB) {
+    return json({ error: "D1 binding DB is not configured" }, 503);
+  }
+  if (!env.WORKSTATION_EVENTS) {
+    return json({ error: "workstation event socket is not configured" }, 503);
+  }
+  if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+    return json({ error: "expected WebSocket upgrade" }, 426);
+  }
+
+  const identity = await authenticateRequestOrResponse(request, env, {
+    allowWorkstationCredential: true,
+  });
+  if (identity instanceof Response) {
+    return identity;
+  }
+  if (isAnonymousViewer(identity)) {
+    return json({ error: "sign in to open workstation events" }, 401);
+  }
+
+  const ownerPrincipal = await canonicalPrincipalForIdentity(env, identity);
+  const workstation = await getWorkstationRow(env, ownerPrincipal, workstationId);
+  if (!workstation) {
+    return missingWorkstationResponse();
+  }
+
+  const stub = workstationEventsStub(env, ownerPrincipal, workstationId);
+  return stub.fetch(
+    new Request(
+      `https://workstation-events.internal/stream?workstation_id=${encodeURIComponent(
+        workstationId,
+      )}`,
+      request,
+    ),
+  );
+}
+
 async function routeWorkstationAttachJobs(
   request: Request,
   env: Env,
@@ -1721,22 +2492,280 @@ async function routeWorkstationAttachJobs(
   const ownerPrincipal = await canonicalPrincipalForIdentity(env, identity);
   const workstation = await getWorkstationRow(env, ownerPrincipal, workstationId);
   if (!workstation) {
-    return json({ error: "workstation not found" }, 404);
+    return missingWorkstationResponse();
   }
 
   const limit = parseWorkstationAttachJobsLimit(request);
   if (limit instanceof Response) {
     return limit;
   }
-  const jobs = await listActiveWorkstationAttachJobs(env, ownerPrincipal, workstationId, limit);
+  const { expiredPendingJobs, jobs } = await listActiveWorkstationAttachJobs(
+    env,
+    ownerPrincipal,
+    workstationId,
+    limit,
+  );
+  await Promise.all(
+    expiredPendingJobs.map((job) =>
+      repairNotebookRuntimeStateIfNoRuntimePeer(env, job.notebook_id, {
+        reason:
+          job.error_message ?? "pending workstation attach job expired before host accepted it",
+        operation: "workstation_attach_job_pending_expired",
+        expectedRuntimeSessionId: job.id,
+      }),
+    ),
+  );
+  const [defaultWorkstationId, leases] = await Promise.all([
+    getDefaultWorkstationId(env, ownerPrincipal),
+    listWorkstationLeases(env, ownerPrincipal),
+  ]);
+  const lease = leases.get(workstationId) ?? null;
   return json({
     ok: true,
     workstation: workstationResponseRow(workstation, {
-      defaultWorkstationId: await getDefaultWorkstationId(env, ownerPrincipal),
+      defaultWorkstationId,
       now: Date.now(),
+      lease,
     }),
     jobs: jobs.map((job) => workstationAttachJobResponseRow(request, job)),
   });
+}
+
+async function notifyWorkstationAttachJob(
+  env: Env,
+  ownerPrincipal: string,
+  job: WorkstationAttachJobRow,
+): Promise<void> {
+  if (!env.WORKSTATION_EVENTS) {
+    return;
+  }
+  const notification: WorkstationAttachJobNotification = {
+    event: "attach_jobs",
+    workstation_id: job.workstation_id,
+    job_id: job.id,
+    notebook_id: job.notebook_id,
+    status: job.status,
+    requested_at: job.requested_at,
+    updated_at: job.updated_at,
+  };
+  try {
+    const response = await workstationEventsStub(env, ownerPrincipal, job.workstation_id).fetch(
+      new Request("https://workstation-events.internal/notify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(notification),
+      }),
+    );
+    if (response.ok) {
+      return;
+    }
+    cloudLog("warn", "workstation.events.notify_failed", {
+      principal: ownerPrincipal,
+      workstation_id: job.workstation_id,
+      job_id: job.id,
+      response_status: response.status,
+      counter: "workstation_events_notify_failed",
+      counter_delta: 1,
+    });
+  } catch (error) {
+    cloudLog("warn", "workstation.events.notify_failed", {
+      principal: ownerPrincipal,
+      workstation_id: job.workstation_id,
+      job_id: job.id,
+      error: error instanceof Error ? error.message : String(error),
+      counter: "workstation_events_notify_failed",
+      counter_delta: 1,
+    });
+  }
+}
+
+async function notifyWorkstationWentOffline(
+  env: Env,
+  ownerPrincipal: string,
+  workstationId: string,
+  reason: string,
+): Promise<void> {
+  if (!env.WORKSTATION_EVENTS) {
+    return;
+  }
+  try {
+    const response = await workstationEventsStub(env, ownerPrincipal, workstationId).fetch(
+      new Request("https://workstation-events.internal/notify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          event: "went_offline",
+          workstation_id: workstationId,
+          reason,
+        }),
+      }),
+    );
+    if (response.ok) {
+      return;
+    }
+    cloudLog("warn", "workstation.events.went_offline_notify_failed", {
+      principal: ownerPrincipal,
+      workstation_id: workstationId,
+      response_status: response.status,
+      counter: "workstation_events_went_offline_notify_failed",
+      counter_delta: 1,
+    });
+  } catch (error) {
+    cloudLog("warn", "workstation.events.went_offline_notify_failed", {
+      principal: ownerPrincipal,
+      workstation_id: workstationId,
+      error: error instanceof Error ? error.message : String(error),
+      counter: "workstation_events_went_offline_notify_failed",
+      counter_delta: 1,
+    });
+  }
+}
+
+async function deleteRegisteredWorkstation(
+  env: Env,
+  ownerPrincipal: string,
+  workstationId: string,
+): Promise<boolean> {
+  if (!env.DB) {
+    return false;
+  }
+  await env.DB.prepare(
+    `DELETE FROM workstation_defaults
+      WHERE owner_principal = ?
+        AND workstation_id = ?`,
+  )
+    .bind(ownerPrincipal, workstationId)
+    .run();
+  const result = await env.DB.prepare(
+    `DELETE FROM workstations
+      WHERE owner_principal = ?
+        AND workstation_id = ?`,
+  )
+    .bind(ownerPrincipal, workstationId)
+    .run();
+  return d1MutationChanges(result) > 0;
+}
+
+function d1MutationChanges(result: { meta?: Record<string, unknown> }): number {
+  const changes = result.meta?.changes;
+  return typeof changes === "number" ? changes : 0;
+}
+
+function workstationEventsStub(
+  env: Env,
+  ownerPrincipal: string,
+  workstationId: string,
+): DurableObjectStub {
+  const id = env.WORKSTATION_EVENTS!.idFromName(
+    workstationEventsObjectName(ownerPrincipal, workstationId),
+  );
+  return env.WORKSTATION_EVENTS!.get(id);
+}
+
+function missingWorkstationResponse(): Response {
+  const response = json(
+    {
+      error: "workstation not found",
+      code: "workstation_not_found",
+    },
+    404,
+  );
+  response.headers.set("Retry-After", MISSING_WORKSTATION_RETRY_AFTER_SECONDS.toString());
+  return response;
+}
+
+async function workstationEventPresenceById(
+  env: Env,
+  ownerPrincipal: string,
+  workstations: readonly WorkstationRow[],
+  leases: ReadonlyMap<string, WorkstationLeaseRecord>,
+  now: number,
+): Promise<Map<string, WorkstationEventPresence | null>> {
+  if (!env.WORKSTATION_EVENTS || workstations.length === 0) {
+    return new Map();
+  }
+  const staleWorkstations = workstations.filter((workstation) =>
+    workstationListNeedsEventPresence(
+      workstation,
+      now,
+      leases.get(workstation.workstation_id) ?? null,
+    ),
+  );
+  if (staleWorkstations.length === 0) {
+    return new Map();
+  }
+  const entries = await Promise.all(
+    staleWorkstations.map(async (workstation) => {
+      const presence = await workstationEventPresence(
+        env,
+        ownerPrincipal,
+        workstation.workstation_id,
+      );
+      return [workstation.workstation_id, presence] as const;
+    }),
+  );
+  return new Map(entries);
+}
+
+function workstationListNeedsEventPresence(
+  workstation: WorkstationRow,
+  now: number,
+  lease: WorkstationLeaseRecord | null | undefined,
+): boolean {
+  if (workstation.status !== "online" || !workstation.last_seen_at) {
+    return false;
+  }
+  if (lease && workstationLeaseIsFreshEnough(workstation, lease)) {
+    return false;
+  }
+  const lastSeen = Date.parse(workstation.last_seen_at);
+  return Number.isFinite(lastSeen) && now - lastSeen > WORKSTATION_HEARTBEAT_STALE_MS;
+}
+
+async function workstationEventPresence(
+  env: Env,
+  ownerPrincipal: string,
+  workstationId: string,
+): Promise<WorkstationEventPresence | null> {
+  if (!env.WORKSTATION_EVENTS) {
+    return null;
+  }
+  try {
+    const response = await workstationEventsStub(env, ownerPrincipal, workstationId).fetch(
+      new Request(
+        `https://workstation-events.internal/status?workstation_id=${encodeURIComponent(
+          workstationId,
+        )}`,
+      ),
+    );
+    if (!response.ok) {
+      cloudLog("warn", "workstation.events.status_failed", {
+        principal: ownerPrincipal,
+        workstation_id: workstationId,
+        response_status: response.status,
+        counter: "workstation_events_status_failed",
+        counter_delta: 1,
+      });
+      return null;
+    }
+    const body = await response.json().catch(() => null);
+    if (!isRecord(body)) {
+      return null;
+    }
+    return {
+      connected: body.connected === true,
+      connections: typeof body.connections === "number" ? body.connections : 0,
+    };
+  } catch (error) {
+    cloudLog("warn", "workstation.events.status_failed", {
+      principal: ownerPrincipal,
+      workstation_id: workstationId,
+      error: error instanceof Error ? error.message : String(error),
+      counter: "workstation_events_status_failed",
+      counter_delta: 1,
+    });
+    return null;
+  }
 }
 
 async function routeWorkstationAttachJob(
@@ -1812,6 +2841,14 @@ async function routeWorkstationAttachJob(
   const workstation = await getWorkstationRow(env, ownerPrincipal, workstationId);
   if (workstation) {
     await publishWorkstationAttachJobRuntimeState(env, job, workstation);
+  }
+  if (job.status === "failed" || job.status === "cancelled") {
+    await repairNotebookRuntimeStateIfNoRuntimePeer(env, job.notebook_id, {
+      reason:
+        job.error_message ?? `workstation attach job ${job.status} before a runtime peer attached`,
+      operation: `workstation_attach_job_${job.status}`,
+      expectedRuntimeSessionId: job.id,
+    });
   }
   return json({
     ok: true,
@@ -1950,6 +2987,18 @@ function parseWorkstationRegistrationPayload(
   if (environmentPolicy instanceof Response) {
     return environmentPolicy;
   }
+  const installedBuild = optionalBoundedStringField(
+    payload.installed_build ?? payload.installedBuild,
+    "installed_build",
+    160,
+  );
+  if (installedBuild instanceof Response) {
+    return installedBuild;
+  }
+  const channel = optionalBoundedStringField(payload.channel, "channel", 40);
+  if (channel instanceof Response) {
+    return channel;
+  }
   const workingDirectory = optionalBoundedStringField(
     payload.working_directory ?? payload.workingDirectory,
     "working_directory",
@@ -1969,6 +3018,10 @@ function parseWorkstationRegistrationPayload(
   if (memoryBytes instanceof Response) {
     return memoryBytes;
   }
+  const acceleratorsJson = normalizeWorkstationAcceleratorsJson(payload.accelerators);
+  if (acceleratorsJson instanceof Response) {
+    return acceleratorsJson;
+  }
   const environmentsJson = normalizeWorkstationEnvironmentsJson(payload.environments);
   if (environmentsJson instanceof Response) {
     return environmentsJson;
@@ -1982,11 +3035,91 @@ function parseWorkstationRegistrationPayload(
     statusMessage,
     defaultEnvironmentLabel,
     environmentPolicy,
+    installedBuild,
+    channel,
     workingDirectory,
     cpuCount,
     memoryBytes,
+    acceleratorsJson,
     environmentsJson,
   };
+}
+
+function normalizeWorkstationAcceleratorsJson(value: unknown): string | null | Response {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!Array.isArray(value)) {
+    return json({ error: "accelerators must be an array" }, 400);
+  }
+  if (value.length > MAX_WORKSTATION_ACCELERATORS) {
+    return json(
+      { error: `accelerators must contain at most ${MAX_WORKSTATION_ACCELERATORS} entries` },
+      400,
+    );
+  }
+
+  const normalized: WorkstationAccelerator[] = [];
+  for (const [index, rawAccelerator] of value.entries()) {
+    const field = `accelerators[${index}]`;
+    if (!isRecord(rawAccelerator)) {
+      return json({ error: `${field} must be a JSON object` }, 400);
+    }
+    const kind = boundedStringField(rawAccelerator.kind, `${field}.kind`, 40);
+    if (kind instanceof Response) {
+      return kind;
+    }
+    const vendor = optionalBoundedStringField(rawAccelerator.vendor, `${field}.vendor`, 120);
+    if (vendor instanceof Response) {
+      return vendor;
+    }
+    const model = optionalBoundedStringField(rawAccelerator.model, `${field}.model`, 160);
+    if (model instanceof Response) {
+      return model;
+    }
+    const count = boundedPositiveIntegerField(
+      rawAccelerator.count,
+      `${field}.count`,
+      MAX_WORKSTATION_ACCELERATOR_COUNT,
+    );
+    if (count instanceof Response) {
+      return count;
+    }
+    const memoryBytesPerDevice = optionalSafePositiveIntegerField(
+      rawAccelerator.memory_bytes_per_device ?? rawAccelerator.memoryBytesPerDevice,
+      `${field}.memory_bytes_per_device`,
+    );
+    if (memoryBytesPerDevice instanceof Response) {
+      return memoryBytesPerDevice;
+    }
+    const readinessValue = boundedStringField(rawAccelerator.readiness, `${field}.readiness`, 24);
+    if (readinessValue instanceof Response) {
+      return readinessValue;
+    }
+    const readiness = readinessValue.toLowerCase();
+    if (!isWorkstationAcceleratorReadiness(readiness)) {
+      return json({ error: `${field}.readiness must be ready, not_ready, or unknown` }, 400);
+    }
+    const diagnostic = optionalBoundedStringField(
+      rawAccelerator.diagnostic,
+      `${field}.diagnostic`,
+      240,
+    );
+    if (diagnostic instanceof Response) {
+      return diagnostic;
+    }
+
+    normalized.push({
+      kind: kind.toLowerCase(),
+      vendor,
+      model,
+      count,
+      memory_bytes_per_device: memoryBytesPerDevice,
+      readiness,
+      diagnostic,
+    });
+  }
+  return JSON.stringify(normalized);
 }
 
 function normalizeWorkstationEnvironmentsJson(value: unknown): string | null | Response {
@@ -2036,9 +3169,22 @@ function normalizeWorkstationEnvironmentsJson(value: unknown): string | null | R
 
 function workstationResponseRow(
   workstation: WorkstationRow,
-  options: { defaultWorkstationId: string | null; now: number },
+  options: {
+    defaultWorkstationId: string | null;
+    now: number;
+    eventPresence?: WorkstationEventPresence | null;
+    lease?: WorkstationLeaseRecord | null;
+    latestBuilds?: LatestWorkstationBuildMap;
+  },
 ): Record<string, unknown> {
-  const status = workstationStatusForResponse(workstation, options.now);
+  const status = workstationStatusForResponse(
+    workstation,
+    options.now,
+    options.eventPresence,
+    options.lease,
+  );
+  const latestBuild = latestWorkstationBuildForChannel(options.latestBuilds, workstation.channel);
+  const accelerators = parseStoredWorkstationAccelerators(workstation.accelerators_json);
   return {
     workstation_id: workstation.workstation_id,
     display_name: workstation.display_name,
@@ -2046,14 +3192,23 @@ function workstationResponseRow(
     provider_label: workstation.provider_label,
     status,
     status_message:
-      status === "offline" && workstation.status === "online"
-        ? "No heartbeat from this workstation recently."
-        : workstation.status_message,
+      status === "offline" && options.eventPresence?.connected === false
+        ? "Workstation event socket is not connected."
+        : status === "online" && options.eventPresence?.connected === true
+          ? workstation.status_message
+          : status === "offline" && workstation.status === "online"
+            ? "No heartbeat from this workstation recently."
+            : workstation.status_message,
     default_environment_label: workstation.default_environment_label,
     environment_policy: workstation.environment_policy,
+    installed_build: workstation.installed_build,
+    channel: workstation.channel,
+    latest_build: latestBuild,
+    is_outdated: isWorkstationBuildOutdated(workstation.installed_build, latestBuild),
     working_directory: workstation.working_directory,
     cpu_count: workstation.cpu_count,
     memory_bytes: workstation.memory_bytes,
+    ...(accelerators === null ? {} : { accelerators }),
     environments: parseStoredWorkstationEnvironments(workstation.environments_json),
     created_at: workstation.created_at,
     updated_at: workstation.updated_at,
@@ -2062,7 +3217,66 @@ function workstationResponseRow(
   };
 }
 
-function workstationStatusForResponse(workstation: WorkstationRow, now: number): WorkstationStatus {
+function parseStoredWorkstationAccelerators(value: string | null): WorkstationAccelerator[] | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) && parsed.every(isWorkstationAccelerator) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isWorkstationAccelerator(value: unknown): value is WorkstationAccelerator {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.kind === "string" &&
+    value.kind.length > 0 &&
+    (value.vendor === null || typeof value.vendor === "string") &&
+    (value.model === null || typeof value.model === "string") &&
+    typeof value.count === "number" &&
+    Number.isSafeInteger(value.count) &&
+    value.count > 0 &&
+    (value.memory_bytes_per_device === null ||
+      (typeof value.memory_bytes_per_device === "number" &&
+        Number.isSafeInteger(value.memory_bytes_per_device) &&
+        value.memory_bytes_per_device > 0)) &&
+    isWorkstationAcceleratorReadiness(value.readiness) &&
+    (value.diagnostic === null || typeof value.diagnostic === "string")
+  );
+}
+
+function isWorkstationAcceleratorReadiness(
+  value: unknown,
+): value is WorkstationAcceleratorReadiness {
+  return value === "ready" || value === "not_ready" || value === "unknown";
+}
+
+export function workstationStatusForResponse(
+  workstation: WorkstationRow,
+  now: number,
+  eventPresence: WorkstationEventPresence | null | undefined = null,
+  lease: WorkstationLeaseRecord | null | undefined = null,
+): WorkstationStatus {
+  const statusUsesLiveness = workstation.status === "online" || workstation.status === "offline";
+  // The registry-DO lease is the proactive liveness signal: its alarm sweeps a
+  // workstation offline at expiry instead of waiting for a read to notice.
+  // Still check the expiry timestamp directly so a late alarm can't report a
+  // lapsed lease as live. Only trust the lease when it is at least as fresh as
+  // the D1 row: a heartbeat writes D1 first and the paired lease write is
+  // best-effort, so if that write lagged or failed, D1 is the newer signal and
+  // a stale offline lease must not override it. Falls back to the lazy D1
+  // staleness check when no (or a stale) lease exists.
+  if (statusUsesLiveness && lease && workstationLeaseIsFreshEnough(workstation, lease)) {
+    return lease.online && lease.lease_expires_at > now ? "online" : "offline";
+  }
+  if (statusUsesLiveness && eventPresence?.connected === true) {
+    return "online";
+  }
   if (workstation.status === "online" && workstation.last_seen_at) {
     const lastSeen = Date.parse(workstation.last_seen_at);
     if (Number.isFinite(lastSeen) && now - lastSeen > WORKSTATION_HEARTBEAT_STALE_MS) {
@@ -2070,6 +3284,15 @@ function workstationStatusForResponse(workstation: WorkstationRow, now: number):
     }
   }
   return workstation.status;
+}
+
+function workstationLeaseIsFreshEnough(
+  workstation: WorkstationRow,
+  lease: WorkstationLeaseRecord,
+): boolean {
+  const rowSeen = workstation.last_seen_at ? Date.parse(workstation.last_seen_at) : NaN;
+  const leaseSeen = Date.parse(lease.last_seen_at);
+  return !Number.isFinite(rowSeen) || (Number.isFinite(leaseSeen) && leaseSeen >= rowSeen);
 }
 
 function parseStoredWorkstationEnvironments(value: string | null): unknown[] {
@@ -2093,6 +3316,7 @@ function workstationAttachJobResponseRow(
     notebook_id: job.notebook_id,
     workstation_id: job.workstation_id,
     status: job.status,
+    trigger: job.trigger,
     requested_at: job.requested_at,
     updated_at: job.updated_at,
     accepted_at: job.accepted_at,
@@ -2164,6 +3388,56 @@ async function publishWorkstationAttachJobRuntimeState(
   }
 }
 
+async function repairNotebookRuntimeStateIfNoRuntimePeer(
+  env: Env,
+  notebookId: string,
+  options: {
+    expectedRuntimeSessionId?: string | null;
+    operation: string;
+    reason: string;
+  },
+): Promise<void> {
+  const id = env.NOTEBOOK_ROOMS.idFromName(notebookId);
+  const room = env.NOTEBOOK_ROOMS.get(id);
+  try {
+    const response = await room.fetch(
+      new Request(
+        `https://notebook-room.internal/internal/n/${encodeURIComponent(
+          notebookId,
+        )}/runtime-state-repair`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            reason: options.reason,
+            ...(options.expectedRuntimeSessionId
+              ? { expected_runtime_session_id: options.expectedRuntimeSessionId }
+              : {}),
+          }),
+        },
+      ),
+    );
+    if (response.ok || response.status === 409) {
+      return;
+    }
+    cloudLog("warn", "workstation.attach.runtime_state_repair_failed", {
+      notebook_id: notebookId,
+      operation: options.operation,
+      response_status: response.status,
+      counter: "workstation_attach_runtime_state_repair_failed",
+      counter_delta: 1,
+    });
+  } catch (error) {
+    cloudLog("warn", "workstation.attach.runtime_state_repair_failed", {
+      notebook_id: notebookId,
+      operation: options.operation,
+      error: error instanceof Error ? error.message : String(error),
+      counter: "workstation_attach_runtime_state_repair_failed",
+      counter_delta: 1,
+    });
+  }
+}
+
 function workstationAttachmentStateForJob(
   job: WorkstationAttachJobRow,
   workstation: WorkstationRow,
@@ -2177,6 +3451,7 @@ function workstationAttachmentStateForJob(
       environmentPolicy: workstation.environment_policy,
       cpuCount: workstation.cpu_count,
       memoryBytes: workstation.memory_bytes,
+      accelerators: parseStoredWorkstationAccelerators(workstation.accelerators_json),
       workingDirectory: workstation.working_directory,
     },
     claim: {
@@ -2257,6 +3532,18 @@ function viewerUrlForRequest(
   const url = new URL(trustedLoopbackBrowserOrigin(request, env) ?? request.url);
   const vanitySegment = vanityName?.trim() || "notebook";
   url.pathname = `/n/${encodeURIComponent(notebookId)}/${encodeURIComponent(vanitySegment)}`;
+  url.search = "";
+  url.hash = "";
+  return url.href;
+}
+
+function latestNotebookOgImageUrlForRequest(
+  request: Request,
+  env: Env,
+  notebookId: string,
+): string {
+  const url = new URL(trustedLoopbackBrowserOrigin(request, env) ?? request.url);
+  url.pathname = `/n/${encodeURIComponent(notebookId)}/r/latest/ogImage.png`;
   url.search = "";
   url.hash = "";
   return url.href;
@@ -2414,6 +3701,35 @@ async function routeSnapshot(
   } catch (error) {
     await env.NOTEBOOK_SNAPSHOTS.delete(key).catch(() => undefined);
     throw error;
+  }
+
+  try {
+    await updateNotebookSnapshotSummary(env, notebookId, validated.summary);
+  } catch (error) {
+    cloudLog("warn", "snapshot.summary.update_failed", {
+      notebook_id: notebookId,
+      notebook_heads_hash: headsHash,
+      revision_id: revisionId,
+      error: errorMessage(error),
+      counter: "snapshot_summary_update_failures",
+      counter_delta: 1,
+    });
+  }
+
+  if (validated.summary.cover) {
+    try {
+      await updateNotebookRevisionCover(env, revisionId, validated.summary.cover);
+    } catch (error) {
+      cloudLog("warn", "snapshot.cover.update_failed", {
+        notebook_id: notebookId,
+        notebook_heads_hash: headsHash,
+        revision_id: revisionId,
+        cover_mime: validated.summary.cover.mime,
+        error: errorMessage(error),
+        counter: "snapshot_cover_update_failures",
+        counter_delta: 1,
+      });
+    }
   }
 
   return json(
@@ -2766,6 +4082,197 @@ async function routeNotebookInvite(
 
 interface AccessRequestActionPayload {
   action?: unknown;
+}
+
+const AUTHOR_PROFILE_LOOKUP_LIMIT = 100;
+const AUTHOR_PROFILE_ACTOR_LABEL_MAX_LENGTH = 512;
+
+async function routeNotebookAuthorProfiles(
+  request: Request,
+  env: Env,
+  notebookId: string,
+): Promise<Response> {
+  if (!env.DB) {
+    return json({ error: "D1 binding DB is not configured" }, 503);
+  }
+
+  const identity = await authenticateAndAuthorizeOrAppSessionOrResponse(
+    request,
+    env,
+    notebookId,
+    "viewer",
+  );
+  if (identity instanceof Response) {
+    return identity;
+  }
+
+  const principals = requestedAuthorProfilePrincipals(new URL(request.url).searchParams);
+  if (principals instanceof Response) {
+    return principals;
+  }
+
+  const allowedPrincipals = await notebookAuthorProfileAllowedPrincipals(env, notebookId);
+  const commentAuthorPrincipals = await notebookCommentAuthorPrincipals(env, notebookId);
+  const profileLookups = await allowedAuthorProfileLookups(
+    env,
+    principals,
+    allowedPrincipals,
+    commentAuthorPrincipals,
+  );
+  const profilePrincipals = Array.from(
+    new Set(profileLookups.flatMap((lookup) => lookup.profilePrincipals)),
+  );
+  const profilesByPrincipal = new Map(
+    (await getPrincipalProfiles(env, profilePrincipals)).map((profile) => [
+      profile.principal,
+      profile,
+    ]),
+  );
+  return json({
+    notebook_id: notebookId,
+    profiles: profileLookups.map((lookup) =>
+      authorProfileResponse(
+        lookup.requestedPrincipal,
+        lookup.profilePrincipals.map((principal) => profilesByPrincipal.get(principal) ?? null),
+      ),
+    ),
+  });
+}
+
+function requestedAuthorProfilePrincipals(params: URLSearchParams): string[] | Response {
+  const principals = new Set<string>();
+  for (const actorLabel of params.getAll("actor_label")) {
+    const trimmed = actorLabel.trim();
+    if (!trimmed || trimmed.length > AUTHOR_PROFILE_ACTOR_LABEL_MAX_LENGTH) {
+      continue;
+    }
+    try {
+      principals.add(parseActorLabel(trimmed).principal);
+    } catch {
+      continue;
+    }
+  }
+
+  if (principals.size > AUTHOR_PROFILE_LOOKUP_LIMIT) {
+    return json(
+      {
+        error: `author profile lookup is limited to ${AUTHOR_PROFILE_LOOKUP_LIMIT} principals`,
+      },
+      400,
+    );
+  }
+  return Array.from(principals);
+}
+
+function authorProfileResponse(
+  principal: string,
+  rows: readonly (PrincipalProfileRow | null)[],
+): Record<string, unknown> {
+  const nameRow = rows.find((candidate) => candidate?.display_name?.trim());
+  const label = nameRow?.display_name?.trim() ?? null;
+  const avatarRow = nameRow?.avatar_url?.trim()
+    ? nameRow
+    : rows.find((candidate) => candidate?.avatar_url?.trim());
+  // Every allowed principal returns an entry; `resolved` marks whether the host
+  // has a display name. Unresolved entries (label null) let the user store tell
+  // "no profile yet" from "never looked up", and the comments client's
+  // non-empty-label validator ignores them. The caller's gate omits non-allowed
+  // principals entirely, so this is never a principal-existence oracle.
+  return {
+    principal,
+    label,
+    image_url: avatarRow?.avatar_url?.trim() ?? null,
+    resolved: label !== null,
+  };
+}
+
+async function notebookAuthorProfileAllowedPrincipals(
+  env: Env,
+  notebookId: string,
+): Promise<Set<string>> {
+  const allowed = new Set<string>();
+  const notebook = await getNotebookRow(env, notebookId);
+  if (notebook?.owner_principal) {
+    allowed.add(notebook.owner_principal);
+  }
+  for (const row of await getNotebookAclRows(env, notebookId)) {
+    if (row.subject_kind === "principal") {
+      allowed.add(row.subject);
+    }
+  }
+  return allowed;
+}
+
+async function notebookCommentAuthorPrincipals(env: Env, notebookId: string): Promise<Set<string>> {
+  const id = env.NOTEBOOK_ROOMS.idFromName(notebookId);
+  const room = env.NOTEBOOK_ROOMS.get(id);
+  const response = await room.fetch(
+    new Request(
+      `https://notebook-room.internal/internal/n/${encodeURIComponent(notebookId)}/comment-authors`,
+      { method: "GET" },
+    ),
+  );
+  if (!response.ok) {
+    return new Set();
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    return new Set();
+  }
+  if (!isRecord(body) || !Array.isArray(body.actor_labels)) {
+    return new Set();
+  }
+  const principals = new Set<string>();
+  for (const actorLabel of body.actor_labels) {
+    if (typeof actorLabel !== "string") {
+      continue;
+    }
+    try {
+      principals.add(parseActorLabel(actorLabel).principal);
+    } catch {
+      continue;
+    }
+  }
+  return principals;
+}
+
+interface AuthorProfileLookup {
+  requestedPrincipal: string;
+  profilePrincipals: string[];
+}
+
+async function allowedAuthorProfileLookups(
+  env: Env,
+  principals: string[],
+  allowedPrincipals: Set<string>,
+  commentAuthorPrincipals: Set<string>,
+): Promise<AuthorProfileLookup[]> {
+  if (
+    principals.length === 0 ||
+    allowedPrincipals.size === 0 ||
+    commentAuthorPrincipals.size === 0
+  ) {
+    return [];
+  }
+
+  const lookups: AuthorProfileLookup[] = [];
+  for (const principal of principals) {
+    if (!commentAuthorPrincipals.has(principal)) {
+      continue;
+    }
+    const canonical = await getCanonicalPrincipalForTransport(env, principal);
+    if (!allowedPrincipals.has(principal) && (!canonical || !allowedPrincipals.has(canonical))) {
+      continue;
+    }
+    lookups.push({
+      requestedPrincipal: principal,
+      profilePrincipals:
+        canonical && canonical !== principal ? [principal, canonical] : [principal],
+    });
+  }
+  return lookups;
 }
 
 async function routeNotebookAccessRequests(
@@ -3305,12 +4812,7 @@ async function routeCatalog(request: Request, env: Env, notebookId: string): Pro
   if (!env.DB) {
     return json({ error: "D1 binding DB is not configured" }, 503);
   }
-  const identity = await authenticateAndAuthorizeOrAppSessionOrResponse(
-    request,
-    env,
-    notebookId,
-    "viewer",
-  );
+  const identity = await authenticateNotebookCatalogAccess(request, env, notebookId);
   if (identity instanceof Response) {
     return identity;
   }
@@ -3320,7 +4822,12 @@ async function routeCatalog(request: Request, env: Env, notebookId: string): Pro
     return json({ error: "notebook not found" }, 404);
   }
 
-  return json(catalog);
+  return json({
+    ...catalog,
+    access: {
+      scope: identity.scope,
+    },
+  });
 }
 
 async function routeUpdateNotebookMetadata(
@@ -3404,9 +4911,9 @@ async function validateSnapshotPair(options: {
     };
   }
 
-  let render: Awaited<ReturnType<typeof materializeSnapshotPairRender>>;
+  let materialized: Awaited<ReturnType<typeof materializeSnapshotPairRenderWithSummary>>;
   try {
-    render = await materializeSnapshotPairRender({
+    materialized = await materializeSnapshotPairRenderWithSummary({
       notebookId: options.notebookId,
       notebookHeadsHash: options.notebookHeadsHash,
       runtimeHeadsHash: options.runtimeHeadsHash,
@@ -3437,6 +4944,7 @@ async function validateSnapshotPair(options: {
       },
     };
   }
+  const { render, summary } = materialized;
 
   if (render.runtime_state_doc_id !== options.expectedRuntimeStateDocId) {
     cloudLog("warn", "snapshot_pair.validation.runtime_state_doc_id_mismatch", {
@@ -3515,7 +5023,7 @@ async function validateSnapshotPair(options: {
     counter: "snapshot_pair_validations",
     counter_delta: 1,
   });
-  return { ok: true };
+  return { ok: true, summary };
 }
 
 async function findMissingSnapshotBlobs(
@@ -3573,6 +5081,89 @@ export function snapshotBlobRefsOverCap(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function routeLatestNotebookOgImage(
+  request: Request,
+  env: Env,
+  notebookId: string,
+): Promise<Response> {
+  const cover = await publicLatestRasterCover(env, notebookId);
+  if (!cover) {
+    return notebookOgImageNotFound(request);
+  }
+
+  const key = blobKey(notebookId, cover.blobHash);
+  if (request.method === "HEAD") {
+    const object = await env.NOTEBOOK_SNAPSHOTS?.head(key);
+    if (!object) {
+      return notebookOgImageNotFound(request);
+    }
+    return withCors(new Response(null, { headers: notebookOgImageHeaders(object, cover.mime) }));
+  }
+
+  const object = await env.NOTEBOOK_SNAPSHOTS?.get(key);
+  if (!object) {
+    return notebookOgImageNotFound(request);
+  }
+  return withCors(
+    new Response(object.body, { headers: notebookOgImageHeaders(object, cover.mime) }),
+  );
+}
+
+function notebookOgImageNotFound(request: Request): Response {
+  if (request.method === "HEAD") {
+    return withCors(new Response(null, { status: 404 }));
+  }
+  return json({ error: "notebook image not found" }, 404);
+}
+
+function notebookOgImageHeaders(
+  object: { httpEtag: string; size: number },
+  contentType: "image/png" | "image/jpeg",
+): Headers {
+  return new Headers({
+    "Cache-Control": "public, max-age=300",
+    "Content-Length": object.size.toString(),
+    "Content-Type": contentType,
+    ETag: object.httpEtag,
+    "X-Content-Type-Options": "nosniff",
+  });
+}
+
+async function publicLatestRasterCover(
+  env: Env,
+  notebookId: string,
+  options: { verifyBlob?: boolean } = {},
+): Promise<{ blobHash: string; mime: "image/png" | "image/jpeg" } | null> {
+  // Fail-open: the cover is derived convenience for shell metadata and the OG
+  // route. A transient D1/R2 error yields "no cover", never a 500 on the
+  // public viewer page.
+  try {
+    const row = await getPublicPublishedNotebookRow(env, notebookId);
+    if (!row?.latest_revision_id) {
+      return null;
+    }
+    const revision = await getNotebookRevisionRow(env, notebookId, row.latest_revision_id);
+    if (typeof revision?.cover_blob_hash !== "string" || !isRasterCoverMime(revision.cover_mime)) {
+      return null;
+    }
+    if (options.verifyBlob) {
+      const object = await env.NOTEBOOK_SNAPSHOTS?.head(
+        blobKey(notebookId, revision.cover_blob_hash),
+      );
+      if (!object) {
+        return null;
+      }
+    }
+    return { blobHash: revision.cover_blob_hash, mime: revision.cover_mime };
+  } catch (error) {
+    console.warn("[notebook-cloud] latest raster cover lookup failed", {
+      notebook_id: notebookId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
 }
 
 async function routeBlob(
@@ -3686,6 +5277,19 @@ async function routeBlob(
     return json({ error: "R2 binding NOTEBOOK_SNAPSHOTS is not configured" }, 503);
   }
 
+  const contentType = normalizedBlobUploadContentType(request.headers.get("content-type"));
+  if (contentType == null) {
+    cloudLog("warn", "blob.upload.rejected", {
+      notebook_id: notebookId,
+      hash,
+      reason: "unsupported_content_type",
+      content_type: request.headers.get("content-type"),
+      counter: "blob_upload_rejections",
+      counter_delta: 1,
+    });
+    return json({ error: "unsupported blob content type" }, 415);
+  }
+
   const body = await request.arrayBuffer();
   const digest = await sha256Hex(body);
   if (hash !== digest) {
@@ -3715,7 +5319,6 @@ async function routeBlob(
     return authorizedIdentity;
   }
 
-  const contentType = request.headers.get("content-type");
   // Content-addressed first-writer-wins: an existing object already holds
   // these exact bytes (the hash was verified above), and its stored metadata
   // (Content-Type) must not be rewritable by later writers. Skip the R2 write;
@@ -3743,7 +5346,7 @@ async function routeBlob(
 
   await env.NOTEBOOK_SNAPSHOTS.put(key, body, {
     httpMetadata: {
-      contentType: contentType ?? "application/octet-stream",
+      contentType,
       cacheControl: "public, max-age=31536000, immutable",
     },
     customMetadata: {
@@ -3937,6 +5540,30 @@ function optionalPositiveIntegerField(value: unknown, fieldName: string): number
   return value;
 }
 
+function boundedPositiveIntegerField(
+  value: unknown,
+  fieldName: string,
+  max: number,
+): number | Response {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0 || value > max) {
+    return json({ error: `${fieldName} must be an integer from 1 to ${max}` }, 400);
+  }
+  return value;
+}
+
+function optionalSafePositiveIntegerField(
+  value: unknown,
+  fieldName: string,
+): number | null | Response {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    return json({ error: `${fieldName} must be a positive safe integer` }, 400);
+  }
+  return value;
+}
+
 function isOwnerAclInput(row: ParsedNotebookAclInput): boolean {
   return row.subject_kind === "principal" && row.scope === "owner";
 }
@@ -3976,7 +5603,7 @@ async function safeEnsureCatalogSchema(env: Env, ctx: ExecutionContext): Promise
 async function authenticateRequestOrResponse(
   request: Request,
   env: Env,
-  options?: { allowWorkstationCredential?: boolean },
+  options?: { allowWorkstationCredential?: boolean; syncProfile?: boolean },
 ): Promise<AuthenticatedConnection | Response> {
   try {
     // Workstation credentials are least-privilege by allowlist: only the
@@ -3991,7 +5618,9 @@ async function authenticateRequestOrResponse(
       return await authenticateWorkstationCredentialRequest(env, request, workstationToken);
     }
     const identity = await authenticateRequestWithProviders(request, env);
-    await syncAuthenticatedProfile(env, identity);
+    if (options?.syncProfile !== false) {
+      await syncAuthenticatedProfile(env, identity);
+    }
     return identity;
   } catch (error) {
     if (error instanceof AuthError) {
@@ -4031,6 +5660,7 @@ async function syncAuthenticatedProfile(
       provider: identity.metadata.provider,
       email: identity.metadata.email ?? null,
       displayName: identity.metadata.displayName ?? null,
+      avatarUrl: identity.metadata.avatarUrl ?? null,
     };
 
     // Canonical account ACLs are keyed by verified email. OIDC carries an
@@ -4086,6 +5716,7 @@ async function syncStoredAppSessionProfile(env: Env, session: CloudAppSession): 
       email: profile.email_normalized,
       emailVerified: true,
       displayName: session.displayName ?? profile.display_name,
+      avatarUrl: profile.avatar_url,
     });
     logInviteResolutionCompleted({
       principal: session.principal,
@@ -4158,6 +5789,23 @@ async function authenticateAndAuthorizeOrAppSessionOrResponse(
     return identity;
   }
   return authorizeIdentityOrResponse(env, notebookId, identity, requestedScope);
+}
+
+async function authenticateNotebookCatalogAccess(
+  request: Request,
+  env: Env,
+  notebookId: string,
+): Promise<AuthenticatedConnection | Response> {
+  const identity = await authenticateRequestOrAppSessionOrResponse(request, env, "owner");
+  if (identity instanceof Response) {
+    return identity;
+  }
+  if (isAnonymousViewer(identity)) {
+    return authorizeIdentityOrResponse(env, notebookId, identity, "viewer");
+  }
+  return authorizeIdentityOrResponse(env, notebookId, identity, "owner", {
+    allowLiveScopeDowngrade: true,
+  });
 }
 
 async function authorizeIdentityOrResponse(
@@ -4308,6 +5956,7 @@ async function viewer(
   }
 
   const shellMetadata = await publicViewerShellMetadata(
+    request,
     env,
     notebookId,
     headsHash,
@@ -4318,6 +5967,9 @@ async function viewer(
   const rendererSidecarAssets = await rendererSidecarAssetNames(env);
   const notebookRouteAssets = await notebookRouteAssetNames(env);
   const session = await readCloudAppSession(env, request).catch(() => null);
+  const initialCatalogAccess = session
+    ? await initialNotebookViewerCatalogAccess(env, notebookId, session).catch(() => null)
+    : null;
   const config = {
     notebookId,
     headsHash: headsHash ?? null,
@@ -4328,12 +5980,17 @@ async function viewer(
     aclEndpoint: `${notebookApiBasePath}/acl`,
     invitesEndpoint: `${notebookApiBasePath}/invites`,
     accessRequestsEndpoint: `${notebookApiBasePath}/access-requests`,
+    authorProfilesEndpoint: `${notebookApiBasePath}/author-profiles`,
     workstationsEndpoint: "/api/workstations",
     workstationDefaultEndpoint: "/api/workstations/default",
     workstationAttachEndpoint: `${notebookApiBasePath}/workstation-attachments`,
     hostCapabilities: {
       canManageSharing: true,
     },
+    featureFlags: {
+      enable_comments: true,
+    },
+    initialCatalogAccess,
     session: session ? appSessionResponse(session) : null,
     syncEndpoint: `/n/${encodeURIComponent(notebookId)}/sync`,
     blobBasePath: notebookCloudBlobBasePath(notebookId),
@@ -4344,10 +6001,47 @@ async function viewer(
     runtimedWasmModulePath: runtimedWasmAssetPath(env, runtimeWasmAssets.module),
     runtimedWasmPath: runtimedWasmAssetPath(env, runtimeWasmAssets.wasm),
   };
-  return responseForRequestMethod(
-    request,
-    viewerShell(shellMetadata, env, authConfigForRequest(request, env), config),
+  return withAppSessionRenewalCookie(
+    responseForRequestMethod(
+      request,
+      viewerShell(shellMetadata, env, authConfigForRequest(request, env), config),
+    ),
+    env,
+    session,
   );
+}
+
+async function initialNotebookViewerCatalogAccess(
+  env: Env,
+  notebookId: string,
+  session: CloudAppSession,
+): Promise<{ scope: Exclude<ConnectionScope, "runtime_peer">; title: string | null } | null> {
+  if (!env.DB) {
+    return null;
+  }
+  const identity = appSessionConnectionIdentity(session, "browser:http", "owner");
+  const { identity: authorized, notebook } = await authorizeNotebookAccessWithNotebook(
+    env,
+    notebookId,
+    identity,
+    "owner",
+    {
+      allowLiveScopeDowngrade: true,
+    },
+  );
+  return {
+    scope: browserCatalogAccessScope(authorized.scope),
+    title: notebook.title,
+  };
+}
+
+function browserCatalogAccessScope(
+  scope: ConnectionScope,
+): Exclude<ConnectionScope, "runtime_peer"> {
+  if (scope === "runtime_peer") {
+    throw new Error("runtime_peer is not a browser catalog access scope");
+  }
+  return scope;
 }
 
 interface ViewerShellConfig extends Record<string, unknown> {
@@ -4382,25 +6076,42 @@ async function notebookListViewer(request: Request, env: Env): Promise<Response>
     return viewerShellHead(env);
   }
 
-  const bootstrap = await notebookListBootstrap(request, env);
-  const resourceHints = notebookListBootstrapHasNotebooks(bootstrap)
-    ? {
-        notebookRouteAssets: await notebookRouteAssetNames(env),
-        notebookRouteStyleHint: "prefetch" as const,
-      }
-    : null;
+  const { bootstrap, session } = await notebookListBootstrap(request, env);
+  return withAppSessionRenewalCookie(
+    responseForRequestMethod(
+      request,
+      viewerShell(
+        {
+          title: "nteract cloud notebooks",
+          description: "Open, create, and manage hosted nteract notebooks.",
+        },
+        env,
+        authConfigForRequest(request, env),
+        null,
+        bootstrap,
+        null,
+      ),
+    ),
+    env,
+    session,
+  );
+}
+
+function workstationsViewer(request: Request, env: Env): Response {
+  if (request.method === "HEAD") {
+    return viewerShellHead(env);
+  }
+
   return responseForRequestMethod(
     request,
     viewerShell(
       {
-        title: "nteract cloud notebooks",
-        description: "Open, create, and manage hosted nteract notebooks.",
+        title: "nteract cloud workstations",
+        description: "Manage the remote workstations paired to your nteract cloud account.",
       },
       env,
       authConfigForRequest(request, env),
       null,
-      bootstrap,
-      resourceHints,
     ),
   );
 }
@@ -4420,6 +6131,12 @@ function oidcCallbackViewer(request: Request, env: Env): Response {
       env,
       authConfigForRequest(request, env),
       null,
+      null,
+      null,
+      {
+        entryAssetPath: "/assets/notebook-cloud-oidc.js",
+        includeViewerStylesheet: false,
+      },
     ),
   );
 }
@@ -4448,9 +6165,19 @@ function viewerShellHead(env: Env): Response {
 interface ViewerShellMetadata {
   title: string;
   description: string;
+  ogImage?: {
+    type: "image/png" | "image/jpeg";
+    url: string;
+  };
+}
+
+interface ViewerShellOptions {
+  entryAssetPath?: string;
+  includeViewerStylesheet?: boolean;
 }
 
 async function publicViewerShellMetadata(
+  request: Request,
   env: Env,
   notebookId: string,
   headsHash?: string,
@@ -4470,9 +6197,20 @@ async function publicViewerShellMetadata(
   const revisionPart = headsHash
     ? `revision ${shortNotebookId(headsHash)}`
     : `published revision ${shortNotebookId(row.latest_revision_id)}`;
+  const cover = headsHash
+    ? null
+    : await publicLatestRasterCover(env, notebookId, { verifyBlob: true });
   return {
     title: `nteract notebook: ${displayTitle}`,
     description: `${displayTitle} is a public nteract notebook at ${revisionPart}.`,
+    ...(cover
+      ? {
+          ogImage: {
+            type: cover.mime,
+            url: latestNotebookOgImageUrlForRequest(request, env, notebookId),
+          },
+        }
+      : {}),
   };
 }
 
@@ -4508,9 +6246,14 @@ function viewerShell(
   config: ViewerShellConfig | null,
   bootstrap: unknown | null = null,
   resourceHints: ViewerShellResourceHints | null = config,
+  options: ViewerShellOptions = {},
 ): Response {
   const title = escapeHtml(metadata.title);
   const description = escapeHtml(metadata.description);
+  const ogImage = metadata.ogImage;
+  const twitterCard = ogImage ? "summary_large_image" : "summary";
+  const entryAssetPath = options.entryAssetPath ?? "/assets/notebook-cloud-viewer.js";
+  const includeViewerStylesheet = options.includeViewerStylesheet ?? true;
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -4521,12 +6264,18 @@ function viewerShell(
   <meta property="og:title" content="${title}" />
   <meta property="og:description" content="${description}" />
   <meta property="og:type" content="article" />
-  <meta name="twitter:card" content="summary" />
+  ${
+    ogImage
+      ? `<meta property="og:image" content="${escapeHtml(ogImage.url)}" />
+  <meta property="og:image:type" content="${escapeHtml(ogImage.type)}" />`
+      : ""
+  }
+  <meta name="twitter:card" content="${twitterCard}" />
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <style id="nteract-cloud-viewer-theme-surface">${viewerThemeFirstPaintStyle()}</style>
   <script>${viewerThemeBootstrapScript()}</script>
-  ${viewerResourceHints(resourceHints)}
-  <link rel="stylesheet" href="/assets/notebook-cloud-viewer.css" />
+  ${viewerResourceHints(resourceHints, entryAssetPath)}
+  ${includeViewerStylesheet ? `<link rel="stylesheet" href="/assets/notebook-cloud-viewer.css" />` : ""}
 </head>
 <body>
   <div id="root"></div>
@@ -4545,7 +6294,7 @@ function viewerShell(
         )}</script>`
       : ""
   }
-  <script type="module" src="/assets/notebook-cloud-viewer.js"></script>
+  <script type="module" src="${escapeHtml(entryAssetPath)}"></script>
 </body>
 </html>`;
 
@@ -4565,35 +6314,55 @@ function viewerShell(
 async function notebookListBootstrap(
   request: Request,
   env: Env,
-): Promise<Record<string, unknown> | null> {
+): Promise<{ bootstrap: Record<string, unknown> | null; session: CloudAppSession | null }> {
   if (!env.DB) {
-    return null;
+    return { bootstrap: null, session: null };
   }
   const session = await readCloudAppSession(env, request);
   if (!session) {
-    return null;
+    return { bootstrap: null, session: null };
   }
   await syncStoredAppSessionProfile(env, session);
-  const notebooks = await listNotebooksForPrincipal(
+  const notebookList = await listNotebooksForPrincipal(
     env,
     session.principal,
     DEFAULT_NOTEBOOK_LIST_LIMIT,
   );
+  const { notebooks, totalCount } = notebookList;
+  // The SSR bootstrap is embedded in served HTML, which is PII-free by
+  // invariant (see the "bootstraps the notebook home" leak-guard test): no
+  // profile display names and no presence occupant identities here. The
+  // authenticated /api/n fetch that follows carries both.
+  const computeSessions = await listNotebookComputeSessionsForOwnedRows(env, notebooks);
   return {
-    kind: "notebook-list",
-    session: appSessionResponse(session),
-    notebooks: notebookListResponseRows(request, notebooks, env),
-    saved_at: new Date().toISOString(),
+    session,
+    bootstrap: {
+      kind: "notebook-list",
+      session: appSessionResponse(session),
+      notebooks: notebookListResponseRows(request, notebooks, env, computeSessions),
+      total_count: totalCount,
+      saved_at: new Date().toISOString(),
+    },
   };
 }
 
-function notebookListBootstrapHasNotebooks(bootstrap: Record<string, unknown> | null): boolean {
-  const notebooks = bootstrap?.notebooks;
-  return Array.isArray(notebooks) && notebooks.length > 0;
+async function withAppSessionRenewalCookie(
+  response: Response,
+  env: Env,
+  session: CloudAppSession | null | undefined,
+): Promise<Response> {
+  const renewalCookie = await appSessionRenewalCookie(env, session);
+  if (renewalCookie) {
+    response.headers.append("Set-Cookie", renewalCookie);
+  }
+  return response;
 }
 
-function viewerResourceHints(config: ViewerShellResourceHints | null): string {
-  const viewerEntryHint = `<link rel="modulepreload" href="/assets/notebook-cloud-viewer.js" />`;
+function viewerResourceHints(
+  config: ViewerShellResourceHints | null,
+  entryAssetPath = "/assets/notebook-cloud-viewer.js",
+): string {
+  const viewerEntryHint = `<link rel="modulepreload" href="${escapeHtml(entryAssetPath)}" />`;
   if (!config) {
     return viewerEntryHint;
   }
@@ -4672,24 +6441,37 @@ function authConfigForRequest(
   env: Env,
 ): { oidc: Record<string, string> | null; localDev: Record<string, string> | null } {
   const localDev = localDevAuthConfigForRequest(request, env);
+  const oidc = oidcAuthConfigForRequest(request, env);
+  // With the dev issuer mounted, surface both configs. The viewer makes OIDC the
+  // primary sign-in (resolveCloudSignInMethod), so a real browser sign-in drives
+  // the local issuer's authorization_code + PKCE flow; the loopback dev-token
+  // path stays reachable at /local-auth as a fallback. Off the flag, loopback
+  // keeps its dev-token-only config.
+  if (localOidcEnabled(env) && oidc) {
+    return { oidc, localDev };
+  }
   if (localDev) {
     return { oidc: null, localDev };
   }
+  return { oidc, localDev: null };
+}
+
+function oidcAuthConfigForRequest(request: Request, env: Env): Record<string, string> | null {
   const issuer = env.NOTEBOOK_CLOUD_OIDC_ISSUER?.trim();
   const clientId = env.NOTEBOOK_CLOUD_OIDC_CLIENT_ID?.trim();
   const providerLabel = env.NOTEBOOK_CLOUD_OIDC_PROVIDER_LABEL?.trim();
   if (!issuer || !clientId) {
-    return { oidc: null, localDev: null };
+    return null;
   }
   return {
-    localDev: null,
-    oidc: {
-      issuer,
-      clientId,
-      redirectUri:
-        env.NOTEBOOK_CLOUD_OIDC_REDIRECT_URI?.trim() || new URL("/oidc", request.url).href,
-      ...(providerLabel ? { providerLabel } : {}),
-    },
+    issuer,
+    clientId,
+    redirectUri: env.NOTEBOOK_CLOUD_OIDC_REDIRECT_URI?.trim() || new URL("/oidc", request.url).href,
+    ...(providerLabel ? { providerLabel } : {}),
+    // Server-derived: only the dev issuer mount sets this, and the viewer keys
+    // its login_hint forwarding on it. Deriving it here (not from the issuer
+    // string) keeps production sign-in unable to forward a URL login_hint.
+    ...(localOidcEnabled(env) ? { localOidc: "true" } : {}),
   };
 }
 

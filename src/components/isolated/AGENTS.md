@@ -71,24 +71,11 @@ The iframe's message handler rejects anything whose `event.source !== window.par
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### Key components
-
-| Component | Location | Purpose |
-|-----------|----------|---------|
-| `IsolatedFrame` | `src/components/isolated/isolated-frame.tsx` | Manages iframe document lifecycle, exposes `installRenderer()` |
-| `CommBridgeManager` | `src/components/isolated/comm-bridge-manager.ts` | Parent-side widget state sync |
-| `jsonrpc-transport.ts` | `src/components/isolated/jsonrpc-transport.ts` | JSON-RPC 2.0 transport over `postMessage` |
-| `rpc-methods.ts` | `src/components/isolated/rpc-methods.ts` | Shared widget-bridge method constants |
-| `WidgetBridgeClient` | `src/isolated-renderer/widget-bridge-client.ts` | Iframe-side widget bridge (`createWidgetBridgeClient`) |
-| `frame.html` | `src/components/isolated/frame.html` | Bootstrap HTML served by Tauri and mounted by browser dev |
-| `frame-html.ts` | `src/components/isolated/frame-html.ts` | Raw HTML import and `generateFrameHtml()` wrapper |
-| `frame-bridge.ts` | `src/components/isolated/frame-bridge.ts` | Legacy frame-message types and guards |
-
 The core renderer bundle is built inline by `apps/notebook/vite-plugin-isolated-renderer.ts` and supplied through `IsolatedRendererProvider` (read via `useIsolatedRenderer()`). No HTTP fetch, no separate build step.
 
 ## Renderer plugins
 
-Heavy renderers (markdown, plotly, vega, leaflet, sift) are **not** in the core IIFE. They're on-demand CJS modules loaded via `frame.installRenderer()` only when their MIME types appear.
+Heavy renderers (markdown, plotly, bokeh, panel, vega, leaflet, sift) are **not** in the core IIFE. They're on-demand CJS modules loaded via `frame.installRenderer()` only when their MIME types appear.
 
 ```
 ┌──────────────────────────────┐     ┌──────────────────────────┐
@@ -115,16 +102,6 @@ Heavy renderers (markdown, plotly, vega, leaflet, sift) are **not** in the core 
 
 **Code splitting:** each plugin has its own virtual module, so a markdown-only notebook never pulls the 4.8 MB plotly chunk.
 
-### Current plugins
-
-| Plugin | MIME | Virtual module | Size |
-|--------|------|----------------|------|
-| Markdown | `text/markdown` | `virtual:renderer-plugin/markdown` | ~2.2 MB |
-| Vega | `application/vnd.vega*.v*` | `virtual:renderer-plugin/vega` | ~865 KB |
-| Plotly | `application/vnd.plotly.v1+json` | `virtual:renderer-plugin/plotly` | ~4.8 MB |
-| Leaflet | `application/geo+json` | `virtual:renderer-plugin/leaflet` | ~194 KB |
-| Sift | `application/vnd.apache.parquet` | `virtual:renderer-plugin/sift` | ~380 KB JS + 138 KB CSS |
-
 ### Adding a plugin
 
 1. Create `src/isolated-renderer/{name}-renderer.tsx` with a React component and an `install(ctx)` function:
@@ -148,21 +125,9 @@ export function install(ctx: {
 ```
 
 2. Extend `apps/notebook/vite-plugin-isolated-renderer.ts`: add the entry path, code/css variables, `invalidateCache()` entry, the `buildRendererPlugin()` call, and a `load()` case for the virtual module.
-3. Declare the virtual module in `apps/notebook/src/vite-env.d.ts`.
-4. In `src/components/isolated/iframe-libraries.ts`, add the MIME → plugin entry to `PLUGIN_MIME_TYPES`. Vega-style pattern matchers can use a shared loader; exact MIME types should live in the map.
+3. Declare the virtual module in `apps/notebook/src/vite-env.d.ts` (e.g., `declare module "virtual:renderer-plugin/bokeh" { ... }`).
+4. In `src/components/isolated/renderer-plugin-info.ts`, add the MIME → plugin mapping. The plugin loader registration lives in `iframe-libraries.ts` with imports from the virtual modules.
 5. Remove the component from `src/isolated-renderer/index.tsx` so it no longer ships in the core bundle.
-
-### Key files
-
-| File | Role |
-|------|------|
-| `src/isolated-renderer/index.tsx` | Core renderer + plugin registry + CJS loader |
-| `src/isolated-renderer/*-renderer.tsx` | Plugin entry points |
-| `apps/notebook/vite-plugin-isolated-renderer.ts` | Builds core IIFE + plugins |
-| `src/components/isolated/iframe-libraries.ts` | MIME detection, plugin loading |
-| `src/components/isolated/frame-bridge.ts` | `InstallRendererMessage` type |
-| `src/components/isolated/rpc-methods.ts` | `NTERACT_INSTALL_RENDERER` constant |
-| `src/components/isolated/isolated-frame.tsx` | `installRenderer()` on `IsolatedFrameHandle` |
 
 ## Message protocol
 

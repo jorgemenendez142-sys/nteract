@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-version = "0.3.2"
+version = "0.4.3"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -10,6 +10,6 @@ publish = false
 workspace = true
 
 [dependencies]
-dirs = "6"
+dirs = { workspace = true }
 runt-workspace = { path = "../runt-workspace" }
 serde_json.workspace = true

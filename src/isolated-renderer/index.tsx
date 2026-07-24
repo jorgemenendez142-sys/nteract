@@ -69,6 +69,7 @@ import { IframeWidgetStoreProvider } from "./widget-provider";
 // Import widget controls to register them in the widget registry
 // This import has side effects that register all built-in widgets
 import "@/components/widgets/controls";
+import "@/components/widgets/matplotlib";
 
 // --- Renderer Plugin Registry ---
 //
@@ -119,6 +120,21 @@ function installRendererPlugin(code: string, css?: string) {
     subscribeHostContext: (listener) => {
       rendererPluginHostContextListeners.add(listener);
       return () => rendererPluginHostContextListeners.delete(listener);
+    },
+    requestHost: (method, params) => {
+      if (!rpcTransport) {
+        return Promise.reject(new Error("Renderer host transport is not ready"));
+      }
+      return rpcTransport.request(method, params);
+    },
+    notifyHost: (method, params) => {
+      rpcTransport?.notify(method, params);
+    },
+    subscribeHostNotification: (method, listener) => {
+      if (!rpcTransport) {
+        return () => {};
+      }
+      return rpcTransport.onNotification(method, listener);
     },
   });
 
@@ -722,7 +738,7 @@ function OutputRenderer({
   payload: RenderPayload;
   interactionActive: boolean;
 }) {
-  const { mimeType, data, metadata } = payload;
+  const { mimeType, data, metadata, outputId } = payload;
   const content = data;
 
   // Handle stream output (plain text with potential ANSI)
@@ -773,6 +789,7 @@ function OutputRenderer({
         data={data}
         metadata={metadata}
         mimeType={mimeType}
+        outputId={outputId}
         interactionActive={interactionActive}
       />
     );

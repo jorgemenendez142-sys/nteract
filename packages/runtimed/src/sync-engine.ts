@@ -34,7 +34,12 @@ import {
   Subscription,
 } from "rxjs";
 
-import { type CommBroadcast, isCommBroadcast } from "./broadcast-types";
+import {
+  type BokehSessionPatchBroadcast,
+  type CommBroadcast,
+  isBokehSessionPatchBroadcast,
+  isCommBroadcast,
+} from "./broadcast-types";
 import { type CellChangeset, mergeChangesets } from "./cell-changeset";
 import {
   type CommChanges,
@@ -45,9 +50,11 @@ import {
 } from "./comm-diff";
 import type {
   CommsState,
+  CommentsProjection,
   ExecutionQueueProjection,
   ExecutionViewChangeset,
   FrameEvent,
+  HostedBridgeStatus,
   InitialLoadPhase,
   SessionStatus,
   SyncableHandle,
@@ -74,6 +81,8 @@ const FLUSH_DEBOUNCE_MS = 20;
 
 /** Maximum wait for a host transport to accept an outbound sync frame. */
 const DEFAULT_FLUSH_DELIVERY_TIMEOUT_MS = 5000;
+
+type FlushDocKey = "notebook" | "runtimeState" | "commsDoc" | "commentsDoc" | "pool";
 
 // ── Logger interface ─────────────────────────────────────────────────
 
@@ -105,6 +114,10 @@ function initialLoadPhaseName(phase: InitialLoadPhase): InitialLoadPhase["phase"
 
 function formatSessionStatus(status: SessionStatus): string {
   return `notebook=${status.notebook_doc} runtime=${status.runtime_state} load=${initialLoadPhaseName(status.initial_load)}`;
+}
+
+function isInitialLoadStreamingStatus(status: SessionStatus | null): boolean {
+  return status?.initial_load.phase === "streaming";
 }
 
 // ── Comm state helpers ───────────────────────────────────────────────
@@ -315,8 +328,8 @@ export class SyncEngine {
   /** The running pipeline's materialize subject (null while stopped). */
   private materializeIn: Subject<CellChangeset | null> | null = null;
 
-  /** Promise for the most recent fire-and-forget flush (debounced path). */
-  private inflightFlush: Promise<boolean> | null = null;
+  /** Delivery promises for fire-and-forget flushes that already claimed sync state. */
+  private inflightFlushes = new Map<FlushDocKey, Promise<boolean>>();
 
   // ── Public observables ───────────────────────────────────────────
 
@@ -330,14 +343,17 @@ export class SyncEngine {
   readonly cellChanges$: Observable<CellChangeset | null>;
 
   /**
-   * Daemon broadcast payloads. Only Comm traffic (ipywidget messages,
-   * custom widget events) flows here — kernel status, execution, outputs,
-   * env progress, and text attributions all live in RuntimeStateDoc now.
+   * Daemon broadcast payloads. Ephemeral Comm traffic and low-latency Bokeh
+   * document transactions flow here. Durable runtime topology and replay
+   * coordinates live in RuntimeStateDoc.
    */
   readonly broadcasts$: Observable<unknown>;
 
   /** Remote peer presence updates (cursor, selection, snapshot, left, heartbeat). */
   readonly presence$: Observable<unknown>;
+
+  /** Daemon-to-hosted-room bridge health for the active room. */
+  readonly hostedBridgeStatus$: Observable<HostedBridgeStatus>;
 
   /** RuntimeState snapshots from the daemon's RuntimeStateDoc. */
   readonly runtimeState$: Observable<RuntimeState>;
@@ -385,6 +401,9 @@ export class SyncEngine {
   /** Custom comm messages (buttons, model.send()). */
   readonly commBroadcasts$: Observable<CommBroadcast>;
 
+  /** Ordered Bokeh document transactions projected by the runtime. */
+  readonly bokehSessionPatchBroadcasts$: Observable<BokehSessionPatchBroadcast>;
+
   /**
    * Comm state projection from RuntimeStateDoc topology + CommsDoc state.
    *
@@ -397,6 +416,9 @@ export class SyncEngine {
    * ContentRef-backed state defers until the host provides a resolver.
    */
   readonly commChanges$: Observable<CommChanges>;
+
+  /** Durable comment thread projection from CommentsDoc. */
+  readonly commentsProjection$: Observable<CommentsProjection>;
 
   /** Ordered bootstrap/readiness status emitted by the daemon. */
   readonly sessionStatus$: Observable<SessionStatus>;
@@ -430,11 +452,23 @@ export class SyncEngine {
    * `NotebookDoc` bytes for local storage.
    *
    * Note: only `NotebookDoc` bytes may seed a syncing handle —
-   * `RuntimeStateDoc` is daemon-authoritative and must never be restored
-   * into the sync path. (A render-only RuntimeStateDoc paint cache is the
-   * one storage exception; see `RUNTIME_STATE_CACHE_KEY_SEGMENT`.)
+   * `RuntimeStateDoc` is runtime-authoritative and must never be restored
+   * into a regular client sync path. (A render-only RuntimeStateDoc paint
+   * cache is the one storage exception; see `RUNTIME_STATE_CACHE_KEY_SEGMENT`.)
    */
   readonly notebookDocChanged$: Observable<void>;
+
+  /**
+   * Fires when a local NotebookDoc sync flush was accepted by the transport.
+   * Replays the latest delivery to late subscribers so hosts can observe an
+   * initial bootstrap flush that completed before their app shell mounted.
+   *
+   * This is paired with the outbound side of `notebookDocChanged$`: hosts
+   * that persist "local work is still pending remote acceptance" markers can
+   * set them on local flush attempts and clear them only after confirmed
+   * delivery. Failed or timed-out deliveries are silent here.
+   */
+  readonly notebookDocFlushDelivered$: Observable<void>;
 
   /**
    * Fires once per APPLIED inbound NotebookDoc sync frame, whether or not
@@ -455,18 +489,21 @@ export class SyncEngine {
   private readonly _cellChanges$ = new Subject<CellChangeset | null>();
   private readonly _broadcasts$ = new Subject<unknown>();
   private readonly _presence$ = new Subject<unknown>();
+  private readonly _hostedBridgeStatus$ = new ReplaySubject<HostedBridgeStatus>(1);
   private readonly _runtimeState$ = new Subject<RuntimeState>();
   private readonly _poolState$ = new Subject<PoolState>();
   private readonly _executionTransitions$ = new Subject<ExecutionTransition[]>();
   private readonly _sessionStatus$ = new ReplaySubject<SessionStatus>(1);
   private readonly _initialSyncComplete$ = new Subject<void>();
   private readonly _commChanges$ = new Subject<CommChanges>();
+  private readonly _commentsProjection$ = new Subject<CommentsProjection>();
   private readonly _outputIdChanges$ = new Subject<{
     changed: Array<[string, unknown]>;
     removed_ids: string[];
   }>();
   private readonly _executionViewChanges$ = new Subject<ExecutionViewChangeset>();
   private readonly _notebookDocChanged$ = new Subject<void>();
+  private readonly _notebookDocFlushDelivered$ = new ReplaySubject<void>(1);
   private readonly _notebookSyncApplied$ = new Subject<void>();
 
   constructor(opts: SyncEngineOptions) {
@@ -481,19 +518,23 @@ export class SyncEngine {
     this.cellChanges$ = this._cellChanges$.asObservable();
     this.broadcasts$ = this._broadcasts$.asObservable();
     this.presence$ = this._presence$.asObservable();
+    this.hostedBridgeStatus$ = this._hostedBridgeStatus$.asObservable();
     this.runtimeState$ = this._runtimeState$.asObservable();
     this.poolState$ = this._poolState$.asObservable();
     this.executionTransitions$ = this._executionTransitions$.asObservable();
     this.sessionStatus$ = this._sessionStatus$.asObservable();
     this.initialSyncComplete$ = this._initialSyncComplete$.asObservable();
     this.commChanges$ = this._commChanges$.asObservable();
+    this.commentsProjection$ = this._commentsProjection$.asObservable();
     this.outputIdChanges$ = this._outputIdChanges$.asObservable();
     this.executionViewChanges$ = this._executionViewChanges$.asObservable();
     this.notebookDocChanged$ = this._notebookDocChanged$.asObservable();
+    this.notebookDocFlushDelivered$ = this._notebookDocFlushDelivered$.asObservable();
     this.notebookSyncApplied$ = this._notebookSyncApplied$.asObservable();
 
     // Typed broadcast sub-observables (derived from broadcasts$)
     this.commBroadcasts$ = this.broadcasts$.pipe(filter(isCommBroadcast));
+    this.bokehSessionPatchBroadcasts$ = this.broadcasts$.pipe(filter(isBokehSessionPatchBroadcast));
 
     // Queue-only projection derived from the execution view changeset.
     this.executionQueue$ = this.executionViewChanges$.pipe(
@@ -612,6 +653,21 @@ export class SyncEngine {
         }),
     );
 
+    sub.add(
+      frameEvents$
+        .pipe(
+          filter(
+            (event) => event.type === "hosted_bridge_status" && event.hosted_bridge_status != null,
+          ),
+          map((event) => event.hosted_bridge_status as HostedBridgeStatus),
+          distinctUntilChanged(),
+        )
+        .subscribe((status) => {
+          log.debug(`[sync-engine] hosted bridge status: ${status}`);
+          this._hostedBridgeStatus$.next(status);
+        }),
+    );
+
     // ── Sub-pipeline: sync_applied → coalesce ─────────────────────
 
     sub.add(
@@ -651,7 +707,12 @@ export class SyncEngine {
                   "[sync-engine] sync_applied with change but no changeset (full materialization needed)",
                 );
               }
-              materialize$.next(cs ?? null);
+              if (isInitialLoadStreamingStatus(this.latestSessionStatus)) {
+                log.debug("[sync-engine] streaming load changeset emitted without coalescing");
+                this._cellChanges$.next(cs ?? null);
+              } else {
+                materialize$.next(cs ?? null);
+              }
               this._notebookDocChanged$.next();
             }
             this.emitExecutionViewChanges(e.execution_view_changeset);
@@ -884,6 +945,62 @@ export class SyncEngine {
         if (e.changed && e.state) {
           this.lastCommsState = e.state as CommsState;
           this.projectComms();
+        }
+      }),
+    );
+
+    // ── Sub-pipeline: comments doc sync ───────────────────────────
+
+    sub.add(
+      frameEvents$
+        .pipe(
+          filter((e) => e.type === "comments_doc_sync_applied"),
+          concatMap((e) => {
+            if (e.changed && e.projection) {
+              this._commentsProjection$.next(e.projection);
+            }
+
+            const handle = this.opts.getHandle();
+            const generateReply = handle?.generate_comments_doc_sync_reply;
+            if (handle && generateReply) {
+              try {
+                const reply = generateReply.call(handle);
+                if (reply) {
+                  return from(
+                    this.opts.transport
+                      .sendFrame(FrameType.COMMENTS_DOC_SYNC, reply)
+                      .catch((err: unknown) =>
+                        log.warn("[sync-engine] comments doc sync reply failed:", err),
+                      ),
+                  );
+                }
+              } catch (err) {
+                log.warn("[sync-engine] generate_comments_doc_sync_reply failed:", err);
+              }
+            }
+            return EMPTY;
+          }),
+        )
+        .subscribe(),
+    );
+
+    // CommentsDoc sync error: send recovery reply and publish recovered projection.
+    sub.add(
+      frameEvents$.pipe(filter((e) => e.type === "comments_doc_sync_error")).subscribe((e) => {
+        log.warn(
+          "[sync-engine] comments_doc_sync_error: comments doc rebuilt, sync state normalized",
+        );
+        if (e.reply) {
+          this.opts.transport
+            .sendFrame(FrameType.COMMENTS_DOC_SYNC, new Uint8Array(e.reply))
+            .catch((err: unknown) => {
+              const handle = this.opts.getHandle();
+              handle?.cancel_last_comments_doc_flush?.();
+              log.warn("[sync-engine] comments doc recovery reply send failed:", err);
+            });
+        }
+        if (e.changed && e.projection) {
+          this._commentsProjection$.next(e.projection);
         }
       }),
     );
@@ -1189,7 +1306,19 @@ export class SyncEngine {
       this.opts.logger.warn("[sync-engine] local mutation event dropped: engine not running");
       return false;
     }
-    if (!event || event.type !== "sync_applied" || !event.changed) {
+    if (!event || !event.changed) {
+      return false;
+    }
+
+    if (event.type === "comments_doc_sync_applied") {
+      if (event.projection) {
+        this._commentsProjection$.next(event.projection);
+        return true;
+      }
+      return false;
+    }
+
+    if (event.type !== "sync_applied") {
       return false;
     }
 
@@ -1283,8 +1412,13 @@ export class SyncEngine {
         "sync to relay",
         () => handle.cancel_last_flush(),
       );
+      done.then((delivered) => {
+        if (delivered) {
+          this._notebookDocFlushDelivered$.next();
+        }
+      });
       // Track the in-flight flush so flushAndWait() can await it.
-      this.inflightFlush = done;
+      this.trackInflightFlush("notebook", done);
     }
 
     // Also flush RuntimeStateDoc sync so the daemon sends kernel status,
@@ -1293,10 +1427,13 @@ export class SyncEngine {
     // stuck on "not_started" (#runtime-state-race).
     const stateMsg = handle.flush_runtime_state_sync();
     if (stateMsg) {
-      void this.awaitFrameDelivery(
-        this.opts.transport.sendFrame(FrameType.RUNTIME_STATE_SYNC, stateMsg),
-        "runtime state sync to relay",
-        () => handle.cancel_last_runtime_state_flush(),
+      this.trackInflightFlush(
+        "runtimeState",
+        this.awaitFrameDelivery(
+          this.opts.transport.sendFrame(FrameType.RUNTIME_STATE_SYNC, stateMsg),
+          "runtime state sync to relay",
+          () => handle.cancel_last_runtime_state_flush(),
+        ),
       );
     }
 
@@ -1304,20 +1441,39 @@ export class SyncEngine {
     // independently from runtime topology/status.
     const commsMsg = handle.flush_comms_doc_sync();
     if (commsMsg) {
-      void this.awaitFrameDelivery(
-        this.opts.transport.sendFrame(FrameType.COMMS_DOC_SYNC, commsMsg),
-        "comms doc sync to relay",
-        () => handle.cancel_last_comms_doc_flush(),
+      this.trackInflightFlush(
+        "commsDoc",
+        this.awaitFrameDelivery(
+          this.opts.transport.sendFrame(FrameType.COMMS_DOC_SYNC, commsMsg),
+          "comms doc sync to relay",
+          () => handle.cancel_last_comms_doc_flush(),
+        ),
+      );
+    }
+
+    // Also flush CommentsDoc sync when the current handle has comments identity.
+    const commentsMsg = handle.flush_comments_doc_sync?.();
+    if (commentsMsg) {
+      this.trackInflightFlush(
+        "commentsDoc",
+        this.awaitFrameDelivery(
+          this.opts.transport.sendFrame(FrameType.COMMENTS_DOC_SYNC, commentsMsg),
+          "comments doc sync to relay",
+          () => handle.cancel_last_comments_doc_flush?.(),
+        ),
       );
     }
 
     // Also flush PoolDoc sync so the daemon sends pool state.
     const poolMsg = handle.flush_pool_state_sync();
     if (poolMsg) {
-      void this.awaitFrameDelivery(
-        this.opts.transport.sendFrame(FrameType.POOL_STATE_SYNC, poolMsg),
-        "pool state sync to relay",
-        () => handle.cancel_last_pool_state_flush(),
+      this.trackInflightFlush(
+        "pool",
+        this.awaitFrameDelivery(
+          this.opts.transport.sendFrame(FrameType.POOL_STATE_SYNC, poolMsg),
+          "pool state sync to relay",
+          () => handle.cancel_last_pool_state_flush(),
+        ),
       );
     }
   }
@@ -1334,19 +1490,11 @@ export class SyncEngine {
    * execute/save to guarantee the daemon has the latest source.
    */
   async flushAndWait(): Promise<boolean> {
-    // Drain all in-flight debounced flushes. A new debounced flush can
-    // start while we're awaiting the current one (the 20ms timer fires
-    // independently), so loop until stable.
-    while (this.inflightFlush) {
-      const current = this.inflightFlush;
-      const delivered = await current;
-      // Only clear if no newer flush replaced it while we awaited.
-      if (this.inflightFlush === current) {
-        this.inflightFlush = null;
-      }
-      if (!delivered) {
-        return false;
-      }
+    // Drain all in-flight debounced/fire-and-forget flushes. A new debounced
+    // flush can start while we're awaiting current deliveries (the 20ms timer
+    // fires independently), so loop until stable.
+    if (!(await this.drainInflightFlushes())) {
+      return false;
     }
 
     const handle = this.opts.getHandle();
@@ -1367,6 +1515,7 @@ export class SyncEngine {
       if (!delivered) {
         return false;
       }
+      this._notebookDocFlushDelivered$.next();
     }
 
     // Also flush RuntimeStateDoc sync.
@@ -1389,6 +1538,19 @@ export class SyncEngine {
         this.opts.transport.sendFrame(FrameType.COMMS_DOC_SYNC, commsMsg),
         "flushAndWait comms doc sync",
         () => handle.cancel_last_comms_doc_flush(),
+      );
+      if (!delivered) {
+        return false;
+      }
+    }
+
+    // Also flush CommentsDoc sync.
+    const commentsMsg = handle.flush_comments_doc_sync?.();
+    if (commentsMsg) {
+      const delivered = await this.awaitFrameDelivery(
+        this.opts.transport.sendFrame(FrameType.COMMENTS_DOC_SYNC, commentsMsg),
+        "flushAndWait comments doc sync",
+        () => handle.cancel_last_comments_doc_flush?.(),
       );
       if (!delivered) {
         return false;
@@ -1454,6 +1616,30 @@ export class SyncEngine {
     }
   }
 
+  private trackInflightFlush(key: FlushDocKey, delivery: Promise<boolean>): void {
+    this.inflightFlushes.set(key, delivery);
+  }
+
+  private async drainInflightFlushes(): Promise<boolean> {
+    while (this.inflightFlushes.size > 0) {
+      const entries = Array.from(this.inflightFlushes.entries());
+      const results = await Promise.all(
+        entries.map(async ([key, current]) => {
+          const delivered = await current;
+          // Only clear if no newer flush replaced it while we awaited.
+          if (this.inflightFlushes.get(key) === current) {
+            this.inflightFlushes.delete(key);
+          }
+          return delivered;
+        }),
+      );
+      if (results.some((delivered) => !delivered)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /**
    * Schedule a debounced flush (for batching rapid keystrokes).
    *
@@ -1496,6 +1682,9 @@ export class SyncEngine {
     this.commDiffState = { comms: {}, json: {} };
     this.lastRuntimeState = null;
     this.lastCommsState = null;
+    // Do not replay a previous hosted bridge's connected state into the new
+    // relay generation. Local rooms promptly replace this with not_applicable.
+    this._hostedBridgeStatus$.next("connecting");
     this._sessionStatus$.next({
       notebook_doc: "pending",
       runtime_state: "pending",

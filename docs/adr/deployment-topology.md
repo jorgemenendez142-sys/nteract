@@ -137,7 +137,7 @@ References:
 This decision records the current Cloudflare prototype and remains useful for
 understanding the shipped `preview.runt.run` path. For the next
 production-oriented hosted target, it is partially superseded by
-`aws-rust-room-host.md`, which moves live room authority to a native Rust room
+`../memos/aws-rust-room-host.md`, which moves live room authority to a native Rust room
 host on AWS while preserving the typed-frame protocol and document model.
 
 The primary hosted topology is a Cloudflare Worker routing room requests to one
@@ -230,9 +230,13 @@ topology.
 The identity model does not require a local daemon bridge for hosted rooms.
 Supported client-to-room patterns:
 
-- **Browser direct.** The browser connects to the hosted room WebSocket. For the
-  Anaconda-friendly path, the viewer/editor shell performs direct OIDC login and
-  sends a validated bearer token through the non-echoed WebSocket subprotocol.
+- **Browser direct.** The browser connects to the hosted room WebSocket. For
+  first-party app sessions, the viewer/editor shell uses the app-session cookie
+  (set by OIDC login redirects) directly, with trusted `Origin` enforcement.
+  The WebSocket upgrade path reads the session from the cookie and produces an
+  authenticated connection identity (`:720-:778` in `index.ts`). Non-cookie
+  browser clients (embedding shells, explicit MCP bridges) may send a validated
+  bearer token through the non-echoed WebSocket subprotocol.
 - **Native direct.** Desktop, CLI, TUI, and agents connect directly to the room
   WebSocket with an `Authorization` header or equivalent native credential
   transport.
@@ -339,7 +343,10 @@ infer compute from the document host.
 - SSH as the first remote-room transport.
 - Moving kernels into Cloudflare Workers or Durable Objects.
 - Treating JupyterHub as the default document engine for Anaconda-hosted rooms.
-- Preserving pre-publish local Automerge actor history inside hosted rooms.
+- Treating preserved pre-publish actor history as verified attribution.
+  Current publish carries source actor history into hosted rooms;
+  re-authoring at the publish boundary is the target (identity ADR
+  Decision 6).
 - Solving the local same-path autosave bug; #2285 remains the concrete bug for
   local file-binding safety.
 
@@ -362,23 +369,3 @@ infer compute from the document host.
 6. **Backpressure and fanout.** What is the first threshold where a public room
    needs a read-only fanout layer instead of every viewer WebSocket hitting the
    same Durable Object?
-
-## Implementation Sequence
-
-1. Keep `hosted-room-authorization.md` moving first: DO as live document host,
-   ACL lookup before WebSocket admission, and snapshot persistence.
-2. Add explicit runtime attachment metadata and UI/API vocabulary without
-   launching JupyterHub yet.
-3. Define typed failure states for no runtime, runtime disconnected, credential
-   expired, and ACL revoked before the first Hub prototype consumes those
-   errors.
-4. Implement `runtime_peer` WebSocket attach from a trusted local/runtime test
-   sidecar to prove the frame path.
-5. Prototype a JupyterHub service or single-user sidecar that authenticates
-   with Hub OAuth/token, starts a kernel, and opens outbound `runtime_peer`
-   sync to the Cloudflare room.
-6. Define the runtime attachment grant/token exchange after the prototype
-   proves which side needs to mint which credential.
-7. Only after the hosted runtime path is proven, revisit whether any of #2284's
-   local URI-discovery work is still needed beyond #2285's file-binding safety
-   stopgap.

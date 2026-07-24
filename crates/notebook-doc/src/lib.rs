@@ -20,6 +20,7 @@
 //!   schema_version: u64           ← Document schema version (currently 5)
 //!   notebook_id: Str
 //!   runtime_state_doc_id: Str     ← RuntimeStateDoc identity associated with this notebook
+//!   comms_doc_id: Str             ← CommsDoc identity associated with this notebook
 //!   cells/                        ← Map keyed by cell ID (O(1) lookup)
 //!     {cell_id}/
 //!       id: Str                   ← cell UUID (redundant but convenient)
@@ -66,7 +67,8 @@ use std::collections::HashMap;
 /// - **4** — Addressable outputs: `OutputManifest` carries a required `output_id` (UUIDv4).
 ///   Outputs live in RuntimeStateDoc keyed by `execution_id` and then `output_id`.
 /// - **5** — NotebookDoc carries `runtime_state_doc_id`, the durable identity of the
-///   associated RuntimeStateDoc. Runtime-state heads remain checkpoint/publish metadata.
+///   associated RuntimeStateDoc. It also carries `comms_doc_id`, the durable identity
+///   of the associated CommsDoc. Runtime/comms heads remain checkpoint/publish metadata.
 ///
 /// v1–v2 predate the nteract 2.0 pre-release series and are no longer
 /// supported. `load_or_create_inner` discards pre-v3 documents on load.
@@ -111,6 +113,9 @@ use std::path::Path;
 /// Identifier of the RuntimeStateDoc associated with a NotebookDoc.
 pub type RuntimeStateDocId = String;
 
+/// Identifier of the CommsDoc associated with a NotebookDoc.
+pub type CommsDocId = String;
+
 /// Derive the default RuntimeStateDoc id for a notebook id.
 ///
 /// This keeps older notebooks migratable without adding a random-id source at
@@ -118,6 +123,14 @@ pub type RuntimeStateDocId = String;
 /// for new documents, but this stable derivation is the compatibility default.
 pub fn default_runtime_state_doc_id(notebook_id: &str) -> RuntimeStateDocId {
     format!("runtime:{notebook_id}")
+}
+
+/// Derive the default CommsDoc id for a notebook id.
+///
+/// Keep this deterministic: a missing pointer on an older document must repair
+/// to the same sidecar identity on every peer and reload.
+pub fn default_comms_doc_id(notebook_id: &str) -> CommsDocId {
+    format!("comms:{notebook_id}")
 }
 
 /// Extract a non-negative schema version from an Automerge scalar value.
@@ -621,6 +634,66 @@ impl NotebookDoc {
         None
     }
 
+    /// Read only `metadata.runt.uv.dependencies` without materializing the
+    /// rest of notebook metadata.
+    ///
+    /// Control-plane projections call this while holding the document lock.
+    /// Traversing the native Automerge maps directly keeps arbitrary Jupyter
+    /// extension metadata and unrelated runt configuration out of that hot
+    /// path. Legacy scalar-encoded runt metadata is supported by parsing only
+    /// that scalar value.
+    pub fn get_uv_dependencies(&self) -> Vec<String> {
+        fn dependency_strings(value: Option<serde_json::Value>) -> Vec<String> {
+            value
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect()
+        }
+
+        let Some(meta_id) = self.metadata_map_id() else {
+            return Vec::new();
+        };
+        let Some((runt_value, runt_id)) = self.doc.get(&meta_id, "runt").ok().flatten() else {
+            return Vec::new();
+        };
+        let runt_id = match runt_value {
+            automerge::Value::Object(ObjType::Map) => runt_id,
+            automerge::Value::Scalar(value) => {
+                let automerge::ScalarValue::Str(encoded) = value.as_ref() else {
+                    return Vec::new();
+                };
+                return serde_json::from_str::<serde_json::Value>(encoded)
+                    .ok()
+                    .and_then(|runt| runt.get("uv").cloned())
+                    .and_then(|uv| uv.get("dependencies").cloned())
+                    .map(|dependencies| dependency_strings(Some(dependencies)))
+                    .unwrap_or_default();
+            }
+            _ => return Vec::new(),
+        };
+        let Some((uv_value, uv_id)) = self.doc.get(&runt_id, "uv").ok().flatten() else {
+            return Vec::new();
+        };
+        match uv_value {
+            automerge::Value::Object(ObjType::Map) => {
+                dependency_strings(read_json_value(&self.doc, &uv_id, "dependencies"))
+            }
+            automerge::Value::Scalar(value) => {
+                let automerge::ScalarValue::Str(encoded) = value.as_ref() else {
+                    return Vec::new();
+                };
+                serde_json::from_str::<serde_json::Value>(encoded)
+                    .ok()
+                    .and_then(|uv| uv.get("dependencies").cloned())
+                    .map(|dependencies| dependency_strings(Some(dependencies)))
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Read the notebook metadata as it existed at a historical head set.
     pub fn get_metadata_snapshot_at_heads(
         &self,
@@ -738,6 +811,32 @@ impl NotebookDoc {
         }
 
         Ok(())
+    }
+
+    /// True when writing `snapshot` via [`Self::set_metadata_snapshot`] would
+    /// leave the readable metadata unchanged.
+    ///
+    /// Raw `snapshot == doc.get_metadata_snapshot()` comparisons are not
+    /// idempotence-safe because a write+read round trip normalizes the
+    /// snapshot in two ways:
+    ///
+    /// - an all-empty snapshot (a vanilla `.ipynb` with `"metadata": {}`)
+    ///   reads back as `None`, not `Some(default)` — the doc's metadata map
+    ///   may hold only internal reserved keys (`runtime`, `ephemeral`) that
+    ///   the snapshot never models
+    /// - extras entries under reserved keys are dropped on write and skipped
+    ///   on read, so they never surface in the doc's readable form
+    ///
+    /// External-apply paths (file watcher, recovery replay) must use this to
+    /// decide whether an incoming snapshot is a real change; comparing
+    /// unnormalized forms reports a permanent spurious delta for identical
+    /// input (issue #4015).
+    pub fn metadata_snapshot_matches(&self, snapshot: &metadata::NotebookMetadataSnapshot) -> bool {
+        let mut incoming = snapshot.clone();
+        incoming
+            .extras
+            .retain(|key, _| !is_snapshot_reserved_metadata_key(key));
+        self.get_metadata_snapshot().unwrap_or_default() == incoming
     }
 
     /// Detect the notebook runtime from metadata (kernelspec + language_info).
@@ -1011,6 +1110,11 @@ impl NotebookDoc {
             "runtime_state_doc_id",
             default_runtime_state_doc_id(notebook_id),
         );
+        let _ = doc.put(
+            automerge::ROOT,
+            "comms_doc_id",
+            default_comms_doc_id(notebook_id),
+        );
 
         Self { doc }
     }
@@ -1258,6 +1362,9 @@ impl NotebookDoc {
                             if loaded.runtime_state_doc_id().is_none() {
                                 let _ = loaded.ensure_runtime_state_doc_id(notebook_id);
                             }
+                            if loaded.comms_doc_id().is_none() {
+                                let _ = loaded.ensure_comms_doc_id(notebook_id);
+                            }
                             return loaded;
                         }
 
@@ -1278,6 +1385,7 @@ impl NotebookDoc {
                                 loaded.set_actor(label);
                             }
                             let _ = loaded.ensure_runtime_state_doc_id(notebook_id);
+                            let _ = loaded.ensure_comms_doc_id(notebook_id);
                             let _ =
                                 loaded
                                     .doc
@@ -1442,6 +1550,31 @@ impl NotebookDoc {
         }
         let id = default_runtime_state_doc_id(notebook_id);
         self.set_runtime_state_doc_id(&id)?;
+        Ok(id)
+    }
+
+    /// Read the associated CommsDoc ID from the document.
+    pub fn comms_doc_id(&self) -> Option<CommsDocId> {
+        read_str(&self.doc, automerge::ROOT, "comms_doc_id")
+    }
+
+    /// Set the associated CommsDoc ID.
+    pub fn set_comms_doc_id(&mut self, comms_doc_id: &str) -> Result<(), AutomergeError> {
+        self.doc
+            .put(automerge::ROOT, "comms_doc_id", comms_doc_id)?;
+        Ok(())
+    }
+
+    /// Ensure the document has an associated CommsDoc ID.
+    ///
+    /// Returns the existing value when present; otherwise writes the stable
+    /// default derived from the notebook id and returns it.
+    pub fn ensure_comms_doc_id(&mut self, notebook_id: &str) -> Result<CommsDocId, AutomergeError> {
+        if let Some(id) = self.comms_doc_id() {
+            return Ok(id);
+        }
+        let id = default_comms_doc_id(notebook_id);
+        self.set_comms_doc_id(&id)?;
         Ok(id)
     }
 
@@ -2416,7 +2549,8 @@ impl NotebookDoc {
 
     /// True when nothing beyond document creation has been applied: the change
     /// graph contains only the canonical schema seed and the identity puts
-    /// (`notebook_id`, `runtime_state_doc_id`) that `new_with_actor` writes.
+    /// (`notebook_id`, `runtime_state_doc_id`, `comms_doc_id`) that
+    /// `new_with_actor` writes.
     ///
     /// This is the host-authority seeding gate. Unlike a `cell_count()` check it
     /// is derived from immutable history, so it is convergence-safe (no transient
@@ -2450,8 +2584,9 @@ impl NotebookDoc {
                 // creation, before any seeding or user interaction.
                 //
                 // (1) Initial `Put` (empty `pred`) to ROOT's `notebook_id` /
-                //     `runtime_state_doc_id` (from `new_with_actor`). A delete or
-                //     overwrite of those keys is post-creation history and fails.
+                //     `runtime_state_doc_id` / `comms_doc_id` (from
+                //     `new_with_actor`). A delete or overwrite of those keys is
+                //     post-creation history and fails.
                 //
                 //     INVARIANT: this ROOT allowlist must never grow to include
                 //     `cells`, `metadata`, or any structural ROOT key. Those Maps
@@ -2476,6 +2611,7 @@ impl NotebookDoc {
                         LegacyKey::Map(k)
                             if k.as_str() == "notebook_id"
                                 || k.as_str() == "runtime_state_doc_id"
+                                || k.as_str() == "comms_doc_id"
                     );
                 let is_ephemeral_flag = matches!(op.action, LegacyOpType::Put(_))
                     && op.pred.is_empty()
@@ -3231,6 +3367,7 @@ mod tests {
         let doc = NotebookDoc::bootstrap(TextEncoding::UnicodeCodePoint, "test");
         assert_eq!(doc.notebook_id(), None);
         assert_eq!(doc.runtime_state_doc_id(), None);
+        assert_eq!(doc.comms_doc_id(), None);
         assert_eq!(doc.cell_count(), 0);
         assert!(doc.has_cells_map());
         assert_eq!(doc.get_cells(), vec![]);
@@ -3241,8 +3378,13 @@ mod tests {
 
     #[test]
     fn fresh_notebook_doc_is_pristine() {
-        // genesis + the two identity puts, nothing else
+        // genesis + the identity puts, nothing else
         let mut doc = NotebookDoc::new_with_actor("nb-1", "runtimed");
+        assert_eq!(
+            doc.runtime_state_doc_id(),
+            Some(default_runtime_state_doc_id("nb-1"))
+        );
+        assert_eq!(doc.comms_doc_id(), Some(default_comms_doc_id("nb-1")));
         assert!(doc.is_pristine());
     }
 
@@ -3317,12 +3459,22 @@ mod tests {
             !deleted.is_pristine(),
             "a delete of an identity key is an OpType::Delete, not a Put"
         );
+
+        let mut deleted_comms = NotebookDoc::new_with_actor("nb-1", "runtimed");
+        deleted_comms
+            .doc
+            .delete(automerge::ROOT, "comms_doc_id")
+            .expect("delete comms_doc_id");
+        assert!(
+            !deleted_comms.is_pristine(),
+            "a delete of comms_doc_id is an OpType::Delete, not a Put"
+        );
     }
 
     #[test]
     fn every_fresh_constructor_is_pristine() {
         // Guard: the allowlist is sound only while every creation path writes
-        // nothing to ROOT except the two identity puts. Enumerate the public fresh
+        // nothing to ROOT except the identity puts. Enumerate the public fresh
         // constructors so a future ROOT scaffolding put trips here instead of
         // silently shipping a notebook that never seeds.
         assert!(NotebookDoc::new("nb-1").is_pristine());
@@ -3542,7 +3694,12 @@ mod tests {
             daemon.runtime_state_doc_id(),
             Some(default_runtime_state_doc_id("test-notebook"))
         );
+        assert_eq!(
+            daemon.comms_doc_id(),
+            Some(default_comms_doc_id("test-notebook"))
+        );
         assert_eq!(frontend.runtime_state_doc_id(), None);
+        assert_eq!(frontend.comms_doc_id(), None);
 
         assert_eq!(daemon.root_map_conflict_count("cells"), 1);
         assert_eq!(daemon.root_map_conflict_count("metadata"), 1);
@@ -3663,6 +3820,76 @@ mod tests {
         let cell = empty.get_cell("cell-1").unwrap();
         assert_eq!(cell.source, "print('hello')");
         assert_eq!(empty.notebook_id(), Some("test-notebook".to_string()));
+    }
+
+    /// Repro for the MCP-joiner-gets-no-cells bug.
+    ///
+    /// Models PRODUCTION driving (not the symmetric idealized loop above):
+    /// the daemon room doc is built via `new_with_actor` + `add_cell` (the
+    /// desktop-load shape), a joining peer bootstraps an empty doc, and the
+    /// handshake is driven exactly as the sync server / sync_task drive it.
+    /// The daemon sends ONE initial frame (`send_initial_notebook_doc_sync`),
+    /// then both sides do strict reactive ping-pong (each replies only when it
+    /// receives a frame, via `handle_notebook_doc_frame` / sync_task), using the
+    /// `_recovering` variants that production actually calls. A joining peer
+    /// must end up with the daemon's cells.
+    #[test]
+    fn join_existing_populated_doc_delivers_cells_reactive_handshake() {
+        use automerge::sync;
+
+        // Daemon room doc: populated, built the production way.
+        let mut daemon = NotebookDoc::new_with_actor("nb-join", "runtimed");
+        daemon.add_cell(0, "cell-1", "code").unwrap();
+        daemon.update_source("cell-1", "print('hello')").unwrap();
+        daemon.add_cell(1, "cell-2", "code").unwrap();
+
+        // Joining MCP peer: bootstrap, empty.
+        let mut joiner = NotebookDoc::bootstrap(TextEncoding::UnicodeCodePoint, "agent:mcp");
+
+        // Continuous peer_state on each side (production threads these through).
+        let mut daemon_state = sync::State::new();
+        let mut joiner_state = sync::State::new();
+
+        // 1) daemon's single initial notebook-doc send.
+        let mut to_joiner = daemon
+            .generate_sync_message_recovering(&mut daemon_state, "initial-doc-sync")
+            .unwrap();
+
+        // 2) reactive ping-pong until quiescent.
+        for _ in 0..32 {
+            let to_daemon = if let Some(msg) = to_joiner.take() {
+                joiner
+                    .receive_sync_message_recovering(&mut joiner_state, msg, "c-recv")
+                    .unwrap();
+                joiner
+                    .generate_sync_message_recovering(&mut joiner_state, "c-reply")
+                    .unwrap()
+            } else {
+                None
+            };
+
+            match to_daemon {
+                Some(msg) => {
+                    daemon
+                        .receive_sync_message_recovering(&mut daemon_state, msg, "d-recv")
+                        .unwrap();
+                    to_joiner = daemon
+                        .generate_sync_message_recovering(&mut daemon_state, "doc-sync-reply")
+                        .unwrap();
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            joiner.cell_count(),
+            2,
+            "joining peer must receive the daemon's existing cells"
+        );
+        assert_eq!(
+            joiner.get_cell("cell-1").map(|c| c.source),
+            Some("print('hello')".to_string())
+        );
     }
 
     /// Regression test: MCP-added deps must survive when a second bootstrap
@@ -4113,6 +4340,10 @@ mod tests {
             loaded.runtime_state_doc_id(),
             Some(default_runtime_state_doc_id("migrate-test"))
         );
+        assert_eq!(
+            loaded.comms_doc_id(),
+            Some(default_comms_doc_id("migrate-test"))
+        );
         assert_eq!(loaded.cell_count(), 1);
         let cells = loaded.get_cells();
         assert_eq!(cells[0].source, "import numpy");
@@ -4308,6 +4539,38 @@ mod tests {
             loaded.runtime_state_doc_id(),
             Some(default_runtime_state_doc_id("v4-migrate-test"))
         );
+        assert_eq!(
+            loaded.comms_doc_id(),
+            Some(default_comms_doc_id("v4-migrate-test"))
+        );
+        assert_eq!(loaded.cell_count(), 1);
+        assert_eq!(loaded.get_cells()[0].source, "hello");
+    }
+
+    #[test]
+    #[cfg(feature = "persistence")]
+    fn test_load_v5_doc_migrates_comms_doc_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("notebook.automerge");
+
+        let mut doc = NotebookDoc::new("v5-comms-migrate-test");
+        doc.add_cell(0, "c1", "markdown").unwrap();
+        doc.update_source("c1", "hello").unwrap();
+        let _ = doc.doc.delete(automerge::ROOT, "comms_doc_id");
+        assert_eq!(doc.schema_version(), Some(SCHEMA_VERSION));
+        assert_eq!(doc.comms_doc_id(), None);
+        doc.save_to_file(&path).unwrap();
+
+        let loaded = NotebookDoc::load_or_create(&path, "v5-comms-migrate-test");
+        assert_eq!(loaded.schema_version(), Some(SCHEMA_VERSION));
+        assert_eq!(
+            loaded.runtime_state_doc_id(),
+            Some(default_runtime_state_doc_id("v5-comms-migrate-test"))
+        );
+        assert_eq!(
+            loaded.comms_doc_id(),
+            Some(default_comms_doc_id("v5-comms-migrate-test"))
+        );
         assert_eq!(loaded.cell_count(), 1);
         assert_eq!(loaded.get_cells()[0].source, "hello");
     }
@@ -4357,6 +4620,7 @@ mod tests {
             loaded.runtime_state_doc_id(),
             Some(default_runtime_state_doc_id("v4-rich"))
         );
+        assert_eq!(loaded.comms_doc_id(), Some(default_comms_doc_id("v4-rich")));
 
         // Cells: count, order, and sources preserved.
         let cells = loaded.get_cells();
@@ -5945,6 +6209,28 @@ mod tests {
     }
 
     #[test]
+    fn test_set_cell_type_preserves_cell_identity_source_and_position() {
+        let mut doc = NotebookDoc::new("nb-set-cell-type");
+
+        doc.add_cell_after("cell-a", "code", None).unwrap();
+        doc.add_cell_after("cell-b", "markdown", Some("cell-a"))
+            .unwrap();
+        doc.update_source("cell-a", "print('hello')").unwrap();
+        let position_before = doc.get_cell_position("cell-a");
+
+        assert!(doc.set_cell_type("cell-a", "markdown").unwrap());
+
+        assert_eq!(doc.get_cell_type("cell-a"), Some("markdown".to_string()));
+        assert_eq!(
+            doc.get_cell_source("cell-a"),
+            Some("print('hello')".to_string())
+        );
+        assert_eq!(doc.get_cell_position("cell-a"), position_before);
+        assert_eq!(doc.get_cell_ids(), vec!["cell-a", "cell-b"]);
+        assert!(!doc.set_cell_type("missing", "code").unwrap());
+    }
+
+    #[test]
     fn test_metadata_fingerprint_stable_when_unchanged() {
         let mut doc = NotebookDoc::new("nb-fp-stable");
 
@@ -6218,6 +6504,31 @@ mod tests {
     }
 
     #[test]
+    fn uv_dependency_projection_ignores_unrelated_large_metadata() {
+        let mut doc = NotebookDoc::new("nb-bounded-metadata");
+        let mut snapshot = metadata::NotebookMetadataSnapshot::default();
+        snapshot.runt.uv = Some(metadata::UvInlineMetadata {
+            dependencies: vec!["numpy>=2".to_string(), "pandas".to_string()],
+            requires_python: Some(">=3.11".to_string()),
+            prerelease: None,
+        });
+        snapshot.extras.insert(
+            "large-extension-payload".to_string(),
+            serde_json::Value::String("x".repeat(2 * 1024 * 1024)),
+        );
+        snapshot.runt.extra.insert(
+            "large-unrelated-runt-payload".to_string(),
+            serde_json::Value::String("y".repeat(2 * 1024 * 1024)),
+        );
+        doc.set_metadata_snapshot(&snapshot).unwrap();
+
+        assert_eq!(
+            doc.get_uv_dependencies(),
+            vec!["numpy>=2".to_string(), "pandas".to_string()]
+        );
+    }
+
+    #[test]
     fn set_metadata_snapshot_writes_extras_as_siblings() {
         use crate::metadata::NotebookMetadataSnapshot;
         let mut doc = NotebookDoc::new_with_actor("test-nb", "test");
@@ -6361,6 +6672,50 @@ mod tests {
             !after_second.extras.contains_key("colab"),
             "stale extras key must be deleted when absent from replacement"
         );
+    }
+
+    #[test]
+    fn metadata_snapshot_matches_normalizes_the_doc_round_trip() {
+        use crate::metadata::{KernelspecSnapshot, NotebookMetadataSnapshot};
+        let mut doc = NotebookDoc::new_with_actor("test-nb", "test");
+
+        // An all-empty snapshot matches a doc with no readable metadata,
+        // even though get_metadata_snapshot() returns None for that doc.
+        let empty = NotebookMetadataSnapshot::default();
+        assert!(doc.metadata_snapshot_matches(&empty));
+
+        // Internal reserved keys on the doc don't break the match: they
+        // never surface in the readable snapshot.
+        let meta_id = doc
+            .doc
+            .put_object(automerge::ROOT, "metadata", ObjType::Map)
+            .unwrap();
+        doc.doc.put(&meta_id, "runtime", "python").unwrap();
+        assert!(doc.metadata_snapshot_matches(&empty));
+
+        // Reserved keys in the incoming extras are dropped on write, so
+        // they don't count as a difference either.
+        let mut reserved_extras = NotebookMetadataSnapshot::default();
+        reserved_extras
+            .extras
+            .insert("runtime".to_string(), serde_json::json!("python"));
+        assert!(doc.metadata_snapshot_matches(&reserved_extras));
+
+        // A genuine difference still reports as one, and matches after
+        // the write lands.
+        let real = NotebookMetadataSnapshot {
+            kernelspec: Some(KernelspecSnapshot {
+                name: "python3".to_string(),
+                display_name: "Python 3".to_string(),
+                language: Some("python".to_string()),
+                extras: Default::default(),
+            }),
+            ..Default::default()
+        };
+        assert!(!doc.metadata_snapshot_matches(&real));
+        doc.set_metadata_snapshot(&real).unwrap();
+        assert!(doc.metadata_snapshot_matches(&real));
+        assert!(!doc.metadata_snapshot_matches(&empty));
     }
 
     #[test]

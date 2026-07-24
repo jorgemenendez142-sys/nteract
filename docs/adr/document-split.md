@@ -6,10 +6,8 @@
 three-document model by extracting mutable widget comm state into `CommsDoc`.
 This document remains the historical baseline for the original split and its
 document-boundary reasoning. Do not use the document count as the concept:
-current notebook rooms sync `NotebookDoc`, `RuntimeStateDoc`, and `CommsDoc`;
-`PoolDoc` is daemon-scoped and sync-adjacent; the proposed `CommentsDoc` is
-another per-notebook sidecar tracked separately in
-`notebook-comments-document.md`.
+current notebook rooms sync `NotebookDoc`, `RuntimeStateDoc`, `CommsDoc`, and
+`CommentsDoc`; `PoolDoc` is daemon-scoped and sync-adjacent.
 
 ## Context
 
@@ -17,8 +15,8 @@ nteract syncs state through Automerge CRDTs. Separate documents carry that
 state today, not one. They split into two scopes:
 
 - **Notebook-room documents** are attached to one notebook collaboration room.
-  Today that set is `NotebookDoc`, `RuntimeStateDoc`, and `CommsDoc`. Proposed
-  comment work adds `CommentsDoc` to this room set.
+  Today that set is `NotebookDoc`, `RuntimeStateDoc`, `CommsDoc`, and
+  `CommentsDoc`.
 - **Daemon-scoped documents** are fanned out to room peers because they affect
   the room UI, but they do not belong to the room identity. `PoolDoc` is the
   current example.
@@ -28,16 +26,18 @@ The current documents are:
 - **`NotebookDoc`** (`crates/notebook-doc/src/lib.rs`) - one per notebook room. Carries cells, source text, notebook metadata, attachments. Schema version 5. Wire frame `0x00` (AutomergeSync).
 - **`RuntimeStateDoc`** (`crates/runtime-doc/src/doc.rs`) - one per runtime state surface; today each notebook room creates one. Carries kernel lifecycle, execution queue, executions and their outputs, env-sync state, trust state, project-file context, and widget comm topology/routing. Mutable widget comm state moved to `CommsDoc`. Schema version 2. Wire frame `0x05` (RuntimeStateSync).
 - **`CommsDoc`** (`crates/runtime-doc/src/comms.rs`) - one per notebook room. Carries mutable widget comm state keyed by comm id; `RuntimeStateDoc` remains the topology and membership source of truth. Schema version 1. Wire frame `0x09` (CommsDocSync).
+- **`CommentsDoc`** (`crates/comments-doc/src/lib.rs`) - one per notebook room. Carries notebook comments as a durable collaboration sidecar. The daemon persists CommentsDoc separately from the notebook, applies optimistic rendering, and finalizes authority-policy fields. Schema version 1. Wire frame `0x0a` (CommentsDocSync).
 - **`PoolDoc`** (`crates/notebook-doc/src/pool_state.rs`) - one per daemon (not per room). Carries UV / Conda / Pixi prewarm pool counters, errors, retry timers. No schema version. Wire frame `0x06` (PoolStateSync).
 
 A connecting peer subscribes through one of the typed-frame handshake channels.
-`NotebookSync` (and the related `OpenNotebook` / `CreateNotebook` paths) brings
-up the room documents on one socket: `NotebookDoc`, `RuntimeStateDoc`, and
-`CommsDoc` per the joined room, plus `PoolDoc` fanned out to that peer because
-the peer loop subscribes to `pool_doc_changed` regardless of room. The `Pool`
-handshake is a JSON-IPC channel for pool status, env claims, and daemon admin;
-it does not carry typed-frame Automerge sync at all. Frame caps differ per type
-(see `crates/notebook-wire/src/lib.rs`).
+`NotebookSync` (and the related `OpenNotebook` / `CreateNotebook` /
+`OpenHostedNotebook` paths) brings up the room documents on one socket:
+`NotebookDoc`, `RuntimeStateDoc`, `CommsDoc`, and `CommentsDoc` per the joined
+room, plus `PoolDoc` fanned out to that peer because the peer loop subscribes
+to `pool_doc_changed` regardless of room. The `Pool` handshake is a JSON-IPC
+channel for pool status, env claims, and daemon admin; it does not carry
+typed-frame Automerge sync at all. Frame caps differ per type (see
+`crates/notebook-wire/src/lib.rs`).
 
 The split is load-bearing for permission boundaries, document authority,
 durability/lifetime, attachment identity, and fan-out scope. It is not written
@@ -70,13 +70,15 @@ let InitialSyncState { mut peer_state } =      // NotebookDoc
     send_initial_notebook_doc_sync(&mut writer, room).await?;
 let mut state_peer_state = sync::State::new(); // RuntimeStateDoc
 let mut comms_peer_state = sync::State::new(); // CommsDoc
+let mut comments_peer_state = sync::State::new(); // CommentsDoc
 let mut pool_peer_state = sync::State::new();  // PoolDoc
 ```
 
 Each ingress path is a separate handler (`handle_notebook_doc_frame`,
 `handle_runtime_state_frame`, `handle_comms_doc_frame`,
-`handle_pool_state_frame`) with its own validator. Each broadcast subscription
-is a separate stream (`changed_tx`, `state_changed_tx`, `comms_changed_tx`,
+`handle_comments_doc_frame`, `handle_pool_state_frame`) with its own validator.
+Each broadcast subscription is a separate stream (`changed_tx`,
+`state_changed_tx`, `comms_changed_tx`, `comments_changed_tx`,
 `pool_doc_changed`). Egress now follows the first stage of the peer-lane split:
 reliable frames (`Response`, `SessionControl`, document sync, blob replies) are
 separated from ephemeral presence/broadcast traffic inside `PeerWriter`.
@@ -87,11 +89,12 @@ control/resync lanes.
 The reasons for keeping them separate, not just logically but physically on the wire:
 
 1. **Different write authority.** `NotebookDoc` is multi-writer (any
-   editor-scope peer authors cells). `RuntimeStateDoc` is daemon-authored for
-   execution intent and daemon/runtime-peer authored for lifecycle, execution
-   progress, output, and comm topology. `CommsDoc` is room-writable widget
-   state, but RuntimeStateDoc topology gates which comm state can reach the
-   kernel. `PoolDoc` is daemon-only, with all client changes stripped at ingress
+   editor-scope peer authors cells). `RuntimeStateDoc` is coordinator-authored
+   for execution intent and room facts, and runtime-peer authored for
+   policy-allowed lifecycle, execution progress, output, and comm topology.
+   `CommsDoc` carries editor/owner/runtime-peer widget state, but
+   RuntimeStateDoc topology gates which comm state can reach the kernel.
+   `PoolDoc` is daemon-only, with all client changes stripped at ingress
    (`pool_state.rs:341`, `message.changes = Vec::<Vec<u8>>::new().into()`).
 2. **Different trust scopes.** The identity ADR
    (`docs/adr/identity-and-trust.md` Decision 5) carves four scopes precisely
@@ -104,14 +107,15 @@ The reasons for keeping them separate, not just logically but physically on the 
 3. **Different lifetimes and durability.** `NotebookDoc` persists to disk
    (`.automerge` for ephemeral rooms; `.ipynb` for file-backed).
    `RuntimeStateDoc` and desktop `CommsDoc` are live room state, not standalone
-   persisted notebook content. `CommentsDoc`, when added, is durable
-   collaboration state with its own attachment and persistence policy. `PoolDoc`
+   persisted notebook content. `CommentsDoc` is durable collaboration state
+   persisted as a sidecar by the daemon
+   (`crates/runtimed/src/notebook_sync_server/comments_store.rs`). `PoolDoc`
    lives for the daemon's lifetime. See Decision 4.
 4. **Different fan-out and attachment scopes.** `PoolDoc` sync frames fan out
    to notebook-room typed peers so each open notebook can observe daemon pool
-   state. `Handshake::Pool` clients, such as system-tray UI or env-management
-   tools, use the separate JSON-IPC pool/admin channel instead of Automerge
-   `PoolStateSync`. `NotebookDoc` and `RuntimeStateDoc` fan out only to peers
+   state. `Handshake::Pool` clients use the separate JSON-IPC pool/admin
+   channel instead of Automerge `PoolStateSync`. `NotebookDoc`,
+   `RuntimeStateDoc`, `CommsDoc`, and `CommentsDoc` fan out only to peers
    attached to that room.
 5. **Different operational traffic shapes.** The documents do have different
    write cadences, but that is not the primary architectural reason for the
@@ -130,7 +134,7 @@ What lives in `NotebookDoc` (schema v5, `crates/notebook-doc/src/lib.rs`):
 - `cells/{cell_id}/`: `id`, `cell_type`, `position` (fractional index hex string for ordering), `source` (Automerge Text), `metadata`, `resolved_assets`, `attachments`, `execution_count` (legacy JSON-encoded string preserved for nbformat round-trip).
 - `cells/{cell_id}/execution_id`: a pointer that the daemon stamps at queue time. This is the **only** runtime-state field that lives in `NotebookDoc`.
 - `metadata/`: `runtime`, `kernelspec`, `language_info`, `runt` (deps / trust / cell-execution metadata), legacy `notebook_metadata` JSON string.
-- `schema_version`, `notebook_id`, `runtime_state_doc_id`.
+- `schema_version`, `notebook_id`, `runtime_state_doc_id`, `comms_doc_id`.
 
 What lives in `RuntimeStateDoc` (schema v2, `crates/runtime-doc/src/doc.rs`):
 
@@ -158,7 +162,7 @@ This matches nbformat semantics. `.ipynb` files carry cell source, cell type, me
 
 A cell's "current outputs" are looked up by following the `cells/{cell_id}/execution_id` pointer in `NotebookDoc` into the `executions/{execution_id}/outputs` map in `RuntimeStateDoc`. The daemon stamps this pointer at queue time (`NotebookDoc::set_execution_id`, `lib.rs:1707`). `clear_outputs` sets the pointer to null and resets the legacy `execution_count` field; it never deletes the execution entry in `RuntimeStateDoc` (`lib.rs:1736`).
 
-This is currently the only structural link between the two documents. Everything else is keyed entirely within one or the other. Output history sits in `RuntimeStateDoc` indefinitely; the cell just looks at one of the entries.
+This is the per-cell structural link between `NotebookDoc` and `RuntimeStateDoc`. Document-level pairings are carried by `NotebookDoc.runtime_state_doc_id` and `NotebookDoc.comms_doc_id`.
 
 The choice to store the pointer in `NotebookDoc` and the body in `RuntimeStateDoc` was driven by save semantics. The pointer is the part that survives a `.ipynb` export. The body is the part that gets thrown away.
 
@@ -168,7 +172,8 @@ which `RuntimeStateDoc` belongs with the notebook. The runtime-state document
 itself remains document-agnostic: it carries its own `runtime_state_doc_id`, not
 a notebook backlink, so the same schema can support markdown-associated or
 standalone runtime state later. It does not replace `cell.execution_id`, and it
-does not store runtime-state heads in `NotebookDoc`.
+does not store runtime-state heads in `NotebookDoc`. ADR 0002 adds the parallel
+`NotebookDoc.comms_doc_id` pointer for the paired CommsDoc.
 
 ## Decision 3: Write authority is per-document, and `RuntimeStateDoc` separates runtime authority from widget state
 
@@ -196,19 +201,19 @@ kernel.
 |---|---|---|
 | `NotebookDoc` writes from viewer scope | Frame-level scope check (`identity-and-trust.md` Decision 5) | `peer_notebook_sync.rs::handle_notebook_doc_frame` |
 | `NotebookDoc` actor-principal forgery | Clone-preview validator | `peer_notebook_sync.rs` (mirror of `peer_runtime_sync.rs:80-107`) |
-| `RuntimeStateDoc` writes from editor/owner scope | Shared before/after policy rejects comm-state and other non-runtime writes; widget state belongs in `CommsDoc`. | `crates/runtime-doc/src/policy.rs`, `peer_runtime_sync.rs`, hosted WASM room host |
+| `RuntimeStateDoc` writes from editor/owner scope | Frame-level scope check rejects non-runtime-agent writes; widget state belongs in `CommsDoc`. | `crates/runtime-doc/src/policy.rs`, `peer_runtime_sync.rs`, hosted WASM room host |
 | `RuntimeStateDoc` actor-principal forgery | Clone-preview validator | `peer_runtime_sync.rs:80-107` |
 | `CommsDoc` orphan state | Runtime forward path and orphan GC derive membership from `RuntimeStateDoc` topology. | `peer_comms_sync.rs`, `runtime_agent.rs`, `crates/runtime-doc/src/comms.rs` |
 | `PoolDoc` writes from any peer | Strip all changes at ingress | `pool_state.rs:341` |
 | Runtime-agent ID provenance mismatch | Ingress reject on agent ID mismatch | `peer_runtime_agent.rs:47-63` |
 
-Editor/owner `RuntimeStateDoc` deltas are server-validated before apply and are
-rejected outside the notebook-authoring surface. Queue, execution, kernel,
-environment, output routing, comm topology, and hidden root/schema writes remain
-runtime-owned. Runtime-peer deltas are also policy-validated: progress and
-output updates for accepted executions pass, but newly created execution entries
-and queue entries for unknown executions are rejected. The runtime-agent
-provenance check above is a separate gate: it filters who may write under the
+Editor/owner `RuntimeStateDoc` deltas are rejected; their mutable widget state
+writes belong in `CommsDoc`. Queue, execution, kernel, environment, output
+routing, comm topology, and hidden root/schema writes remain runtime-owned.
+Runtime-peer deltas are also policy-validated: progress and output updates for
+accepted executions pass, but newly created execution entries and queue entries
+for unknown executions are rejected. The runtime-agent provenance check above is
+a separate gate: it filters who may write under the
 runtime-agent actor, while the shared policy filters what each scope may mutate.
 
 `RuntimeStateDoc` exposes two ingress APIs internally: `receive_sync_message` (read-only, strips changes for clone-preview validation) and `receive_sync_message_with_changes_recovering` (writable, applies changes after validation). The server uses the read-only API in the clone-preview pass and the writable one for committed application; library callers use the writable API directly (`crates/runtime-doc/src/doc.rs:2720`, `:2789`).
@@ -221,6 +226,12 @@ runtime-agent actor, while the shared policy filters what each scope may mutate.
   desktop rooms. Save/load reconstructs widget state from the notebook's widget
   metadata and the runtime/comms projection; the live CommsDoc is dropped on
   room eviction.
+- **`CommentsDoc`** is **persisted** to disk as a durable sidecar. The daemon
+  writes CommentsDoc to
+  `~/.cache/<namespace>/comments/<sha256-of-comments-doc-id>.automerge`
+  (sibling of `notebook-docs/`) and loads it on room join. Optimistic comments
+  render immediately; ingress validates change actor labels and scope
+  (`crates/runtimed/src/notebook_sync_server/peer_comments_sync.rs`).
 - **`PoolDoc`** is **not** persisted. It is built fresh from `PoolDoc::new()` on daemon startup, hydrated from in-process pool state on each daemon tick (`Daemon::update_pool_doc`). On daemon restart it is empty until the pools come back online.
 
 Output durability is the asymmetry that needs the most attention. `RuntimeStateDoc` outputs are the live record of the most recent execution; they are also what the frontend renders. If the room evicts before a save, those outputs are gone. The compensating mechanism:
@@ -238,6 +249,7 @@ So the durable footprint of one notebook is: the `.ipynb` (or untitled `.automer
 | `NotebookDoc` | On room load (either from `.ipynb` or fresh) | Per-notebook UUID; schema seed actor `nteract:notebook-schema:v5` | On room eviction; persisted file deleted on save-as transition |
 | `RuntimeStateDoc` | On room load (fresh from schema seed; load code populates synthetic executions when the `.ipynb` carries legacy outputs, `crates/runtimed/src/notebook_sync_server/load.rs:709, :731, :741`) | Runtime-state document id referenced by `NotebookDoc.runtime_state_doc_id`; schema seed actor `nteract:runtime-state-schema:v2`; daemon writes under actor `runtimed:state`; runtime-agent peer writes under its own actor (`crates/runtimed/src/runtime_agent.rs:96`) | On room eviction |
 | `CommsDoc` | On room load (fresh from schema seed; load code hydrates widget state when `.ipynb` widget metadata is present) | Per-notebook side document; schema seed actor `nteract:comms-doc-schema:v1` | On room eviction |
+| `CommentsDoc` | On room load (loaded from disk or fresh from schema seed) | Per-notebook sidecar document; schema seed actor `nteract:comments-doc-schema:v1`; ingress validates change actor labels and scope | On room eviction; persisted sidecar survives eviction |
 | `PoolDoc` | On daemon startup | Singleton; daemon writes under actor `runtimed:pool` | On daemon shutdown |
 
 The schema seed actor is what makes initial sync correct. Every peer scaffolds
@@ -247,8 +259,10 @@ top-level object IDs (`cells`, `metadata`, `kernel`, `queue`, `executions`,
 `comms`, ...) agree before the first sync round. The `notebook-doc/AGENTS.md`
 invariant "exactly one peer creates document structure" applies inside
 `NotebookDoc` for any non-genesis structure (so the daemon owns `cells`
-creation when scaffolding from empty); for `RuntimeStateDoc`, the daemon owns
-everything by convention because the genesis already scaffolds the runtime tree.
+creation when scaffolding from empty). For `RuntimeStateDoc`, the frozen genesis
+scaffolds the runtime tree; regular clients remain read-only, the
+coordinator/room host owns intent and room facts, and runtime peers may only
+mutate policy-allowed runtime progress/output/topology state.
 
 Room eviction is driven by "last peer disconnected." `peer_eviction.rs` runs the teardown: stop kernel, optionally clean up env, save `.ipynb` if file-backed and dirty, drop the room from the registry. Room-scoped live docs go out of scope. Re-opening the room recreates `RuntimeStateDoc` and `CommsDoc` fresh from seed.
 
@@ -261,6 +275,11 @@ Each doc's `receive_sync_message` makes a different choice about client changes:
 - **`CommsDoc::receive_sync_message_with_changes_recovering`** applies mutable
   widget state changes. Runtime forwarding and orphan cleanup use
   `RuntimeStateDoc` topology as the membership authority.
+- **`CommentsDoc::receive_sync_message_with_changes_recovering`** applies
+  optimistic comment changes. The daemon/room host validates change actor
+  labels against the connection principal and strips writes from scopes
+  without comment authority; there is no daemon finalization step —
+  attribution is projected from admitted change actors.
 - **`PoolDoc::receive_sync_message`** (`crates/notebook-doc/src/pool_state.rs:341`) explicitly clears `message.changes = Vec::<Vec<u8>>::new().into()` before passing to Automerge. The `heads`, `need`, and `have` fields are preserved by omission so the sync handshake still completes (bloom-filter exchange, ACKs); only the change payload is dropped.
 
 This is a set of different ingress shapes for what looks like one protocol.
@@ -294,7 +313,7 @@ cause Automerge to evaluate the changes; the strip happens before any apply.
 
 1. UV pool prewarm fails because `default_packages` contains a typo'd package name.
 2. `Daemon::update_pool_doc` writes `PoolDoc.uv.error = "could not resolve package 'numpyy'"`, `error_kind = "invalid_package"`, `failed_package = "numpyy"`.
-3. `pool_doc_changed.send(())` fans out to every peer subscribed in `peer_loop.rs`. That includes peers attached to notebooks via `NotebookSync`, and peers attached via `Pool` handshakes (system tray, env tools).
+3. `pool_doc_changed.send(())` fans out to every notebook typed peer subscribed in `peer_loop.rs`. `Pool` handshake clients use the separate JSON-IPC pool/admin channel, not `PoolStateSync` typed frames.
 4. The frontend `usePoolState` hook re-renders the pool banner. The banner appears once per app instance, not once per open notebook.
 
 ## Open Questions
@@ -327,7 +346,7 @@ The split was designed for the desktop topology (one daemon per user, same-UID t
 - `crates/notebook-doc/AGENTS.md` - mutation rules for NotebookDoc.
 - `crates/runtime-doc/src/doc.rs` - RuntimeStateDoc schema v2.
 - `crates/runtime-doc/src/comms.rs` - CommsDoc schema v1.
-- `crates/notebook-doc/src/pool_state.rs:8-27, :128-141` - PoolDoc schema. The doc-comment at 8-27 names `uv` and `conda` only; the live scaffold at 128-141 also includes `pixi` and a per-pool `failed_package` field (`pool_state.rs:52, :223`). The doc-comment is stale.
+- `crates/notebook-doc/src/pool_state.rs:8-39, :110-153, :234-251` - PoolDoc schema. The doc-comment and live scaffold both model `uv`, `conda`, and `pixi` counters with optional per-pool error fields, including `failed_package`.
 - `crates/notebook-wire/src/lib.rs:9-44` - frame type constants and per-type caps.
 - `crates/notebook-wire/AGENTS.md` - wire protocol overview.
 - `crates/runtimed/src/notebook_sync_server/peer_loop.rs` - the sync select loop holding per-document peer-state objects.
@@ -337,17 +356,3 @@ The split was designed for the desktop topology (one daemon per user, same-UID t
 - `crates/runtimed/src/notebook_sync_server/persist.rs` - NotebookDoc `.automerge` debouncer.
 - `crates/runtimed/src/daemon.rs:4419-4422` - the comment that records "RuntimeStateDoc is not persisted."
 - `docs/adr/identity-and-trust.md` - the trust scopes that the document split makes expressible.
-
-## Tracked follow-ups (from the retired cleanup punchlist)
-
-These items were migrated from `docs/adr/cleanup-punchlist.md` when it was
-retired (2026-06-10). Severity: **Targeted PR** = one-or-two-file fix ready
-to implement; **Design** = needs a decision in this ADR before code moves.
-
-- **3D-1** (Targeted PR; `crates/notebook-doc/`, frontend reader): `cells[cell_id].execution_count` lives in **both** `NotebookDoc` (legacy JSON-string) and `RuntimeStateDoc.executions[execution_id].execution_count` (live i64). Frontend consults live first, falls back to legacy. Two sources of truth for one number.
-- **3D-2** (Targeted PR; `crates/runtime-state/` (move to `NotebookDoc` or use `.ipynb` mtime)): `last_saved` lives in `RuntimeStateDoc`, which does not persist. A reopened room has no record of its last save time.
-- **3D-3** (Design; output manifest path): `comms/*/outputs` inline output manifests, bypassing the blob path that `executions/*/outputs` uses. Two output-storage paths in one document.
-- **3D-6** (Design; `crates/runtimed/src/notebook_sync_server/`): `PoolDoc` does not participate in the clone-preview validator. Mitigation is `strip_changes`, not `validate`. Future write-bearing pool features would need the validator path wired back in.
-- **3D-7** (Design; `docs/adr/remote-workstation-doc-agents.md` workstation dispatch): **Reframed.** The routing contract exists and its core is implemented: owner-scoped `REQUEST` frames are validated by the room host, become queued executions with coordinator-owned provenance in `RuntimeStateDoc` (`crates/runtimed-wasm/src/lib.rs::receive_request`), and the runtime peer consumes them through normal `RuntimeStateDoc` sync while the shared policy rejects runtime-peer-forged execution intent. Remaining design is active-target selection, kernel-lifecycle request dispatch, and disconnect/liveness gating, tracked in `remote-workstation-doc-agents.md` (#3399).
-- **3D-8** (Design; `crates/runtimed/src/notebook_sync_server/peer_writer.rs`): The first peer-egress lane split has landed: `PeerWriter` separates reliable sync/response traffic from ephemeral presence/broadcast traffic. Remaining design work is reserved control capacity, explicit session-control barriers, and RuntimeStateDoc catch-up when reliable runtime traffic saturates. See `peer-egress-lanes.md`.
-- **3D-9** (Targeted PR; `crates/notebook-doc/`, `crates/runtime-doc/src/comms.rs`, sync bootstrap/load paths): `CommsDoc` now exists as a room document, but `NotebookDoc.comms_doc_id` has not landed. ADR 0002 requires a deterministic durable pointer so clone/save-as/publish/snapshot flows do not rely on room attachment alone.

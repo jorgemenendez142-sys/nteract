@@ -12,43 +12,23 @@ import type { SyncEngineLogger } from "./sync-engine";
 import type { NotebookRequestOptions, NotebookTransport } from "./transport";
 import { putBlob } from "./blob-upload";
 import type {
+  BokehSessionBufferRef,
+  BokehSessionPatchReply,
   CommBufferRef,
   CommRequestMessage,
   CompletionItem,
   DependencyGuard,
-  GuardedNotebookProvenance,
   HistoryEntry,
   NotebookRequest,
   NotebookResponse,
-  SaveErrorKind,
+  SaveBlockedReason,
+  SourceReconciliation,
+  SourceReconciliationBlockedReason,
+  SourceReconciliationOperation,
 } from "./request-types";
 
-/**
- * Thrown when `NotebookClient.saveNotebook` receives a structured
- * `SaveErrorKind` from the daemon. Callers that need to branch on the
- * kind (e.g., to surface the conflicting UUID on `path_already_open`)
- * can inspect `.kind`. `.message` is a user-facing rendering suitable
- * for display.
- */
-export class SaveNotebookError extends Error {
-  readonly kind: SaveErrorKind;
-  constructor(kind: SaveErrorKind) {
-    super(formatSaveError(kind));
-    this.name = "SaveNotebookError";
-    this.kind = kind;
-  }
-}
-
-function formatSaveError(kind: SaveErrorKind): string {
-  switch (kind.type) {
-    case "path_already_open":
-      return (
-        `Cannot save: ${kind.path} is already open in another notebook window. ` +
-        `Close that window first, or choose a different path.`
-      );
-    case "io":
-      return `Failed to save notebook: ${kind.message}`;
-  }
+export interface GuardedNotebookProvenance {
+  observed_heads: string[];
 }
 
 const nullLogger: SyncEngineLogger = {
@@ -59,6 +39,7 @@ const nullLogger: SyncEngineLogger = {
 };
 
 const SEND_COMM_INLINE_BUFFER_LIMIT_BYTES = 64 * 1024;
+const BOKEH_INLINE_BUFFER_LIMIT_BYTES = 64 * 1024;
 
 export interface NotebookClientOptions {
   transport: NotebookTransport;
@@ -74,6 +55,55 @@ export interface ExecuteCellOptions {
 export interface RunAllCellsOptions {
   cellExecutionIds?: Record<string, string> | null;
 }
+
+export interface BokehPatchBuffer {
+  id: string;
+  data: Uint8Array;
+}
+
+export interface ApplyBokehSessionPatchOptions {
+  sessionId: string;
+  transactionId: string;
+  baseRevision: number;
+  patch: Record<string, unknown>;
+  buffers?: BokehPatchBuffer[];
+}
+
+export type SaveNotebookOutcome =
+  | {
+      outcome: "saved";
+      path: string;
+      exportedHeads: string[];
+      saveSequence: number;
+    }
+  | {
+      outcome: "already_current";
+      path: string;
+      exportedHeads: string[];
+      saveSequence: number;
+    }
+  | {
+      outcome: "blocked";
+      path?: string | null;
+      saveSequence?: number | null;
+      reason: SaveBlockedReason;
+    };
+
+export type ReconcileNotebookSourceOutcome =
+  | {
+      outcome: "reconciled";
+      operation: SourceReconciliationOperation;
+      path: string;
+      archivedJournal?: string | null;
+      exportedHeads: string[];
+      saveSequence: number;
+      sourceGeneration: number;
+    }
+  | {
+      outcome: "blocked";
+      operation: SourceReconciliationOperation;
+      reason: SourceReconciliationBlockedReason;
+    };
 
 export class NotebookClient {
   private readonly transport: NotebookTransport;
@@ -329,14 +359,19 @@ export class NotebookClient {
    * Save the notebook to disk via the daemon.
    *
    * Pass `path` to save-as. Without `path`, saves in place — the daemon
-   * uses the room's current path and returns `save_error` if the room
+   * uses the room's current path and returns a blocked outcome if the room
    * is still untitled.
    *
-   * Throws `SaveNotebookError` on structured `save_error` responses (the
-   * `.kind` payload carries `path_already_open` / `io` details). Throws
-   * a plain `Error` on transport failures or unexpected response shapes.
+   * Returns an honest causal outcome. Only `saved` means atomic replacement
+   * committed and advanced RuntimeStateDoc's file checkpoint;
+   * `already_current` emits no saved timestamp, and `blocked` exposes the
+   * structured reason without turning it into a timeout or false success.
+   * Transport failures and unexpected response shapes still throw.
    */
-  async saveNotebook(options: { formatCells: boolean; path?: string }): Promise<{ path: string }> {
+  async saveNotebook(options: {
+    formatCells: boolean;
+    path?: string;
+  }): Promise<SaveNotebookOutcome> {
     const request: NotebookRequest = {
       type: "save_notebook",
       format_cells: options.formatCells,
@@ -353,13 +388,78 @@ export class NotebookClient {
 
     switch (response.result) {
       case "notebook_saved":
-        return { path: response.path };
-      case "save_error":
-        throw new SaveNotebookError(response.error);
+        return {
+          outcome: "saved",
+          path: response.path,
+          exportedHeads: response.exported_heads,
+          saveSequence: response.save_sequence,
+        };
+      case "notebook_already_current":
+        return {
+          outcome: "already_current",
+          path: response.path,
+          exportedHeads: response.exported_heads,
+          saveSequence: response.save_sequence,
+        };
+      case "notebook_save_blocked":
+        return {
+          outcome: "blocked",
+          path: response.path,
+          saveSequence: response.save_sequence,
+          reason: response.reason,
+        };
       case "error":
         throw new Error(`Daemon save failed: ${response.error}`);
       default:
         throw new Error(`Unexpected save_notebook response: ${JSON.stringify(response)}`);
+    }
+  }
+
+  /**
+   * Resolve a degraded room's recovered state against its bound `.ipynb`.
+   *
+   * This is intentionally separate from ordinary save/reload. The operation
+   * names which side wins (or preserves recovered state elsewhere), and the
+   * daemon restores mutation capabilities only after its file and recovery
+   * journal checkpoint commits.
+   */
+  async reconcileNotebookSource(
+    operation: SourceReconciliation,
+  ): Promise<ReconcileNotebookSourceOutcome> {
+    let response: NotebookResponse;
+    try {
+      response = await this.sendRequest(
+        { type: "reconcile_notebook_source", operation },
+        this.requiredHeadsOptions(),
+      );
+    } catch (e) {
+      this.log.error("[notebook-client] Source reconciliation request failed:", e);
+      throw e;
+    }
+
+    switch (response.result) {
+      case "notebook_source_reconciled":
+        return {
+          outcome: "reconciled",
+          operation: response.operation,
+          path: response.path,
+          archivedJournal: response.archived_journal,
+          exportedHeads: response.exported_heads,
+          saveSequence: response.save_sequence,
+          sourceGeneration: response.source_generation,
+        };
+      case "notebook_source_reconciliation_blocked":
+        return {
+          outcome: "blocked",
+          operation: response.operation,
+          reason: response.reason,
+        };
+      case "error":
+        throw new Error(`Daemon source reconciliation failed: ${response.error}`);
+      default:
+        throw new Error(
+          `Unexpected reconcile_notebook_source response: ${JSON.stringify(response)}`,
+        );
     }
   }
 
@@ -457,6 +557,72 @@ export class NotebookClient {
       return response;
     } catch (e) {
       this.log.error("[notebook-client] Send comm failed:", e);
+      throw e;
+    }
+  }
+
+  /** Apply one typed mutation to a kernel-owned Bokeh document session. */
+  async applyBokehSessionPatch(
+    options: ApplyBokehSessionPatchOptions,
+  ): Promise<BokehSessionPatchReply> {
+    this.log.debug(
+      "[notebook-client] Applying Bokeh session patch:",
+      options.sessionId,
+      options.baseRevision,
+    );
+    try {
+      const encoded = await Promise.all(
+        (options.buffers ?? []).map(async (buffer) => {
+          if (buffer.data.byteLength <= BOKEH_INLINE_BUFFER_LIMIT_BYTES) {
+            return {
+              inline: {
+                id: buffer.id,
+                data: Array.from(buffer.data),
+              },
+            };
+          }
+          const uploaded = await putBlob(
+            this.transport,
+            buffer.data,
+            "application/octet-stream",
+            "ephemeral",
+          );
+          return {
+            ref: {
+              id: buffer.id,
+              blob: uploaded.blob,
+              size: uploaded.size,
+              media_type: uploaded.media_type,
+            } satisfies BokehSessionBufferRef,
+          };
+        }),
+      );
+      const response = await this.sendRequest({
+        type: "apply_bokeh_session_patch",
+        request: {
+          session_id: options.sessionId,
+          transaction_id: options.transactionId,
+          base_revision: options.baseRevision,
+          patch: options.patch,
+          buffers: encoded.flatMap((buffer) => (buffer.inline ? [buffer.inline] : [])),
+          buffer_refs: encoded.flatMap((buffer) => (buffer.ref ? [buffer.ref] : [])),
+        },
+      });
+
+      switch (response.result) {
+        case "bokeh_session_patch":
+          return response.reply;
+        case "no_kernel":
+          throw new Error("No kernel running");
+        case "error":
+          throw new Error(response.error);
+        default:
+          throw new Error(
+            `Unexpected apply_bokeh_session_patch response: ${JSON.stringify(response)}`,
+          );
+      }
+    } catch (e) {
+      this.log.error("[notebook-client] Bokeh session patch failed:", e);
       throw e;
     }
   }

@@ -43,12 +43,12 @@ The daemon (`runtimed`) is a singleton coordinating notebook windows over a Unix
 
 ### How `cargo xtask build` works (4 phases)
 
-0. **Artifact guard** — verify gitignored WASM + renderer-plugin outputs. Build/dev commands fingerprint workspace inputs and skip wasm-pack when outputs are current; rebuild only when outputs are missing, invalid, or stale.
-1. **Single Rust compilation** — `cargo build -p runtimed -p runt -p mcp-supervisor -p notebook`. Sidecars copied to `crates/notebook/binaries/`.
+0. **Artifact guard** — verify gitignored WASM, renderer-plugin, and MCP widget outputs. Build/dev commands fingerprint workspace inputs and skip wasm-pack when outputs are current; rebuild only when outputs are missing, invalid, or stale.
+1. **Single Rust compilation** — `cargo build -p runtimed -p runt -p nteract-mcp -p mcp-supervisor`. Sidecars copied to `crates/notebook/binaries/`. The `notebook` crate is intentionally excluded until the Tauri link phase after frontend assets exist.
 2. **Frontend build** — `pnpm build` (TypeScript + Vite). `--rust-only` skips this.
 3. **Tauri link** — `cargo tauri build --debug --no-bundle` with embedded frontend assets. Use `--skip-tauri` only for fast edit checks where updated sidecar binaries are enough; run a normal build before launching the bundled app.
 
-All Rust targets build in one `cargo build` call to avoid feature-unification recompilation. WASM outputs are gitignored; `runtimed`'s `build.rs` panics if missing.
+All Rust targets build in one `cargo build` call to avoid feature-unification recompilation. WASM outputs are gitignored; `runtimed`'s `build.rs` panics if missing. `nteract-mcp` embeds the MCP widget HTML; prepare it with `cargo xtask artifacts ensure mcp-widget`.
 
 ### WASM rebuild
 
@@ -148,7 +148,9 @@ RUNTIMED_SOCKET_PATH="$(./target/debug/runt daemon status --json | python3 -c 'i
 
 The MCP server ships as `runt mcp` (Rust). Run via `cargo xtask run-mcp` for development.
 
-**Advertised tools:** `list_active_notebooks`, `connect_notebook`, `create_notebook`, `save_notebook`, `show_notebook`, `disconnect_notebook`, `get_cell`, `get_all_cells`, `create_cell`, `set_cell`, `delete_cell`, `move_cell`, `execute_cell`, `run_all_cells`, `get_results`, `interrupt_kernel`, `restart_kernel`, `manage_dependencies`, `replace_match`, `replace_regex`.
+**Advertised tools** (`all_tools()`): `list_active_notebooks`, `list_notebooks`, `connect_notebook`, `create_notebook`, `save_notebook`, `show_notebook`, `disconnect_notebook`, `create_cell`, `set_cell`, `delete_cell`, `move_cell`, `execute_cell`, `run_all_cells`, `get_results`, `interrupt_kernel`, `restart_kernel`, `manage_dependencies`, `replace_match`, `replace_regex`.
+
+**Hidden/callable read tools** (`hidden_tools()`): `get_cell`, `get_all_cells`. These are callable but not advertised in `list_tools()` — dispatch-only read paths for clients that prefer direct tool calls over resource URIs.
 
 Legacy dependency and cell-metadata tool names still dispatch for compatibility, but new workflows should use `manage_dependencies` for dependency inspection/edits and `get_results` for execution output lookup by `execution_id`.
 
@@ -200,29 +202,6 @@ Each open notebook has a room (`NotebookRoom`), keyed by UUID. A `PathIndex` map
 - Per-cell O(1) accessors must stay in sync across WASM, Rust, and Python.
 - Hold tokio mutex guards only within synchronous blocks (use block scoping, verify with `cargo test -p runtimed --test tokio_mutex_lint`).
 - Cell list renders in stable DOM order (sorted by ID) with CSS `order` for visual positioning.
-
-## Code Structure
-
-```
-crates/runtimed/src/
-  daemon.rs                — State, pool management, connection routing
-  notebook_sync_server/    — Room lifecycle, peer sync, persistence
-  jupyter_kernel.rs        — Process spawn, ZMQ wiring, IOPub routing
-  output_prep.rs           — QueueCommand, iopub → nbformat, blob offload
-  runtime_agent.rs         — Kernel lifecycle, RuntimeStateDoc writes
-  blob_store.rs            — Content-addressed store with metadata sidecars
-  singleton.rs             — Lock file, PID tracking
-crates/runtimed-client/src/
-  client.rs                — Client APIs (Python bindings, MCP)
-  daemon_paths.rs          — Socket/blob path resolution
-  settings_doc.rs          — Settings Automerge schema
-crates/runtimed-outputs/src/
-  output_resolver.rs       — Shared manifest resolution
-crates/runtimed-py/        — PyO3/maturin bindings
-python/runtimed/           — Python SDK package
-python/nteract/            — MCP wrapper (launches `runt mcp`)
-python/gremlin/            — Autonomous notebook stress tester
-```
 
 ## Troubleshooting
 

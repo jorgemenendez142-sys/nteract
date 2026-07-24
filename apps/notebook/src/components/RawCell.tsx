@@ -5,7 +5,7 @@ import { CodeMirrorEditor, type CodeMirrorEditorRef } from "@/components/editor/
 import { remoteCursorsExtension } from "@/components/editor/remote-cursors";
 import { searchHighlight } from "@/components/editor/search-highlight";
 import { textAttributionExtension } from "@/components/editor/text-attribution";
-import { usePresenceContext } from "../contexts/PresenceContext";
+import { usePresenceContext } from "@/components/notebook/presence-context";
 import { useCellKeyboardNavigation } from "../hooks/useCellKeyboardNavigation";
 import { useCrdtBridge } from "../hooks/useCrdtBridge";
 import {
@@ -18,8 +18,16 @@ import { onEditorRegistered, onEditorUnregistered } from "../lib/cursor-registry
 import { detectRawFormat } from "../lib/detect-raw-format";
 import { registerCellEditor, unregisterCellEditor } from "../lib/editor-registry";
 import { presenceSenderExtension } from "../lib/presence-sender";
+import { commentHighlightExtension } from "../lib/comment-highlight-extension";
+import { refreshCellCommentHighlights } from "../lib/comment-highlights";
+import type {
+  SourceCommentSelectionRect,
+  SourceRangeCommentAnchor,
+} from "../lib/comment-source-anchor";
+import { sourceCommentExtension } from "../lib/source-comment-extension";
 import type { RawCell as RawCellType } from "../types";
 import { CellPresenceIndicators } from "./cell/CellPresenceIndicators";
+import { EditorContextMenu } from "./EditorContextMenu";
 
 interface RawCellProps {
   cell: RawCellType;
@@ -28,6 +36,7 @@ interface RawCellProps {
   onFocusPrevious?: (cursorPosition: "start" | "end") => void;
   onFocusNext?: (cursorPosition: "start" | "end") => void;
   onInsertCellAfter?: () => void;
+  onChangeCellType?: (type: "code" | "markdown") => void;
   isLastCell?: boolean;
   /** Props for dnd-kit drag handle (applied to ribbon) */
   dragHandleProps?: Record<string, unknown>;
@@ -36,6 +45,12 @@ interface RawCellProps {
   /** Content for the right gutter (e.g., delete button) */
   rightGutterContent?: ReactNode;
   readOnly?: boolean;
+  onCreateSourceComment?: (
+    anchor: SourceRangeCommentAnchor,
+    rect: SourceCommentSelectionRect | null,
+    quote?: string | null,
+  ) => void;
+  onActivateCommentThread?: (threadId: string) => void;
 }
 
 export const RawCell = memo(function RawCell({
@@ -45,11 +60,14 @@ export const RawCell = memo(function RawCell({
   onFocusPrevious,
   onFocusNext,
   onInsertCellAfter,
+  onChangeCellType,
   isLastCell = false,
   dragHandleProps,
   isDragging,
   rightGutterContent,
   readOnly = false,
+  onCreateSourceComment,
+  onActivateCommentThread,
 }: RawCellProps) {
   const isFocused = useIsCellFocused(cell.id);
   const isPreviousCellFromFocused = useIsPreviousCellFromFocused(cell.id);
@@ -68,6 +86,7 @@ export const RawCell = memo(function RawCell({
         registeredViewRef.current = view;
         registerCellEditor(cell.id, view);
         onEditorRegistered(cell.id);
+        refreshCellCommentHighlights(cell.id);
         return true;
       }
       return false;
@@ -136,13 +155,13 @@ export const RawCell = memo(function RawCell({
     [isLastCell, onFocusNext, onInsertCellAfter, readOnly],
   );
 
-  // Remote cursors extension (stable — no deps that change)
+  // Remote cursors extension, stable with no deps that change.
   const remoteCursorsExt = useMemo(() => remoteCursorsExtension(), []);
 
-  // Text attribution extension (stable — no deps that change)
+  // Text attribution extension, stable with no deps that change.
   const textAttributionExt = useMemo(() => textAttributionExtension(), []);
 
-  // Presence sender extension — broadcasts local cursor/selection to other peers
+  // Presence sender extension broadcasts local cursor/selection to other peers.
   const presenceSenderExt = useMemo(() => {
     if (!presence) return [];
     return [
@@ -153,15 +172,42 @@ export const RawCell = memo(function RawCell({
     ];
   }, [cell.id, presence]);
 
-  // Search highlight extension + remote cursors + presence sender
+  const sourceCommentExt = useMemo(() => {
+    // The create affordance (selection tooltip + keymap) needs editor focus,
+    // which a read-only editor never takes, so offer it only on editable cells.
+    // Reading existing threads stays open to everyone via commentHighlightExt.
+    if (readOnly || !onCreateSourceComment) return [];
+    return [sourceCommentExtension(cell.id, onCreateSourceComment)];
+  }, [cell.id, onCreateSourceComment, readOnly]);
+
+  const commentHighlightExt = useMemo(() => {
+    if (!onActivateCommentThread) return [];
+    return [
+      commentHighlightExtension({
+        onActivate: onActivateCommentThread,
+        onReady: () => refreshCellCommentHighlights(cell.id),
+      }),
+    ];
+  }, [cell.id, onActivateCommentThread]);
+
+  // Search highlight extension, remote cursors, presence, and comments.
   const searchExtensions = useMemo(
     () => [
       ...searchHighlight(searchQuery || ""),
       ...remoteCursorsExt,
       ...textAttributionExt,
       ...presenceSenderExt,
+      ...sourceCommentExt,
+      ...commentHighlightExt,
     ],
-    [searchQuery, remoteCursorsExt, textAttributionExt, presenceSenderExt],
+    [
+      searchQuery,
+      remoteCursorsExt,
+      textAttributionExt,
+      presenceSenderExt,
+      sourceCommentExt,
+      commentHighlightExt,
+    ],
   );
 
   // Get keyboard navigation bindings
@@ -205,18 +251,26 @@ export const RawCell = memo(function RawCell({
             </span>
           </div>
           <div>
-            <CodeMirrorEditor
-              ref={editorRef}
-              initialValue={cell.source}
-              language={language}
-              lineWrapping
-              keyMap={keyMap}
-              extensions={[crdtBridgeExt, ...searchExtensions]}
-              placeholder="Enter raw content..."
-              className="min-h-[2rem]"
-              autoFocus={isFocused}
+            <EditorContextMenu
+              cellId={cell.id}
+              cellType="raw"
               readOnly={readOnly}
-            />
+              onChangeCellType={onChangeCellType}
+              onCreateSourceComment={onCreateSourceComment}
+            >
+              <CodeMirrorEditor
+                ref={editorRef}
+                initialValue={cell.source}
+                language={language}
+                lineWrapping
+                keyMap={keyMap}
+                extensions={[crdtBridgeExt, ...searchExtensions]}
+                placeholder="Enter raw content..."
+                className="min-h-[2rem]"
+                autoFocus={isFocused}
+                readOnly={readOnly}
+              />
+            </EditorContextMenu>
           </div>
         </>
       }

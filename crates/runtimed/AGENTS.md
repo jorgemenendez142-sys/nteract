@@ -1,6 +1,6 @@
 # Runtime daemon (runtimed)
 
-Scope: `crates/runtimed/**`, `crates/runt/**`, `crates/runtimed-client/**`, `crates/runtimed-outputs/**`, `crates/runtimed-service/**`, `crates/runtimed-settings-sync/**`, `crates/runtimed-py/**`, `crates/runtime-doc/**`, `crates/notebook-wire/**`, `crates/notebook-doc/**`, `crates/notebook-protocol/**`, `crates/notebook-sync/**`, `packages/runtimed/**`.
+Scope: `crates/runtimed/**`, `crates/runt/**`, `crates/runtimed-client/**`, `crates/runtimed-outputs/**`, `crates/runtimed-service/**`, `crates/runtimed-settings-sync/**`, `crates/runtimed-py/**`, `crates/runtime-doc/**`, `crates/comments-doc/**`, `crates/notebook-wire/**`, `crates/notebook-doc/**`, `crates/notebook-protocol/**`, `crates/notebook-sync/**`, `packages/runtimed/**`.
 
 ## Core principles
 
@@ -38,15 +38,16 @@ The Tauri app crate (`crates/notebook/`) is glue — it wires Tauri commands to 
 | Cell source (`Text` CRDT) | Frontend WASM | Local-first, character-level merge |
 | Cell position, type, metadata | Frontend WASM | User-initiated via UI |
 | Notebook metadata (deps, runtime) | Frontend WASM | User edits deps, runtime picker |
-| Cell outputs (inline manifests) | Daemon | Kernel IOPub → blob store → inline manifest Maps in RuntimeStateDoc |
-| Execution count | Daemon | Set on `execute_input` from kernel |
+| Cell outputs (inline manifests) | Local daemon / runtime peer | Kernel IOPub → blob store → inline manifest Maps in RuntimeStateDoc |
+| Execution count | Local daemon / runtime peer | Set on `execute_input` from kernel |
 | Widget state | Daemon/runtime agent + frontend comm deltas | RuntimeStateDoc holds comm topology; CommsDoc holds mutable comm state; the runtime agent gates state by topology, suppresses echoes, and forwards accepted frontend deltas to the kernel |
-| RuntimeStateDoc (kernel status, queue, executions, env, trust) | Daemon | Separate per-notebook Automerge doc synced via frame `0x05` |
+| RuntimeStateDoc (kernel status, queue, executions, env, trust) | Local daemon / room host / runtime peer, policy-scoped | Separate per-notebook Automerge doc synced via frame `0x05`; regular clients read it but do not author it |
 | CommsDoc (widget state) | Daemon/runtime agent + frontend comm deltas | Separate per-notebook Automerge doc synced via frame `0x09` |
+| CommentsDoc (notebook comments) | Frontend WASM + daemon | Durable sidecar per-notebook Automerge doc synced via frame `0x0a`; daemon persists to disk and validates change actor labels at ingress, stripping writes from scopes without comment authority |
 
 ## RuntimeStateDoc
 
-Each notebook room has a daemon-authoritative **RuntimeStateDoc** — a separate Automerge document (frame type `0x05`). It tracks:
+Each notebook room has a runtime-authoritative **RuntimeStateDoc** — a separate Automerge document (frame type `0x05`). It tracks:
 
 - **Kernel state**: status, starting phase, name, language, env_source
 - **Execution queue**: `executing_execution_id` plus ordered `queued_execution_ids`; notebook cells point at executions from `NotebookDoc`
@@ -54,9 +55,14 @@ Each notebook room has a daemon-authoritative **RuntimeStateDoc** — a separate
 - **Environment drift**: in_sync flag, added/removed packages
 - **Trust state**: status and needs_approval flag
 
-The daemon is the authoritative writer for kernel lifecycle, env, trust, queue, execution, output state, and comm topology. Frontend reads via `useRuntimeState()`, and Python reads via `notebook.runtime`. Widget values live in the paired CommsDoc so RuntimeStateDoc remains daemon-owned; the runtime agent gates CommsDoc deltas by RuntimeStateDoc topology and filters out kernel-authored echoes before forwarding foreign deltas to the kernel.
-
-Key files: `crates/runtime-doc/src/doc.rs`, `crates/runtime-doc/src/handle.rs`, `apps/notebook/src/lib/runtime-state.ts`.
+Regular notebook clients read RuntimeStateDoc via sync but do not author it. In
+local rooms, the daemon writes runtime state. In hosted/runtime-agent paths,
+runtime peers may write policy-allowed lifecycle, queue/progress, output, and
+comm-topology updates for accepted work, while the room host/local daemon owns
+environment, trust, path/save, workstation, and schema/root facts. Widget values
+live in the paired CommsDoc; the runtime agent gates CommsDoc deltas by
+RuntimeStateDoc topology and filters out kernel-authored echoes before
+forwarding foreign deltas to the kernel.
 
 ## Binary vs text content
 
@@ -189,7 +195,7 @@ runt notebooks              # List open notebooks
 
 ### Cloud workstation attach
 
-Remote machines offer compute to hosted notebook rooms via `runtimed cloud-runtime-agent`. The agent dials out over WebSocket — no inbound ports required. See `docs/remote-workstation.md` for the operator path and `docs/adr/remote-workstation-doc-agents.md` for design context.
+Remote machines offer compute to hosted notebook rooms via `runtimed cloud-runtime-agent`. The agent dials out over WebSocket — no inbound ports required. See `docs/runbooks/remote-workstation.md` for the operator path and `docs/adr/remote-workstation-doc-agents.md` for design context.
 
 ```bash
 RUNT_CLOUD_TOKEN=<token> runtimed cloud-runtime-agent \
@@ -198,36 +204,6 @@ RUNT_CLOUD_TOKEN=<token> runtimed cloud-runtime-agent \
 ```
 
 The workstation module lives in `crates/runtimed/src/workstation/`. It handles the cloud agent CLI, launch-on-attach, environment allocation, and reconnect logic.
-
-## Code structure
-
-```
-crates/runtimed/src/
-├── main.rs                   # CLI entry point (runtimed and cloud-runtime-agent subcommands)
-├── daemon.rs                 # State, pool management, connection routing
-├── notebook_sync_server/     # Room lifecycle, peer sync, persistence, metadata/trust
-├── runtime_agent.rs          # Runtime agent subprocess: peer, CRDT queue, kernel ownership
-├── runtime_agent_handle.rs   # Coordinator-side agent spawn + monitor
-├── jupyter_kernel.rs         # Process spawn, ZMQ sockets, IOPub routing
-├── output_prep.rs            # IOPub → nbformat conversion, widget buffers, blob offload
-├── output_committer.rs       # Output commit pipeline with priority path for control signals
-├── output_blob_publisher.rs  # Blob upload coordination for output manifests
-├── stream_committer.rs       # Stream output (stdout/stderr) batched commit path
-├── stream_terminal.rs        # Terminal emulator for carriage-return/ANSI in stream output
-├── output_store.rs           # Manifest creation, blob inlining threshold
-├── blob_store.rs             # Content-addressed storage with metadata sidecars
-├── blob_server.rs            # HTTP read server (hyper 1.x)
-├── inline_env.rs             # Inline dependency env caching
-├── project_file.rs           # Unified project file detection (closest-wins walk-up)
-├── pixi_project.rs           # Pixi project launch helpers (offline-tolerant shell-hook probe)
-├── uv_project.rs             # UV project launch helpers
-├── workstation/              # Cloud workstation: agent CLI, launch-on-attach, env allocation
-├── cloud_peer.rs             # Hosted cloud peer session (outbound WebSocket runtime_peer)
-├── embedded_plugins.rs       # Renderer plugin bytes embedded at build time
-├── singleton.rs              # Daemon locking/singleton
-├── sync_server.rs            # Settings Automerge sync
-└── task_supervisor.rs        # Background task supervision
-```
 
 ## Shipped app behavior
 
@@ -245,22 +221,3 @@ Manage with `runt daemon start/stop/status/logs`. Cross-platform install/uninsta
 **Pool not replenishing:** Verify `uv --version` works and check `~/.cache/<namespace>/envs/`.
 
 **Python bindings "Failed to parse output":** Usually connecting to wrong daemon (missing blob access). Set `RUNTIMED_SOCKET_PATH` to the correct daemon's socket.
-
-## Key files
-
-| File | Role |
-|------|------|
-| `crates/notebook-doc/src/lib.rs` | `NotebookDoc` — Automerge schema, cell CRUD |
-| `crates/notebook-doc/src/diff.rs` | `CellChangeset` — structural diff from patches |
-| `crates/notebook-doc/src/mime.rs` | Canonical MIME classification |
-| `crates/notebook-protocol/src/protocol.rs` | Wire types: requests, responses, broadcasts |
-| `crates/notebook-sync/src/handle.rs` | `DocHandle` — sync infrastructure |
-| `crates/runtime-doc/src/doc.rs` | `RuntimeStateDoc` schema |
-| `crates/runtimed/src/notebook_sync_server/` | Room lifecycle, peer sync |
-| `crates/runtimed/src/output_prep.rs` | IOPub conversion, widget buffers |
-| `crates/runtimed/src/output_store.rs` | Manifest creation, `ContentRef` |
-| `crates/runtimed/src/blob_store.rs` | Content-addressed storage |
-| `crates/runtimed/src/blob_server.rs` | HTTP blob server |
-| `crates/runtimed-outputs/src/output_resolver.rs` | Shared Rust manifest resolution |
-| `apps/notebook/src/lib/manifest-resolution.ts` | Frontend resolution (WASM resolves directly) |
-| `apps/notebook/src/lib/notebook-cells.ts` | Split cell store, per-cell subscriptions |

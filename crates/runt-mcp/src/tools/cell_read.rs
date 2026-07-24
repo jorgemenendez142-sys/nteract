@@ -1,6 +1,6 @@
 //! Read-only cell tools: get_cell, get_all_cells.
 
-use rmcp::model::{CallToolRequestParams, CallToolResult, Content};
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::ErrorData as McpError;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -72,7 +72,43 @@ pub async fn get_cell(
         .ok_or_else(|| McpError::invalid_params("Missing required parameter: cell_id", None))?;
     let full_output = arg_bool(request, "full_output").unwrap_or(false);
 
-    let handle = require_handle!(server);
+    let access = require_session_access!(server, ProjectionRead);
+    if !access.readiness.interactive {
+        let Some(projection) = access.projection.as_ref() else {
+            return super::session_access_error(crate::session::SessionAccessError {
+                code: "notebook_not_ready",
+                message: "The notebook projection is not available yet".to_string(),
+                readiness: Box::new(access.readiness),
+            });
+        };
+        let Some(cell) = projection.cells.iter().find(|cell| cell.id == cell_id) else {
+            return tool_error(&format!("Cell not found in retained projection: {cell_id}"));
+        };
+        let details = serde_json::json!({
+            "cell": {
+                "cell_id": cell.id,
+                "cell_type": cell.cell_type,
+                "source_preview": cell.source_preview,
+                "execution_id": cell.execution_id,
+                "execution_status": cell.execution_status,
+                "execution_count": cell.execution_count,
+            },
+            "projection": {
+                "generation": projection.load_generation,
+                "heads": projection.projection_heads,
+                "complete": projection.projection_complete,
+                "bounded_source_preview": true,
+                "outputs_available": false,
+            },
+            "readiness": access.readiness,
+        });
+        let mut result = CallToolResult::success(vec![formatting::assistant_text(
+            serde_json::to_string_pretty(&details).unwrap_or_default(),
+        )]);
+        result.structured_content = Some(details);
+        return Ok(result);
+    }
+    let handle = access.handle;
 
     // No presence on read — get_cell is read-only, shouldn't move the cursor.
 
@@ -154,18 +190,18 @@ pub async fn get_cell(
     let mut items = Vec::new();
 
     if !cell.source.is_empty() {
-        items.push(Content::text(format!(
+        items.push(formatting::assistant_text(format!(
             "{header_with_tags}\n\n{}",
             cell.source
         )));
     } else {
-        items.push(Content::text(header_with_tags));
+        items.push(formatting::assistant_text(header_with_tags));
     }
 
     // Each output as a separate Content item (matches Python _cell_to_content)
     let output_summaries = output_summary_lines(&outputs, &raw_outputs, 120);
     if !output_summaries.is_empty() {
-        items.push(Content::text(format!(
+        items.push(formatting::assistant_text(format!(
             "Output summary:\n{}",
             output_summaries.join("\n")
         )));
@@ -190,7 +226,7 @@ pub async fn get_all_cells(
             "preview_chars",
         ],
     )?;
-    let handle = require_handle!(server);
+    let access = require_session_access!(server, ProjectionRead);
 
     let format = get_all_cells_format(request)?;
     let start = request
@@ -212,6 +248,79 @@ pub async fn get_all_cells(
         .and_then(|a| a.get("preview_chars"))
         .and_then(|v| v.as_i64())
         .unwrap_or(60) as usize;
+
+    if !access.readiness.interactive {
+        let Some(projection) = access.projection.as_ref() else {
+            return super::session_access_error(crate::session::SessionAccessError {
+                code: "notebook_not_ready",
+                message: "The notebook projection is not available yet".to_string(),
+                readiness: Box::new(access.readiness),
+            });
+        };
+        let end = match count {
+            Some(count) => (start + count).min(projection.cells.len()),
+            None => projection.cells.len(),
+        };
+        let cells =
+            &projection.cells[start.min(projection.cells.len())..end.min(projection.cells.len())];
+        let projected_cells = cells
+            .iter()
+            .map(|cell| {
+                let mut source_preview = cell.source_preview.clone();
+                if source_preview.chars().count() > preview_chars {
+                    source_preview = source_preview.chars().take(preview_chars).collect();
+                    source_preview.push('…');
+                }
+                serde_json::json!({
+                    "cell_id": cell.id,
+                    "cell_type": cell.cell_type,
+                    "source_preview": source_preview,
+                    "execution_id": cell.execution_id,
+                    "execution_status": cell.execution_status,
+                    "execution_count": cell.execution_count,
+                })
+            })
+            .collect::<Vec<_>>();
+        let details = serde_json::json!({
+            "cells": projected_cells.clone(),
+            "projection": {
+                "generation": projection.load_generation,
+                "heads": projection.projection_heads,
+                "complete": projection.projection_complete,
+                "bounded_source_preview": true,
+                "outputs_available": false,
+            },
+            "readiness": access.readiness,
+        });
+        let text = match format {
+            GetAllCellsFormat::Summary => projected_cells
+                .iter()
+                .map(|cell| {
+                    format!(
+                        "[{}] {}: {}",
+                        cell.get("cell_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        cell.get("cell_type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown"),
+                        cell.get("source_preview")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            GetAllCellsFormat::Json | GetAllCellsFormat::Rich => {
+                serde_json::to_string_pretty(&details).unwrap_or_default()
+            }
+        };
+        let mut result = CallToolResult::success(vec![formatting::assistant_text(text)]);
+        result.structured_content = Some(details);
+        return Ok(result);
+    }
+
+    let handle = access.handle;
 
     let cells = handle.get_cells();
     let end = match count {
@@ -282,7 +391,9 @@ pub async fn get_all_cells(
                 }));
             }
             let text = serde_json::to_string_pretty(&json_cells).unwrap_or_default();
-            Ok(CallToolResult::success(vec![Content::text(text)]))
+            Ok(CallToolResult::success(vec![formatting::assistant_text(
+                text,
+            )]))
         }
         GetAllCellsFormat::Rich => {
             let mut items = Vec::new();
@@ -322,10 +433,10 @@ pub async fn get_all_cells(
                 } else {
                     header
                 };
-                items.push(Content::text(text));
+                items.push(formatting::assistant_text(text));
                 let output_summaries = output_summary_lines(&outputs, raw_outputs, 120);
                 if !output_summaries.is_empty() {
-                    items.push(Content::text(format!(
+                    items.push(formatting::assistant_text(format!(
                         "Output summary:\n{}",
                         output_summaries.join("\n")
                     )));

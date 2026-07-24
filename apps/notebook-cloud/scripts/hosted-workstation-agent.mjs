@@ -17,6 +17,7 @@ import {
   retryCooldownMs,
   retryAfterMs,
   runtimePeerExitMessage,
+  STALE_WORKSTATION_RETRYABLE_STATUS_CODES,
   stableWorkstationId,
 } from "./hosted-workstation-agent-core.mjs";
 import { notebookCloudBaseUrl, notebookCloudWorkspaceRoot } from "./local-dev.mjs";
@@ -42,12 +43,12 @@ const workingDirectory = path.resolve(process.env.NOTEBOOK_CLOUD_WORKSTATION_CWD
 const pollIntervalMs = parsePositiveInteger(
   process.env.NOTEBOOK_CLOUD_WORKSTATION_POLL_MS,
   "NOTEBOOK_CLOUD_WORKSTATION_POLL_MS",
-  2_000,
+  60_000,
 );
 const heartbeatIntervalMs = parsePositiveInteger(
   process.env.NOTEBOOK_CLOUD_WORKSTATION_HEARTBEAT_MS,
   "NOTEBOOK_CLOUD_WORKSTATION_HEARTBEAT_MS",
-  20_000,
+  60_000,
 );
 const runtimedBin = path.resolve(
   workspaceRoot,
@@ -142,7 +143,9 @@ async function runAgentStep(step, fn) {
 
 async function heartbeatIfNeeded(pythonPath) {
   const now = Date.now();
-  if (now - lastHeartbeatAt < heartbeatIntervalMs) {
+  const shouldRegister =
+    lastHeartbeatAt === 0 || (activeJobs.size > 0 && now - lastHeartbeatAt >= heartbeatIntervalMs);
+  if (!shouldRegister) {
     return false;
   }
   await registerWorkstation(pythonPath);
@@ -178,7 +181,9 @@ async function pollAttachJobs(pythonPath) {
     },
   );
   const body = await parseHttpResponseBody(response);
-  assertResponse(response, body, "poll attach jobs", [200]);
+  assertResponse(response, body, "poll attach jobs", [200], {
+    retryStatuses: STALE_WORKSTATION_RETRYABLE_STATUS_CODES,
+  });
   for (const job of normalizeJobs(body)) {
     if (activeJobs.has(job.job_id)) continue;
     if (job.status === "pending") {
@@ -580,12 +585,12 @@ async function assertBinaryExists(binaryPath, name) {
   }
 }
 
-function assertResponse(response, body, label, expectedStatuses) {
+function assertResponse(response, body, label, expectedStatuses, options = {}) {
   if (expectedStatuses.includes(response.status)) return;
   const error = new Error(
     `${label} failed: HTTP ${response.status} ${JSON.stringify(body).slice(0, 500)}`,
   );
-  error.retryAfterMs = retryAfterMs(response);
+  error.retryAfterMs = retryAfterMs(response, undefined, options.retryStatuses);
   throw error;
 }
 

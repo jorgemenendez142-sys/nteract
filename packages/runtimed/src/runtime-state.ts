@@ -100,6 +100,12 @@ export interface KernelState {
   name: string;
   language: string;
   env_source: string;
+  /**
+   * Runtime-peer liveness heartbeat. Cloud runtime peers stamp this when their
+   * room link is alive so viewers can distinguish "never attached" from
+   * "previously attached, now stale."
+   */
+  last_seen: string | null;
 }
 
 export interface QueueEntry {
@@ -212,6 +218,41 @@ export interface CommDocEntry {
   seq: number;
 }
 
+export type BokehSessionStatus = "connected" | "disconnected" | "closed" | "error";
+
+export interface BokehSessionContentRef {
+  blob: string;
+  size: number;
+  media_type: string;
+}
+
+export interface BokehSessionCheckpoint {
+  revision: number;
+  content_ref: BokehSessionContentRef;
+}
+
+export interface BokehSessionPatchRef {
+  base_revision: number;
+  revision: number;
+  content_ref: BokehSessionContentRef;
+}
+
+/** Durable topology and replay coordinates for a live Bokeh document. */
+export interface BokehSessionState {
+  output_id: string;
+  cell_id: string;
+  execution_id: string;
+  kernel_id: string;
+  status: BokehSessionStatus;
+  head_revision: number;
+  producer_name: string;
+  producer_version: string;
+  bokeh_version: string;
+  root_ids: string[];
+  checkpoint: BokehSessionCheckpoint | null;
+  patch_tail: BokehSessionPatchRef[];
+}
+
 /** A detected status transition for a single execution. */
 export interface ExecutionTransition {
   execution_id: string;
@@ -283,6 +324,25 @@ export type ProjectContext =
  * room. The daemon/room host writes this into RuntimeStateDoc so late joiners
  * can see compute attachment state without polling a separate registry.
  */
+export type WorkstationAcceleratorReadiness = "ready" | "not_ready" | "unknown";
+
+export interface WorkstationAcceleratorState {
+  /** Extensible accelerator class. The initial native detector publishes `gpu`. */
+  kind: string;
+  vendor?: string | null;
+  model?: string | null;
+  /** Number of identical devices represented by this entry. */
+  count: number;
+  /** Physical memory on each device, never a claim about currently free memory. */
+  memory_bytes_per_device?: number | null;
+  /**
+   * `ready` means the workstation runtime verified device access. It does not
+   * mean the device is idle, free, or schedulable.
+   */
+  readiness: WorkstationAcceleratorReadiness;
+  diagnostic?: string | null;
+}
+
 export interface WorkstationAttachmentState {
   workstation_id: string;
   display_name: string;
@@ -293,9 +353,29 @@ export interface WorkstationAttachmentState {
   status_message?: string | null;
   cpu_count?: number | null;
   memory_bytes?: number | null;
+  /** Missing/null is unknown (for example an older agent); [] is known none. */
+  accelerators?: readonly WorkstationAcceleratorState[] | null;
   working_directory?: string | null;
   updated_at?: string | null;
   runtime_session_id?: string | null;
+}
+
+/** Why the file-backed source is not currently healthy. */
+export type FileSourceIssue =
+  | { kind: "conflict"; reason: string }
+  | { kind: "degraded"; reason: string };
+
+/**
+ * Causal `.ipynb` checkpoint projected by the daemon.
+ *
+ * Empty heads plus a null sequence means no file checkpoint has committed.
+ * `source_issue` is independent so a recovery conflict can be surfaced even
+ * before any checkpoint exists.
+ */
+export interface FileCheckpointState {
+  exported_heads: string[];
+  save_sequence: number | null;
+  source_issue: FileSourceIssue | null;
 }
 
 export interface RuntimeState {
@@ -309,6 +389,8 @@ export interface RuntimeState {
   env: EnvState;
   trust: TrustState;
   last_saved: string | null;
+  /** Daemon-authored causal file checkpoint and source health. */
+  file_checkpoint: FileCheckpointState;
   /**
    * Path to the notebook's `.ipynb` on the daemon's disk. `null` for
    * untitled notebooks; the daemon writes this on save / save-as.
@@ -316,6 +398,7 @@ export interface RuntimeState {
   path: string | null;
   executions: Record<string, ExecutionState>;
   comms: Record<string, CommDocEntry>;
+  bokeh_sessions: Record<string, BokehSessionState>;
   /**
    * Daemon-observed project file context. Clients read this instead of
    * walking the filesystem themselves.
@@ -338,6 +421,7 @@ export const DEFAULT_RUNTIME_STATE: RuntimeState = {
     name: "",
     language: "",
     env_source: "",
+    last_seen: null,
   },
   queue: {
     executing: null,
@@ -363,9 +447,15 @@ export const DEFAULT_RUNTIME_STATE: RuntimeState = {
     approved_pixi_channels: [],
   },
   last_saved: null,
+  file_checkpoint: {
+    exported_heads: [],
+    save_sequence: null,
+    source_issue: null,
+  },
   path: null,
   executions: {},
   comms: {},
+  bokeh_sessions: {},
   project_context: { state: "Pending" },
   workstation: null,
 };

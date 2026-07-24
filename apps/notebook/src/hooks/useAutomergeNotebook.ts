@@ -1,8 +1,13 @@
 import { startRelayBootstrapCoordinator, useNotebookHost } from "@nteract/notebook-host";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { NotebookTransport, SessionStatus, SyncableHandle } from "runtimed";
+import type {
+  HostedBridgeStatus,
+  NotebookTransport,
+  SessionStatus,
+  SyncableHandle,
+} from "runtimed";
 import { NotebookHandleHost, SyncEngine, isDisplayCapableJupyterOutput } from "runtimed";
-import { Observable } from "rxjs";
+import { BehaviorSubject, Observable } from "rxjs";
 import { needsPlugin, preWarmForMimes } from "@/components/isolated/iframe-libraries";
 import {
   getBlobPort,
@@ -23,7 +28,8 @@ import {
   updateCellById,
   useCellIds,
 } from "@/components/notebook/state/cell-store";
-import { createNotebookController } from "../lib/notebook-controller";
+import { flushCellUIState, setFocusedCellId } from "@/components/notebook/state/cell-ui-state";
+import { createNotebookController } from "@/components/notebook/state/notebook-controller";
 import {
   applyExecutionViewChangeset,
   resetRuntimeStoresProjection,
@@ -50,6 +56,7 @@ import type { JupyterOutput, NotebookCell } from "../types";
  * presence stays user-driven and Tauri remains a byte transport.
  */
 const PRESENCE_HEARTBEAT_INTERVAL_MS = 15_000;
+const BOOTSTRAP_INTERACTIVE_TIMEOUT_MS = 90_000;
 
 let loggedWasmReady = false;
 
@@ -65,7 +72,31 @@ function scopeAllowsNotebookWrite(scope: string | null): boolean {
   return scope === null || scope === "editor" || scope === "owner";
 }
 
+function normalizeCommentsDocId(commentsDocId: string | null | undefined): string | null {
+  const trimmed = commentsDocId?.trim();
+  return trimmed || null;
+}
+
+function serializeCommentsNotebookRef(commentsNotebookRef: unknown): string | null {
+  if (commentsNotebookRef === null || commentsNotebookRef === undefined) return null;
+  try {
+    return JSON.stringify(commentsNotebookRef);
+  } catch (error) {
+    logger.warn("[automerge-notebook] failed to serialize comments notebook ref", error);
+    return null;
+  }
+}
+
 let warnedMissingExecutionViewProjector = false;
+let warnedCommentsBootstrapContractViolation = false;
+
+function warnCommentsBootstrapContractViolation(field: string, actorLabel: string) {
+  if (warnedCommentsBootstrapContractViolation) return;
+  warnedCommentsBootstrapContractViolation = true;
+  logger.warn(
+    `[automerge-notebook] daemon:ready did not provide ${field} before bootstrap for ${actorLabel}; comments sync is disabled for this handle`,
+  );
+}
 
 function projectExecutionViewChangeset(handle: NotebookHandle) {
   const projector = (handle as unknown as SyncableHandle).project_execution_view_changeset;
@@ -113,7 +144,6 @@ function preWarmCellRenderers(cells: readonly NotebookCell[]) {
 export function useNotebook() {
   const host = useNotebookHost();
   const cellIds = useCellIds();
-  const [focusedCellId, setFocusedCellId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [canAcceptCellMutations, setCanAcceptCellMutations] = useState(false);
@@ -123,16 +153,36 @@ export function useNotebook() {
   const outputCacheRef = useRef<Map<string, JupyterOutput>>(new Map());
   const prevPathRef = useRef<string | null>(null);
   const actorLabelRef = useRef(`desktop:${sessionIdRef.current}`);
+  const commentsDocIdRef = useRef<string | null>(null);
+  const commentsNotebookRefJsonRef = useRef<string | null>(null);
   const [localActor, setLocalActor] = useState(actorLabelRef.current);
   const [connectionScope, setConnectionScope] = useState<string | null>(null);
+  const [hostedNotebookUrl, setHostedNotebookUrl] = useState<string | null>(null);
   const canWriteNotebookRef = useRef(true);
+  const initialLoadReadyForMutationsRef = useRef(false);
   const readyNotebookIdentityRef = useRef<string | null>(null);
 
   const [handleHost] = useState(
     () =>
       new NotebookHandleHost<NotebookHandle>({
         actorLabel: () => actorLabelRef.current,
-        createHandle: (actorLabel) => NotebookHandle.create_empty_with_actor(actorLabel),
+        createHandle: (actorLabel) => {
+          const commentsDocId = commentsDocIdRef.current;
+          if (!commentsDocId) {
+            warnCommentsBootstrapContractViolation("comments_doc_id", actorLabel);
+            return NotebookHandle.create_empty_with_actor(actorLabel);
+          }
+          const commentsNotebookRefJson = commentsNotebookRefJsonRef.current;
+          if (!commentsNotebookRefJson) {
+            warnCommentsBootstrapContractViolation("comments_notebook_ref", actorLabel);
+            return NotebookHandle.create_empty_with_actor(actorLabel);
+          }
+          return NotebookHandle.create_bootstrap_with_comments_ref(
+            actorLabel,
+            commentsDocId,
+            commentsNotebookRefJson,
+          );
+        },
         getBlobPort,
         publishHandle: setNotebookHandle,
         ready: waitForNotebookWasmReady,
@@ -144,6 +194,17 @@ export function useNotebook() {
   // SyncEngine and transport refs — stable across re-renders.
   const engineRef = useRef<SyncEngine | null>(null);
   const transportRef = useRef<NotebookTransport | null>(null);
+  // This bridge must exist before the engine effect: App's desktop status
+  // source subscribes during render, then the active engine forwards into it.
+  // A BehaviorSubject also gives the connection dot an honest first paint.
+  const hostedBridgeStatusSubject = useMemo(
+    () => new BehaviorSubject<HostedBridgeStatus>("not_applicable"),
+    [],
+  );
+  const hostedBridgeStatus$ = useMemo(
+    () => hostedBridgeStatusSubject.asObservable(),
+    [hostedBridgeStatusSubject],
+  );
 
   // Refresh blob port on mount.
   useEffect(() => {
@@ -167,33 +228,39 @@ export function useNotebook() {
   // ── Core helpers ───────────────────────────────────────────────────
 
   /** Full materialization: WASM doc → resolve manifests → write to store. */
-  const materializeCells = useCallback(async (handle: NotebookHandle) => {
-    const start = performance.now();
-    // Resolve blob port BEFORE reading cells — WASM needs it to
-    // convert binary ContentRefs to Url variants in get_cells_json().
-    let blobResolver = getBlobResolver();
-    if (blobResolver === null) {
-      blobResolver = await refreshBlobResolver();
-    }
-    const blobPort = blobResolver?.port ?? null;
-    if (blobPort !== null) {
-      handle.set_blob_port(blobPort);
-    }
-    const json = handle.get_cells_json();
-    const snapshots: CellSnapshot[] = JSON.parse(json);
-    const newCells = await cellSnapshotsToNotebookCells(
-      snapshots,
-      blobResolver,
-      outputCacheRef.current,
-    );
-    // Pre-warm renderer plugins before cells paint so document-like markdown
-    // and output iframes do not wait for async chunk loads on first render.
-    preWarmCellRenderers(newCells);
-    replaceNotebookCells(newCells);
-    logger.debug(
-      `[automerge-notebook] Full materialization: ${snapshots.length} cells in ${(performance.now() - start).toFixed(1)}ms`,
-    );
-  }, []);
+  const materializeCells = useCallback(
+    async (handle: NotebookHandle) => {
+      const start = performance.now();
+      const isCurrentHandle = () => handleHost.current === handle;
+      // Resolve blob port BEFORE reading cells — WASM needs it to
+      // convert binary ContentRefs to Url variants in get_cells_json().
+      let blobResolver = getBlobResolver();
+      if (blobResolver === null) {
+        blobResolver = await refreshBlobResolver();
+        if (!isCurrentHandle()) return;
+      }
+      const blobPort = blobResolver?.port ?? null;
+      if (blobPort !== null) {
+        handle.set_blob_port(blobPort);
+      }
+      const json = handle.get_cells_json();
+      const snapshots: CellSnapshot[] = JSON.parse(json);
+      const newCells = await cellSnapshotsToNotebookCells(
+        snapshots,
+        blobResolver,
+        outputCacheRef.current,
+      );
+      if (!isCurrentHandle()) return;
+      // Pre-warm renderer plugins before cells paint so document-like markdown
+      // and output iframes do not wait for async chunk loads on first render.
+      preWarmCellRenderers(newCells);
+      replaceNotebookCells(newCells);
+      logger.debug(
+        `[automerge-notebook] Full materialization: ${snapshots.length} cells in ${(performance.now() - start).toFixed(1)}ms`,
+      );
+    },
+    [handleHost],
+  );
 
   /** Sync re-read cells from WASM (cache-only, no blob fetches). */
   const rematerializeCellsSync = useCallback((handle: NotebookHandle) => {
@@ -210,21 +277,40 @@ export function useNotebook() {
 
   const refreshCanAcceptCellMutations = useCallback(
     (handle = handleHost.current) => {
-      const canAccept = canWriteNotebookRef.current && (handle?.has_cells_map() ?? false);
+      const canAccept =
+        canWriteNotebookRef.current &&
+        initialLoadReadyForMutationsRef.current &&
+        (handle?.has_cells_map() ?? false);
       setCanAcceptCellMutations(canAccept);
       return canAccept;
     },
     [handleHost],
   );
 
+  const setInitialLoadReadyForMutations = useCallback(
+    (ready: boolean) => {
+      initialLoadReadyForMutationsRef.current = ready;
+      refreshCanAcceptCellMutations();
+    },
+    [refreshCanAcceptCellMutations],
+  );
+
+  const focusCellInStore = useCallback((cellId: string) => {
+    setFocusedCellId(cellId);
+    flushCellUIState();
+  }, []);
+
   const notebookController = useMemo(
     () =>
       createNotebookController<NotebookHandle>({
         getHandle: () => handleHost.current,
         getEngine: () => engineRef.current,
-        canWriteCellSource: () => canWriteNotebookRef.current,
-        canEditStructure: () => canWriteNotebookRef.current,
-        canAcceptStructure: (handle) => handle.has_cells_map(),
+        canWriteCellSource: () =>
+          canWriteNotebookRef.current && initialLoadReadyForMutationsRef.current,
+        canEditStructure: () =>
+          canWriteNotebookRef.current && initialLoadReadyForMutationsRef.current,
+        canAcceptStructure: (handle) =>
+          initialLoadReadyForMutationsRef.current && handle.has_cells_map(),
         applyMutationEvent: (event) => {
           const engine = engineRef.current;
           return engine
@@ -240,10 +326,10 @@ export function useNotebook() {
           }
         },
         refreshCanAcceptCellMutations,
-        onFocusCell: setFocusedCellId,
+        onFocusCell: focusCellInStore,
         logPrefix: "[automerge-notebook]",
       }),
-    [handleHost, refreshCanAcceptCellMutations, rematerializeCellsSync],
+    [focusCellInStore, handleHost, refreshCanAcceptCellMutations, rematerializeCellsSync],
   );
 
   // ── Bootstrap ──────────────────────────────────────────────────────
@@ -254,6 +340,7 @@ export function useNotebook() {
       if (!bootstrapped) return false;
 
       setCanAcceptCellMutations(false);
+      initialLoadReadyForMutationsRef.current = false;
       setLoadError(null);
       setIsLoading(true);
 
@@ -298,6 +385,10 @@ export function useNotebook() {
     transportRef.current = transport;
     engineRef.current = engine;
 
+    // Attach before start so even a synchronously replayed transport frame is
+    // visible to the app-level bridge.
+    const hostedBridgeStatusSubscription =
+      engine.hostedBridgeStatus$.subscribe(hostedBridgeStatusSubject);
     // Start the engine (subscribes to transport frames).
     engine.start();
 
@@ -308,8 +399,40 @@ export function useNotebook() {
       outputCache: outputCacheRef.current,
       projectExecutionViewChangeset,
       refreshCanAcceptCellMutations,
+      setInitialLoadReadyForMutations,
       setIsLoading,
       setLoadError,
+      bootstrapTimeoutMs: BOOTSTRAP_INTERACTIVE_TIMEOUT_MS,
+      onBootstrapTimeout: () => {
+        // Automatic recovery stays inside the governor: retryNow() dials
+        // immediately and, on failure, the backoff schedule resumes.
+        // host.daemon.reconnect is exclusive to the user's explicit Retry ,
+        // its reset() would cancel the governor's pending retry and replace
+        // it with one dial that schedules nothing on failure.
+        const autoReconnect = host.daemon.autoReconnect;
+        if (autoReconnect) {
+          autoReconnect.retryNow();
+          return;
+        }
+        void host.daemon.reconnect({ force: true }).catch((error: unknown) => {
+          logger.warn(
+            "[automerge-notebook] forced reconnect after bootstrap timeout failed:",
+            error,
+          );
+          setLoadError(error instanceof Error ? error.message : String(error));
+        });
+      },
+      // A failed initial load is terminal for this room: the daemon closes
+      // the session right after sending the status, and every redial gets
+      // the same rejection. Latch the host's automatic reconnect loop off so
+      // it cannot hammer the daemon; the DaemonStatusBanner Retry goes
+      // through host.daemon.reconnect, which drops the latch.
+      onInitialLoadFailed: (reason) => {
+        host.daemon.autoReconnect?.latchFailure(reason);
+      },
+      onInitialLoadRecovered: () => {
+        host.daemon.autoReconnect?.clearLatch();
+      },
     });
 
     // ── Bootstrap / daemon lifecycle ─────────────────────────────
@@ -325,6 +448,11 @@ export function useNotebook() {
           actorLabelRef.current = trigger.payload.actor_label;
           setLocalActor(trigger.payload.actor_label);
         }
+        commentsDocIdRef.current = normalizeCommentsDocId(trigger.payload.comments_doc_id);
+        commentsNotebookRefJsonRef.current = serializeCommentsNotebookRef(
+          trigger.payload.comments_notebook_ref,
+        );
+        setHostedNotebookUrl(trigger.payload.hosted_notebook_url ?? null);
         const connectionScope = trigger.payload.connection_scope ?? null;
         setConnectionScope(connectionScope);
         canWriteNotebookRef.current = scopeAllowsNotebookWrite(connectionScope);
@@ -379,6 +507,7 @@ export function useNotebook() {
       // Flush pending local changes before stopping.
       engine.flush();
       engine.stop();
+      hostedBridgeStatusSubscription.unsubscribe();
       // Do NOT call `transport.disconnect()`. The transport is owned by
       // the host (one shared instance across NotebookClient, SyncEngine,
       // frame-types outbound helpers, etc.) and must outlive this hook's
@@ -396,6 +525,7 @@ export function useNotebook() {
       resetRuntimeStoresProjection();
       resetPoolState();
       canWriteNotebookRef.current = false;
+      initialLoadReadyForMutationsRef.current = false;
       setCanAcceptCellMutations(false);
       handleHost.clear();
     };
@@ -403,9 +533,11 @@ export function useNotebook() {
     bootstrap,
     handleHost,
     host,
+    hostedBridgeStatusSubject,
     materializeCells,
     notifyRelayReady,
     refreshCanAcceptCellMutations,
+    setInitialLoadReadyForMutations,
   ]);
 
   // ── Cell mutations ─────────────────────────────────────────────────
@@ -441,6 +573,13 @@ export function useNotebook() {
   const clearOutputs = useCallback(
     (cellIds: string | string[]) => {
       return notebookController.clearOutputs(cellIds);
+    },
+    [notebookController],
+  );
+
+  const setCellType = useCallback(
+    (cellId: string, cellType: "code" | "markdown" | "raw") => {
+      notebookController.setCellType(cellId, cellType);
     },
     [notebookController],
   );
@@ -485,8 +624,10 @@ export function useNotebook() {
     // it on save / save-as / untitled promotion. Reading it here avoids
     // a Tauri round-trip to the WindowNotebookRegistry.
     const hasPath = runtimePath != null;
-    await saveNotebook(host, flushSync, hasPath);
-  }, [host, flushSync, runtimePath]);
+    await saveNotebook(host, flushSync, hasPath, {
+      hosted: hostedNotebookUrl !== null,
+    });
+  }, [host, flushSync, hostedNotebookUrl, runtimePath]);
 
   const openNotebook = useCallback(() => openNotebookFile(host), [host]);
 
@@ -530,17 +671,31 @@ export function useNotebook() {
     [],
   );
 
+  /**
+   * Stable proxy for causal NotebookDoc change hints. Desktop title state
+   * subscribes once and performs the cheap head-containment query only when
+   * this fires or the daemon publishes a new file checkpoint.
+   */
+  const notebookDocChanged$ = useMemo(
+    () =>
+      new Observable<void>((subscriber) => {
+        const engine = engineRef.current;
+        if (!engine) return;
+        return engine.notebookDocChanged$.subscribe(subscriber);
+      }),
+    [],
+  );
+
   return {
     cellIds,
     isLoading,
     canAcceptCellMutations,
-    focusedCellId,
-    setFocusedCellId,
     updateCellSource,
     addCell,
     moveCell,
     deleteCell,
     clearOutputs,
+    setCellType,
     save,
     openNotebook,
     cloneNotebook,
@@ -553,9 +708,12 @@ export function useNotebook() {
     getHandle,
     getEngine,
     sessionStatus$,
+    hostedBridgeStatus$,
+    notebookDocChanged$,
     triggerSync,
     localActor,
     connectionScope,
+    hostedNotebookUrl,
   };
 }
 

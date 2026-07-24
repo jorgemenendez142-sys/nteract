@@ -4,7 +4,17 @@ import type {
   Env,
   WebSocketRequestResponsePair,
 } from "./cloudflare-types.ts";
-import type { WorkstationAttachmentState } from "runtimed";
+import {
+  projectNotebookComputeSessionSummary,
+  projectNotebookWorkstationAttachmentFromClaim,
+  type WorkstationAttachmentState,
+} from "runtimed";
+import {
+  deleteOwnerComputeSession,
+  listWorkstationLeases,
+  upsertOwnerComputeSession,
+  type WorkstationLeaseRecord,
+} from "./compute-session-index.ts";
 import { identityDisplayLabel } from "./display-label.ts";
 import {
   allowsBlobUpload,
@@ -41,6 +51,23 @@ import {
   type SyncFrameBudgetDirection,
   type SyncFrameBudgetSummary,
 } from "./sync-frame-budget.ts";
+import {
+  createWorkstationAttachJob,
+  getNotebookRow,
+  getWorkstationRow,
+  grantNotebookAclRow,
+  roomSummaryKey,
+  updateWorkstationAttachJobStatus,
+  type NotebookRoomSummary,
+  type NotebookRoomSummaryOccupant,
+  type WorkstationAttachJobRow,
+  type WorkstationAccelerator,
+  type WorkstationRow,
+} from "./storage.ts";
+import {
+  workstationEventsObjectName,
+  type WorkstationAttachJobNotification,
+} from "./workstation-events.ts";
 
 interface Peer {
   id: string;
@@ -71,10 +98,12 @@ interface RuntimePeerWorkstationMetadata {
 interface SelectedRuntimePeerSession {
   workstationId: string;
   runtimeSessionId: string | null;
+  status: string;
 }
 
 interface RejectFrameOptions {
   countsTowardStreak?: boolean;
+  sendControl?: boolean;
 }
 
 interface PeerCloseOptions {
@@ -83,10 +112,25 @@ interface PeerCloseOptions {
   suppressRuntimePeerWatch?: boolean;
 }
 
+interface PublishComputeSessionSummaryOptions {
+  onlyIfQueueDepthChanged?: boolean;
+}
+
+interface WorkstationRegistryLookupResult {
+  failed: boolean;
+  workstation: WorkstationRow | null;
+}
+
 type RuntimePeerForwardedRequestAction = "interrupt_execution" | "send_comm";
 type RuntimePeerQueryRequestAction = "complete";
+type HostedExecutionRequestAction =
+  | "execute_cell"
+  | "execute_cell_guarded"
+  | "run_all_cells"
+  | "run_all_cells_guarded";
 type UnsupportedHostedRuntimeRequestAction =
   | "launch_kernel"
+  | "restart_kernel"
   | "shutdown_kernel"
   | "sync_environment"
   | "get_history";
@@ -110,23 +154,44 @@ interface PendingRuntimePeerResponse {
 /// kernel that is about to come back: if a `runtime_peer` rejoins inside the
 /// window the alarm is disarmed.
 const RUNTIME_PEER_GONE_GRACE_MS = 30_000;
+export const RUNTIME_IDLE_TTL_MS = 30 * 60_000;
+const ROOM_SUMMARY_REFRESH_MS = 60_000;
 const MAX_CONSECUTIVE_REJECTED_FRAMES = 8;
 const REJECTED_FRAME_POLICY_CLOSE_CODE = 1008;
 const REJECTED_FRAME_POLICY_CLOSE_REASON = "too many rejected frames";
 const DUPLICATE_RUNTIME_PEER_CLOSE_CODE = 1008;
 const DUPLICATE_RUNTIME_PEER_CLOSE_REASON = "replaced by newer runtime peer";
+const RUNTIME_IDLE_CLOSE_CODE = 1000;
+const RUNTIME_IDLE_CLOSE_REASON = "runtime idle timeout";
+const RUNTIME_IDLE_STATUS_MESSAGE =
+  "Compute stopped after 30 minutes without queued or active execution.";
+const EXECUTION_RESUME_ACTOR_LABEL = "execution resume";
+const WORKSTATION_EVENT_NOTIFY_TIMEOUT_MS = 5_000;
+const WORKSTATION_HEARTBEAT_STALE_MS = 3 * 60_000;
 
 /// Storage key holding the notebook id whose `runtime_peer` departure armed the
 /// reconciliation alarm. Persisted so a DO that hibernates between the alarm
 /// being set and firing still knows which room to reconcile.
 const RUNTIME_PEER_WATCH_KEY = "runtime_peer_gone_watch";
+const RUNTIME_PEER_WATCH_ALARM_AT_KEY = "runtime_peer_gone_watch_alarm_at";
+const RUNTIME_IDLE_WATCH_KEY = "runtime_idle_watch";
+const RUNTIME_IDLE_WATCH_ALARM_AT_KEY = "runtime_idle_watch_alarm_at";
+const ROOM_SUMMARY_REFRESH_KEY = "room_summary_refresh";
+const ROOM_SUMMARY_REFRESH_ALARM_AT_KEY = "room_summary_refresh_alarm_at";
 const runtimePeerForwardedRequestActions = new Set<RuntimePeerForwardedRequestAction>([
   "interrupt_execution",
   "send_comm",
 ]);
 const runtimePeerQueryRequestActions = new Set<RuntimePeerQueryRequestAction>(["complete"]);
+const hostedExecutionRequestActions = new Set<HostedExecutionRequestAction>([
+  "execute_cell",
+  "execute_cell_guarded",
+  "run_all_cells",
+  "run_all_cells_guarded",
+]);
 const unsupportedHostedRuntimeRequestActions = new Set<UnsupportedHostedRuntimeRequestAction>([
   "launch_kernel",
+  "restart_kernel",
   "shutdown_kernel",
   "sync_environment",
   "get_history",
@@ -185,6 +250,15 @@ function runtimePeerQueryRequestAction(
     : null;
 }
 
+function hostedExecutionRequestAction(action: string | null): HostedExecutionRequestAction | null {
+  if (!action) {
+    return null;
+  }
+  return hostedExecutionRequestActions.has(action as HostedExecutionRequestAction)
+    ? (action as HostedExecutionRequestAction)
+    : null;
+}
+
 function unsupportedHostedRuntimeRequestAction(
   action: string | null,
 ): UnsupportedHostedRuntimeRequestAction | null {
@@ -203,11 +277,20 @@ export class NotebookRoom {
     { notebookId: string; peer: Peer; closeOptions: PeerCloseOptions }
   >();
   private broadcastDepth = 0;
+  private runtimePeerWatchSuppressionDepth = 0;
   private readonly materializers = new Map<string, RoomMaterializer>();
   private readonly selectedRuntimePeerSessions = new Map<
     string,
     SelectedRuntimePeerSession | null
   >();
+  private readonly computeSessionQueueDepths = new Map<string, number>();
+  private readonly computeSessionSummaryPublishes = new Map<string, Promise<void>>();
+  // Room-summary publishes chain per notebook for the same reason compute-session
+  // summaries do: unserialized writes can land out of order (a stale "empty"
+  // publish overwriting a newer "occupied" one) and the trailing rearm would
+  // disarm the refresh alarm against live occupancy.
+  private readonly roomSummaryPublishes = new Map<string, Promise<void>>();
+  private readonly dirtyComputeSessionSummaries = new Set<string>();
   private readonly restoredPeersReady: Promise<void>;
   private readonly pendingRuntimePeerResponses = new Map<string, PendingRuntimePeerResponse>();
   // In-memory only by design: persisting on the frame hot path would cost more
@@ -250,6 +333,10 @@ export class NotebookRoom {
     const runtimeStateRepairNotebookId = runtimeStateRepairControlNotebookId(url.pathname);
     if (runtimeStateRepairNotebookId) {
       return this.handleRuntimeStateRepairControl(runtimeStateRepairNotebookId, request);
+    }
+    const commentAuthorsNotebookId = commentAuthorsControlNotebookId(url.pathname);
+    if (commentAuthorsNotebookId) {
+      return this.handleCommentAuthorsControl(commentAuthorsNotebookId, request);
     }
     const accessControlNotebookId = accessRevocationControlNotebookId(url.pathname);
     if (accessControlNotebookId) {
@@ -298,6 +385,7 @@ export class NotebookRoom {
     if (identity.scope === "runtime_peer") {
       this.removeDuplicateRuntimePeers(notebookId, peer);
     }
+    const humanOccupantsBeforeJoin = this.roomSummaryOccupantKeys();
     this.acceptPeerSocket(notebookId, peer);
     this.peers.set(peer.id, peer);
     // A runtime_peer (re)joining cancels any pending reconciliation alarm: the
@@ -320,6 +408,7 @@ export class NotebookRoom {
       type: "cloud_room_ready",
       protocol: "v4",
       notebook_id: notebookId,
+      comments_doc_id: `comments:${notebookId}`,
       peer_id: peer.id,
       actor_label: identity.actorLabel,
       connection_scope: identity.scope,
@@ -348,6 +437,11 @@ export class NotebookRoom {
         timestamp: peer.connectedAt,
       },
       peer.id,
+    );
+    this.publishRoomSummaryIfHumanOccupantsChanged(
+      notebookId,
+      humanOccupantsBeforeJoin,
+      "peer_joined",
     );
     this.state.waitUntil(this.syncPeerFromRoomHost(notebookId, peer));
 
@@ -390,14 +484,29 @@ export class NotebookRoom {
     try {
       const materializer = this.materializerFor(notebookId);
       const result = await materializer.setWorkstationAttachment(attachment);
-      this.cacheSelectedRuntimePeerSession(notebookId, attachment);
-      if (closeRuntimePeers) {
+      if (result.ignored_stale) {
+        cloudLog("warn", "room.workstation_attachment.stale_publish_ignored", {
+          notebook_id: notebookId,
+          runtime_session_id: attachment?.runtime_session_id ?? null,
+          updated_at: attachment?.updated_at ?? null,
+          counter: "workstation_attachment_stale_publishes_ignored",
+          counter_delta: 1,
+        });
+      } else {
+        this.cacheSelectedRuntimePeerSession(notebookId, attachment);
+      }
+      if (closeRuntimePeers && !result.ignored_stale) {
         this.removeRuntimePeers(notebookId, {
           code: 1012,
           reason: closeReason,
           suppressRuntimePeerWatch: true,
         });
       }
+      this.state.waitUntil(
+        result.ignored_stale
+          ? this.publishCurrentComputeSessionSummary(notebookId)
+          : this.publishCurrentComputeSessionSummary(notebookId, attachment),
+      );
       if (result.changed) {
         this.deliverRoomHostFrames(notebookId, result);
       }
@@ -410,7 +519,8 @@ export class NotebookRoom {
         checkpoint_persisted: checkpointPersisted,
         duration_ms: durationMs(startedAt),
         outbound_frame_count: result.outbound.length,
-        closed_runtime_peers: closeRuntimePeers,
+        ignored_stale: result.ignored_stale ?? false,
+        closed_runtime_peers: closeRuntimePeers && !result.ignored_stale,
         counter: "workstation_attachment_control_published",
         counter_delta: result.changed ? 1 : 0,
       });
@@ -452,6 +562,43 @@ export class NotebookRoom {
     if (reason instanceof Response) {
       return reason;
     }
+    const expectedRuntimeSessionId = optionalBoundedStringField(
+      payload?.expected_runtime_session_id ?? payload?.expectedRuntimeSessionId,
+      "expected_runtime_session_id",
+      128,
+    );
+    if (expectedRuntimeSessionId instanceof Response) {
+      return expectedRuntimeSessionId;
+    }
+
+    const startedAt = Date.now();
+    const materializer = this.materializerFor(notebookId);
+    if (expectedRuntimeSessionId) {
+      const currentAttachment = await materializer.getWorkstationAttachment();
+      const currentRuntimeSessionId = currentAttachment?.runtime_session_id ?? null;
+      if (currentRuntimeSessionId !== expectedRuntimeSessionId) {
+        cloudLog("info", "room.runtime_state_repair.skipped_session_mismatch", {
+          notebook_id: notebookId,
+          expected_runtime_session_id: expectedRuntimeSessionId,
+          current_runtime_session_id: currentRuntimeSessionId,
+          runtime_peer_count: this.runtimePeerCount(),
+          duration_ms: durationMs(startedAt),
+          counter: "runtime_state_repairs_skipped_session_mismatch",
+          counter_delta: 1,
+        });
+        return json(
+          {
+            ok: true,
+            changed: false,
+            skipped: true,
+            skip_reason: "runtime_session_mismatch",
+            forced: force,
+            runtime_peer_count: this.runtimePeerCount(),
+          },
+          200,
+        );
+      }
+    }
 
     if (this.hasRuntimePeer()) {
       if (!force) {
@@ -469,14 +616,13 @@ export class NotebookRoom {
       });
     }
 
-    const startedAt = Date.now();
     try {
-      const materializer = this.materializerFor(notebookId);
       const result = await materializer.reconcileRuntimePeerGone(reason);
       this.invalidateSelectedRuntimePeerSession(notebookId);
       if (result.changed) {
         this.deliverRoomHostFrames(notebookId, result);
       }
+      this.state.waitUntil(this.publishCurrentComputeSessionSummary(notebookId));
       const checkpointPersisted = result.changed
         ? await this.checkpointRoomHost(notebookId, materializer, "runtime_state_repair")
         : true;
@@ -555,6 +701,20 @@ export class NotebookRoom {
       counter_delta: 1,
     });
     return json({ ok: true, closed_anonymous_viewers: closedAnonymousViewers }, 200);
+  }
+
+  private async handleCommentAuthorsControl(
+    notebookId: string,
+    request: Request,
+  ): Promise<Response> {
+    // Worker-internal read path only. The public author-profile API authorizes
+    // notebook viewing before asking the room to constrain profile hydration to
+    // actor labels that actually appear in the CommentsDoc projection.
+    if (request.method !== "GET") {
+      return json({ error: "method not allowed" }, 405);
+    }
+    const actorLabels = await this.materializerFor(notebookId).getCommentAuthorActorLabels();
+    return json({ notebook_id: notebookId, actor_labels: actorLabels }, 200);
   }
 
   async webSocketMessage(
@@ -643,6 +803,13 @@ export class NotebookRoom {
         }
       }),
     );
+
+    const humanNotebookIds = new Set(
+      activeRestored.filter(({ peer }) => isHumanPeer(peer)).map(({ notebookId }) => notebookId),
+    );
+    for (const notebookId of humanNotebookIds) {
+      this.publishRoomSummary(notebookId, "hibernation_restore");
+    }
   }
 
   private removeDuplicateRestoredRuntimePeers(
@@ -858,6 +1025,7 @@ export class NotebookRoom {
           peer,
           frame.type,
           `unsupported presence payload: ${String(error)}`,
+          { sendControl: false },
         );
         return;
       }
@@ -1038,6 +1206,32 @@ export class NotebookRoom {
       return;
     }
 
+    const hostedExecutionAction =
+      normalizedFrame.type === FrameType.REQUEST
+        ? hostedExecutionRequestAction(requestMetadata?.action ?? null)
+        : null;
+    if (hostedExecutionAction) {
+      const runtimePeer = await this.activeRuntimePeer(notebookId, peer.id);
+      if (
+        !runtimePeer &&
+        !(await this.ensureRuntimeForHostedExecution(notebookId, hostedExecutionAction))
+      ) {
+        await this.reconcileMissingRuntimePeer(
+          notebookId,
+          `no runtime peer is attached for ${hostedExecutionAction}`,
+          "hosted_execution_without_runtime_peer",
+        );
+        this.rejectFrame(
+          notebookId,
+          peer,
+          normalizedFrame.type,
+          `no runtime peer is attached for ${hostedExecutionAction}`,
+          { countsTowardStreak: false },
+        );
+        return;
+      }
+    }
+
     const unsupportedRuntimeRequestAction =
       normalizedFrame.type === FrameType.REQUEST
         ? unsupportedHostedRuntimeRequestAction(requestMetadata?.action ?? null)
@@ -1093,6 +1287,14 @@ export class NotebookRoom {
       if (result.changed) {
         this.scheduleRoomHostCheckpoint(notebookId, materializer, "materialized_frame");
       }
+      if (result.runtime_state_changed) {
+        this.refreshRuntimeIdleWatch(notebookId);
+        this.state.waitUntil(
+          this.publishCurrentComputeSessionSummary(notebookId, undefined, {
+            onlyIfQueueDepthChanged: true,
+          }),
+        );
+      }
       this.sendControl(notebookId, peer, {
         type: "cloud_frame_accepted",
         notebook_id: notebookId,
@@ -1126,6 +1328,7 @@ export class NotebookRoom {
       case FrameType.AUTOMERGE_SYNC:
       case FrameType.RUNTIME_STATE_SYNC:
       case FrameType.COMMS_DOC_SYNC:
+      case FrameType.COMMENTS_DOC_SYNC:
         // These frames are both data and protocol control. Read-only peers may
         // send empty sync acks/needs; RoomMaterializer rejects messages carrying
         // document changes when the connection lacks write scope.
@@ -1225,18 +1428,40 @@ export class NotebookRoom {
     const startedAt = Date.now();
     try {
       const materializer = this.materializerFor(notebookId);
-      const attachment = runtimePeerWorkstationAttachment(peer);
+      const registryLookup = await this.registeredWorkstationForRuntimePeer(notebookId, peer);
+      const retainedAttachment = registryLookup.failed
+        ? await materializer.getWorkstationAttachment()
+        : null;
+      const attachment = runtimePeerWorkstationAttachment(
+        peer,
+        registryLookup.workstation,
+        retainedAttachment,
+      );
       const result = await materializer.setWorkstationAttachment(attachment);
-      this.cacheSelectedRuntimePeerSession(notebookId, attachment);
+      if (result.ignored_stale) {
+        cloudLog("warn", "room.workstation_attachment.stale_publish_ignored", {
+          notebook_id: notebookId,
+          peer_id: peer.id,
+          runtime_session_id: attachment.runtime_session_id,
+          updated_at: attachment.updated_at,
+          counter: "workstation_attachment_stale_publishes_ignored",
+          counter_delta: 1,
+        });
+      } else {
+        this.cacheSelectedRuntimePeerSession(notebookId, attachment);
+      }
       if (result.changed) {
         this.deliverRoomHostFrames(notebookId, result);
         await this.checkpointRoomHost(notebookId, materializer, "runtime_peer_attachment");
       }
+      this.refreshRuntimeIdleWatch(notebookId);
+      await this.publishCurrentComputeSessionSummary(notebookId);
       cloudLog("debug", "room.workstation_attachment.published", {
         notebook_id: notebookId,
         peer_id: peer.id,
         scope: peer.identity.scope,
         changed: result.changed,
+        ignored_stale: result.ignored_stale ?? false,
         duration_ms: durationMs(startedAt),
         outbound_frame_count: result.outbound.length,
         counter: "workstation_attachments_published",
@@ -1255,6 +1480,124 @@ export class NotebookRoom {
     }
   }
 
+  private async registeredWorkstationForRuntimePeer(
+    notebookId: string,
+    peer: Peer,
+  ): Promise<WorkstationRegistryLookupResult> {
+    const workstationId = peer.workstation?.workstationId?.trim();
+    if (!this.env.DB || !workstationId) {
+      return { failed: false, workstation: null };
+    }
+    try {
+      const notebook = await getNotebookRow(this.env, notebookId);
+      if (!notebook) {
+        return { failed: false, workstation: null };
+      }
+      return {
+        failed: false,
+        workstation: await getWorkstationRow(this.env, notebook.owner_principal, workstationId),
+      };
+    } catch (error) {
+      cloudLog("warn", "room.workstation_attachment.registry_lookup_failed", {
+        notebook_id: notebookId,
+        workstation_id: workstationId,
+        error: errorMessage(error),
+        counter: "workstation_attachment_registry_lookup_failures",
+        counter_delta: 1,
+      });
+      return { failed: true, workstation: null };
+    }
+  }
+
+  private async publishCurrentComputeSessionSummary(
+    notebookId: string,
+    attachment?: WorkstationAttachmentState | null,
+    options?: PublishComputeSessionSummaryOptions,
+  ): Promise<void> {
+    const previous = this.computeSessionSummaryPublishes.get(notebookId) ?? Promise.resolve();
+    const publish = previous
+      .catch(() => undefined)
+      .then(() => this.publishCurrentComputeSessionSummaryNow(notebookId, attachment, options));
+    this.computeSessionSummaryPublishes.set(notebookId, publish);
+    await publish.finally(() => {
+      if (this.computeSessionSummaryPublishes.get(notebookId) === publish) {
+        this.computeSessionSummaryPublishes.delete(notebookId);
+      }
+    });
+  }
+
+  private async publishCurrentComputeSessionSummaryNow(
+    notebookId: string,
+    attachment?: WorkstationAttachmentState | null,
+    options?: PublishComputeSessionSummaryOptions,
+  ): Promise<void> {
+    if (!this.env.OWNER_COMPUTE_INDEX || !this.env.DB) {
+      return;
+    }
+    try {
+      const materializer = this.materializerFor(notebookId);
+      const queueDepth = await materializer.getRuntimeQueueDepth();
+      if (
+        options?.onlyIfQueueDepthChanged &&
+        !this.dirtyComputeSessionSummaries.has(notebookId) &&
+        this.computeSessionQueueDepths.get(notebookId) === queueDepth
+      ) {
+        return;
+      }
+      const [notebook, currentAttachment] = await Promise.all([
+        getNotebookRow(this.env, notebookId),
+        attachment === undefined
+          ? materializer.getWorkstationAttachment()
+          : Promise.resolve(attachment),
+      ]);
+      if (!notebook) {
+        return;
+      }
+      const summary = projectNotebookComputeSessionSummary({
+        attachment: currentAttachment,
+        notebookId,
+        ownerPrincipal: notebook.owner_principal,
+        queueDepth,
+        runtimePeerCount: this.runtimePeerCount(),
+        updatedAt: new Date().toISOString(),
+      });
+      if (summary) {
+        const published = await upsertOwnerComputeSession(this.env, summary);
+        if (published) {
+          this.computeSessionQueueDepths.set(notebookId, summary.queue_depth);
+          this.dirtyComputeSessionSummaries.delete(notebookId);
+        } else {
+          this.dirtyComputeSessionSummaries.add(notebookId);
+        }
+      } else {
+        const deleted = await deleteOwnerComputeSession(
+          this.env,
+          notebook.owner_principal,
+          notebookId,
+        );
+        if (deleted) {
+          this.computeSessionQueueDepths.set(notebookId, queueDepth);
+          this.dirtyComputeSessionSummaries.delete(notebookId);
+        } else {
+          this.dirtyComputeSessionSummaries.add(notebookId);
+        }
+      }
+    } catch (error) {
+      this.dirtyComputeSessionSummaries.add(notebookId);
+      cloudLog("warn", "room.compute_session_summary.publish_failed", {
+        notebook_id: notebookId,
+        error: errorMessage(error),
+        counter: "compute_session_summary_publish_failed",
+        counter_delta: 1,
+      });
+    }
+  }
+
+  /**
+   * A disconnected selected runtime session is recoverable room state: the
+   * same runtime peer may rejoin with its preserved workstation/session IDs
+   * and publish a ready attachment. Idle remains terminal execution teardown.
+   */
   private async runtimePeerAuthorityError(
     notebookId: string,
     workstation: RuntimePeerWorkstationMetadata | null,
@@ -1265,18 +1608,34 @@ export class NotebookRoom {
     }
 
     const presentedWorkstationId = runtimePeerWorkstationId(workstation);
-    if (presentedWorkstationId === selected.workstationId) {
-      if (!selected.runtimeSessionId) {
-        return null;
-      }
-      const presentedSessionId = runtimePeerRuntimeSessionId(workstation);
-      if (presentedSessionId === selected.runtimeSessionId) {
-        return null;
-      }
-      return `runtime peer session ${presentedSessionId ?? "unknown"} does not match selected runtime session ${selected.runtimeSessionId}`;
+    const presentedSessionId = runtimePeerRuntimeSessionId(workstation);
+    const workstationMatches = presentedWorkstationId === selected.workstationId;
+    const sessionMatches =
+      !selected.runtimeSessionId || presentedSessionId === selected.runtimeSessionId;
+
+    if (selected.status === "disconnected" && workstationMatches && sessionMatches) {
+      return null;
     }
 
-    return `runtime peer workstation ${presentedWorkstationId} does not match selected workstation ${selected.workstationId}`;
+    if (
+      !runtimePeerSessionStatusAcceptsPeer(selected.status) &&
+      selected.status !== "disconnected"
+    ) {
+      return `selected runtime session is ${selected.status}`;
+    }
+
+    if (!workstationMatches) {
+      return `runtime peer workstation ${presentedWorkstationId} does not match selected workstation ${selected.workstationId}`;
+    }
+
+    if (!selected.runtimeSessionId) {
+      return null;
+    }
+    if (sessionMatches) {
+      return null;
+    }
+
+    return `runtime peer session ${presentedSessionId ?? "unknown"} does not match selected runtime session ${selected.runtimeSessionId}`;
   }
 
   private removeRuntimePeers(notebookId: string, closeOptions: PeerCloseOptions): void {
@@ -1347,6 +1706,23 @@ export class NotebookRoom {
       }
       this.sendFrameToPeer(notebookId, target, typedFrameFromRoomHostOutbound(outbound));
     }
+  }
+
+  private withRuntimePeerWatchSuppressed<T>(callback: () => T): T {
+    this.runtimePeerWatchSuppressionDepth += 1;
+    try {
+      return callback();
+    } finally {
+      this.runtimePeerWatchSuppressionDepth -= 1;
+    }
+  }
+
+  private runtimePeerWatchSuppressed(): boolean {
+    return this.runtimePeerWatchSuppressionDepth > 0;
+  }
+
+  private sendFailureCloseOptions(): PeerCloseOptions {
+    return this.runtimePeerWatchSuppressed() ? { suppressRuntimePeerWatch: true } : {};
   }
 
   private async forwardRequestToActiveRuntimePeer(
@@ -1424,6 +1800,221 @@ export class NotebookRoom {
     return selected;
   }
 
+  private async ensureRuntimeForHostedExecution(
+    notebookId: string,
+    action: HostedExecutionRequestAction,
+  ): Promise<boolean> {
+    const materializer = this.materializerFor(notebookId);
+    if (typeof materializer.getWorkstationAttachment !== "function") {
+      return false;
+    }
+    const attachment = await materializer.getWorkstationAttachment();
+    if (attachment?.status === "connecting") {
+      return true;
+    }
+    if (!this.env.DB || !attachment || !runtimeAttachmentCanResumeForExecution(attachment)) {
+      return false;
+    }
+    return this.requestRuntimeResumeForExecution(notebookId, attachment, action);
+  }
+
+  private async requestRuntimeResumeForExecution(
+    notebookId: string,
+    attachment: WorkstationAttachmentState,
+    action: HostedExecutionRequestAction,
+  ): Promise<boolean> {
+    const notebook = await getNotebookRow(this.env, notebookId);
+    if (!notebook) {
+      return false;
+    }
+    const ownerPrincipal = notebook.owner_principal;
+    const workstationId = attachment.workstation_id.trim();
+    const workstation = await getWorkstationRow(this.env, ownerPrincipal, workstationId);
+    if (!workstation || !(await this.workstationCanResumeExecution(ownerPrincipal, workstation))) {
+      return false;
+    }
+
+    await grantNotebookAclRow(this.env, {
+      notebookId,
+      subjectKind: "principal",
+      subject: ownerPrincipal,
+      scope: "runtime_peer",
+      actorLabel: EXECUTION_RESUME_ACTOR_LABEL,
+    });
+
+    const attachJob = await createWorkstationAttachJob(this.env, {
+      notebookId,
+      ownerPrincipal,
+      replaceActive: false,
+      trigger: "resume",
+      workstationId,
+      actorLabel: EXECUTION_RESUME_ACTOR_LABEL,
+    });
+    if (!attachJob) {
+      return false;
+    }
+
+    const nextAttachment = projectNotebookWorkstationAttachmentFromClaim({
+      workstation: workstationAttachmentTargetFromRow(workstation),
+      claim: {
+        status: attachJob.job.status,
+        errorMessage: attachJob.job.error_message,
+        runtimeSessionId: attachJob.job.id,
+        updatedAt: attachJob.job.updated_at,
+      },
+    });
+    const materializer = this.materializerFor(notebookId);
+    const result = await materializer.setWorkstationAttachment(nextAttachment);
+    if (!result.ignored_stale) {
+      this.cacheSelectedRuntimePeerSession(notebookId, nextAttachment);
+    }
+    if (result.changed) {
+      this.deliverRoomHostFrames(notebookId, result);
+      this.scheduleRoomHostCheckpoint(notebookId, materializer, "execution_runtime_resume");
+    }
+    this.state.waitUntil(
+      Promise.allSettled([
+        this.notifyWorkstationAttachJob(ownerPrincipal, attachJob.job),
+        this.publishCurrentComputeSessionSummary(notebookId, nextAttachment),
+      ]).then(() => undefined),
+    );
+    cloudLog("info", "room.execution_runtime_resume.requested", {
+      notebook_id: notebookId,
+      workstation_id: workstationId,
+      job_id: attachJob.job.id,
+      action,
+      counter: "execution_runtime_resume_requests",
+      counter_delta: 1,
+    });
+    return true;
+  }
+
+  private async workstationCanResumeExecution(
+    ownerPrincipal: string,
+    workstation: WorkstationRow,
+  ): Promise<boolean> {
+    if (workstation.status !== "online") {
+      return false;
+    }
+    const leases = await listWorkstationLeases(this.env, ownerPrincipal);
+    const lease = leases.get(workstation.workstation_id) ?? null;
+    if (lease && workstationLeaseIsFreshEnough(workstation, lease)) {
+      return lease.online && lease.lease_expires_at > Date.now();
+    }
+    if (!workstation.last_seen_at) {
+      return true;
+    }
+    const lastSeen = Date.parse(workstation.last_seen_at);
+    return !Number.isFinite(lastSeen) || Date.now() - lastSeen <= WORKSTATION_HEARTBEAT_STALE_MS;
+  }
+
+  private async notifyWorkstationAttachJob(
+    ownerPrincipal: string,
+    job: WorkstationAttachJobRow,
+  ): Promise<void> {
+    const namespace = this.env.WORKSTATION_EVENTS;
+    if (!namespace) {
+      return;
+    }
+    try {
+      const id = namespace.idFromName(
+        workstationEventsObjectName(ownerPrincipal, job.workstation_id),
+      );
+      const notification: WorkstationAttachJobNotification = {
+        event: "attach_jobs",
+        workstation_id: job.workstation_id,
+        job_id: job.id,
+        notebook_id: job.notebook_id,
+        status: job.status,
+        requested_at: job.requested_at,
+        updated_at: job.updated_at,
+      };
+      await namespace.get(id).fetch(
+        new Request("https://workstation-events.internal/notify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(notification),
+          signal: AbortSignal.timeout(WORKSTATION_EVENT_NOTIFY_TIMEOUT_MS),
+        }),
+      );
+    } catch (error) {
+      cloudLog("warn", "room.execution_runtime_resume.notify_failed", {
+        notebook_id: job.notebook_id,
+        workstation_id: job.workstation_id,
+        job_id: job.id,
+        error: errorMessage(error),
+        counter: "execution_runtime_resume_notify_failures",
+        counter_delta: 1,
+      });
+    }
+  }
+
+  private async markSelectedRuntimeSessionCompletedForIdle(notebookId: string): Promise<void> {
+    if (!this.env.DB) {
+      return;
+    }
+    const materializer = this.materializerFor(notebookId);
+    const [notebook, attachment] = await Promise.all([
+      getNotebookRow(this.env, notebookId),
+      materializer.getWorkstationAttachment(),
+    ]);
+    const workstationId = attachment?.workstation_id.trim();
+    const runtimeSessionId = attachment?.runtime_session_id?.trim();
+    if (!notebook || !workstationId || !runtimeSessionId) {
+      return;
+    }
+    const job = await updateWorkstationAttachJobStatus(this.env, {
+      ownerPrincipal: notebook.owner_principal,
+      workstationId,
+      jobId: runtimeSessionId,
+      status: "completed",
+      errorMessage: null,
+    });
+    if (!job || job.status !== "completed") {
+      cloudLog("warn", "room.runtime_idle_watch.attach_job_complete_skipped", {
+        notebook_id: notebookId,
+        workstation_id: workstationId,
+        runtime_session_id: runtimeSessionId,
+        status: job?.status ?? null,
+        counter: "runtime_idle_attach_job_complete_skipped",
+        counter_delta: 1,
+      });
+    }
+  }
+
+  private async reconcileMissingRuntimePeer(
+    notebookId: string,
+    reason: string,
+    operation: string,
+  ): Promise<boolean> {
+    try {
+      const materializer = this.materializerFor(notebookId);
+      const result = await materializer.reconcileRuntimePeerGone(reason);
+      this.invalidateSelectedRuntimePeerSession(notebookId);
+      if (result.changed) {
+        this.deliverRoomHostFrames(notebookId, result);
+        this.scheduleRoomHostCheckpoint(notebookId, materializer, operation);
+      }
+      cloudLog("info", "room.runtime_peer_missing.reconciled", {
+        notebook_id: notebookId,
+        operation,
+        changed: result.changed,
+        counter: "runtime_peer_missing_reconciled",
+        counter_delta: result.changed ? 1 : 0,
+      });
+      return result.changed;
+    } catch (error) {
+      cloudLog("warn", "room.runtime_peer_missing.reconcile_failed", {
+        notebook_id: notebookId,
+        operation,
+        error: errorMessage(error),
+        counter: "runtime_peer_missing_reconcile_failed",
+        counter_delta: 1,
+      });
+      return false;
+    }
+  }
+
   private async selectedRuntimePeerSession(
     notebookId: string,
   ): Promise<SelectedRuntimePeerSession | null> {
@@ -1470,7 +2061,7 @@ export class NotebookRoom {
       if (this.trySendFrame(notebookId, runtimePeer, encoded)) {
         delivered = true;
       } else {
-        this.queuePeerRemoval(notebookId, runtimePeer);
+        this.queuePeerRemoval(notebookId, runtimePeer, this.sendFailureCloseOptions());
       }
     } finally {
       this.broadcastDepth -= 1;
@@ -1633,6 +2224,9 @@ export class NotebookRoom {
       counter: "rejected_frames",
       counter_delta: 1,
     });
+    if (options.sendControl === false) {
+      return;
+    }
     this.sendControl(notebookId, peer, {
       type: "cloud_frame_rejected",
       notebook_id: notebookId,
@@ -1683,7 +2277,7 @@ export class NotebookRoom {
     try {
       for (const peer of peers) {
         if (!this.trySendFrame(notebookId, peer, frame)) {
-          this.queuePeerRemoval(notebookId, peer);
+          this.queuePeerRemoval(notebookId, peer, this.sendFailureCloseOptions());
         }
       }
     } finally {
@@ -1705,7 +2299,7 @@ export class NotebookRoom {
         counter: "peer_send_failed",
         counter_delta: 1,
       });
-      this.removePeer(notebookId, peer);
+      this.removePeer(notebookId, peer, this.sendFailureCloseOptions());
     }
   }
 
@@ -1753,6 +2347,7 @@ export class NotebookRoom {
       return;
     }
 
+    const humanOccupantsBeforeLeave = this.roomSummaryOccupantKeys();
     if (!this.peers.delete(peer.id)) {
       return;
     }
@@ -1799,9 +2394,19 @@ export class NotebookRoom {
     // A runtime_peer departure is the one failure the daemon can't self-correct
     // (its death IS the trigger). Arm the reconciliation watchdog if it left no
     // runtime_peer behind.
-    if (peer.identity.scope === "runtime_peer" && !closeOptions.suppressRuntimePeerWatch) {
+    if (
+      peer.identity.scope === "runtime_peer" &&
+      !closeOptions.suppressRuntimePeerWatch &&
+      !this.runtimePeerWatchSuppressed()
+    ) {
       this.refreshRuntimePeerWatch(notebookId);
+      this.state.waitUntil(this.publishCurrentComputeSessionSummary(notebookId));
     }
+    this.publishRoomSummaryIfHumanOccupantsChanged(
+      notebookId,
+      humanOccupantsBeforeLeave,
+      "peer_left",
+    );
   }
 
   private recordFrameBudget(
@@ -1872,6 +2477,140 @@ export class NotebookRoom {
     return count;
   }
 
+  private roomSummaryOccupantKeys(): Set<string> {
+    // Scope is part of the key: a viewer socket upgrading to an editor socket
+    // must publish immediately (the dashboard only counts editing scopes).
+    return new Set(
+      this.roomSummaryOccupants().map(
+        (occupant) => `${occupant.participant_key}\u0000${occupant.connection_scope}`,
+      ),
+    );
+  }
+
+  private roomSummaryOccupants(): NotebookRoomSummaryOccupant[] {
+    const occupants = new Map<string, NotebookRoomSummaryOccupant>();
+    for (const peer of this.peers.values()) {
+      if (!isHumanPeer(peer)) {
+        continue;
+      }
+      const participantKey = roomPeerParticipantKey(peer);
+      const existing = occupants.get(participantKey);
+      if (
+        existing &&
+        roomSummaryScopeRank(existing.connection_scope) >= roomSummaryScopeRank(peer.identity.scope)
+      ) {
+        continue;
+      }
+      occupants.set(participantKey, {
+        participant_key: participantKey,
+        actor_label: peer.identity.actorLabel,
+        ...(peer.identity.metadata.displayName
+          ? { display_name: peer.identity.metadata.displayName }
+          : {}),
+        connection_scope: peer.identity.scope,
+      });
+    }
+    return Array.from(occupants.values()).sort((left, right) =>
+      left.participant_key.localeCompare(right.participant_key),
+    );
+  }
+
+  private publishRoomSummaryIfHumanOccupantsChanged(
+    notebookId: string,
+    previousOccupantKeys: ReadonlySet<string>,
+    reason: "peer_joined" | "peer_left",
+  ): void {
+    const nextOccupantKeys = this.roomSummaryOccupantKeys();
+    if (sameStringSet(previousOccupantKeys, nextOccupantKeys)) {
+      return;
+    }
+    this.publishRoomSummary(notebookId, reason);
+  }
+
+  private publishRoomSummary(
+    notebookId: string,
+    reason: "peer_joined" | "peer_left" | "hibernation_restore" | "refresh_alarm",
+  ): void {
+    const previous = this.roomSummaryPublishes.get(notebookId) ?? Promise.resolve();
+    const publish = previous
+      .catch(() => undefined)
+      .then(() => this.publishRoomSummaryNow(notebookId, reason));
+    this.roomSummaryPublishes.set(notebookId, publish);
+    this.state.waitUntil(
+      publish.finally(() => {
+        if (this.roomSummaryPublishes.get(notebookId) === publish) {
+          this.roomSummaryPublishes.delete(notebookId);
+        }
+      }),
+    );
+  }
+
+  private async publishRoomSummaryNow(
+    notebookId: string,
+    reason: "peer_joined" | "peer_left" | "hibernation_restore" | "refresh_alarm",
+  ): Promise<void> {
+    const bucket = this.env.NOTEBOOK_SNAPSHOTS;
+    if (!bucket) {
+      await this.refreshRoomSummaryWatch(notebookId, 0);
+      return;
+    }
+
+    const summary: NotebookRoomSummary = {
+      version: 1,
+      notebook_id: notebookId,
+      occupants: this.roomSummaryOccupants(),
+      updated_at: new Date().toISOString(),
+    };
+
+    try {
+      await bucket.put(roomSummaryKey(notebookId), JSON.stringify(summary), {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      });
+      cloudLog("info", "room.summary.published", {
+        notebook_id: notebookId,
+        occupant_count: summary.occupants.length,
+        reason,
+        counter: "room_summaries_published",
+        counter_delta: 1,
+      });
+    } catch (error) {
+      cloudLog("warn", "room.summary.publish_failed", {
+        notebook_id: notebookId,
+        occupant_count: summary.occupants.length,
+        reason,
+        error: errorMessage(error),
+        counter: "room_summary_publish_failures",
+        counter_delta: 1,
+      });
+    } finally {
+      await this.refreshRoomSummaryWatch(notebookId, summary.occupants.length);
+    }
+  }
+
+  private async refreshRoomSummaryWatch(notebookId: string, occupantCount: number): Promise<void> {
+    const storage = this.state.storage;
+    if (!storage.setAlarm || !storage.deleteAlarm) {
+      return;
+    }
+    try {
+      if (occupantCount <= 0) {
+        await storage.delete(ROOM_SUMMARY_REFRESH_KEY);
+        await storage.delete(ROOM_SUMMARY_REFRESH_ALARM_AT_KEY);
+        await this.rescheduleRoomAlarm();
+        return;
+      }
+      const alarmAt = Date.now() + ROOM_SUMMARY_REFRESH_MS;
+      await storage.put(ROOM_SUMMARY_REFRESH_KEY, notebookId);
+      await storage.put(ROOM_SUMMARY_REFRESH_ALARM_AT_KEY, alarmAt);
+      await this.rescheduleRoomAlarm();
+    } catch (error) {
+      cloudLog("warn", "room.summary_watch.refresh_failed", {
+        notebook_id: notebookId,
+        error: errorMessage(error),
+      });
+    }
+  }
+
   /// Arm or disarm the runtime_peer-gone reconciliation alarm to match current
   /// membership: arm (grace window) when no `runtime_peer` is attached, disarm
   /// when one is present. Called when a `runtime_peer` joins or leaves. A no-op
@@ -1885,12 +2624,15 @@ export class NotebookRoom {
       (async () => {
         try {
           if (this.hasRuntimePeer()) {
-            await storage.deleteAlarm?.();
             await storage.delete(RUNTIME_PEER_WATCH_KEY);
+            await storage.delete(RUNTIME_PEER_WATCH_ALARM_AT_KEY);
+            await this.rescheduleRoomAlarm();
             return;
           }
+          const alarmAt = Date.now() + RUNTIME_PEER_GONE_GRACE_MS;
           await storage.put(RUNTIME_PEER_WATCH_KEY, notebookId);
-          await storage.setAlarm?.(Date.now() + RUNTIME_PEER_GONE_GRACE_MS);
+          await storage.put(RUNTIME_PEER_WATCH_ALARM_AT_KEY, alarmAt);
+          await this.rescheduleRoomAlarm();
         } catch (error) {
           cloudLog("warn", "room.runtime_peer_watch.refresh_failed", {
             notebook_id: notebookId,
@@ -1901,41 +2643,185 @@ export class NotebookRoom {
     );
   }
 
-  /// DurableObject alarm handler. Fires `RUNTIME_PEER_GONE_GRACE_MS` after the
-  /// last `runtime_peer` left. If one has since rejoined, it's a no-op (the blip
-  /// recovered). Otherwise it reconciles the room's authoritative RuntimeStateDoc
-  /// — terminalizing orphaned executions and flipping a phantom-live kernel to
-  /// Error — and broadcasts the corrected state to the surviving peers.
-  async alarm(): Promise<void> {
+  private async clearRuntimePeerWatch(notebookId: string): Promise<void> {
     const storage = this.state.storage;
-    const notebookId = await storage.get<string>(RUNTIME_PEER_WATCH_KEY);
-    if (!notebookId) {
+    if (!storage.setAlarm || !storage.deleteAlarm) {
       return;
     }
-    await storage.delete(RUNTIME_PEER_WATCH_KEY);
+    try {
+      await storage.delete(RUNTIME_PEER_WATCH_KEY);
+      await storage.delete(RUNTIME_PEER_WATCH_ALARM_AT_KEY);
+      await this.rescheduleRoomAlarm();
+    } catch (error) {
+      cloudLog("warn", "room.runtime_peer_watch.clear_failed", {
+        notebook_id: notebookId,
+        error: errorMessage(error),
+      });
+    }
+  }
 
+  private refreshRuntimeIdleWatch(notebookId: string): void {
+    const storage = this.state.storage;
+    if (!storage.setAlarm || !storage.deleteAlarm) {
+      return;
+    }
+    this.state.waitUntil(
+      (async () => {
+        try {
+          const activity = await this.materializerFor(notebookId).getRuntimeExecutionActivity();
+          if (activity.executing || activity.queueDepth > 0) {
+            await storage.delete(RUNTIME_IDLE_WATCH_KEY);
+            await storage.delete(RUNTIME_IDLE_WATCH_ALARM_AT_KEY);
+            await this.rescheduleRoomAlarm();
+            return;
+          }
+          const nowMs = Date.now();
+          const existingAlarmAt = await storage.get<unknown>(RUNTIME_IDLE_WATCH_ALARM_AT_KEY);
+          if (!this.hasRuntimePeer()) {
+            if (isFiniteTimestamp(existingAlarmAt) && existingAlarmAt > nowMs) {
+              await this.rescheduleRoomAlarm();
+              return;
+            }
+            await storage.delete(RUNTIME_IDLE_WATCH_KEY);
+            await storage.delete(RUNTIME_IDLE_WATCH_ALARM_AT_KEY);
+            await this.rescheduleRoomAlarm();
+            return;
+          }
+          if (isFiniteTimestamp(existingAlarmAt) && existingAlarmAt > nowMs) {
+            return;
+          }
+          const alarmAt = nowMs + RUNTIME_IDLE_TTL_MS;
+          await storage.put(RUNTIME_IDLE_WATCH_KEY, notebookId);
+          await storage.put(RUNTIME_IDLE_WATCH_ALARM_AT_KEY, alarmAt);
+          await this.rescheduleRoomAlarm();
+        } catch (error) {
+          cloudLog("warn", "room.runtime_idle_watch.refresh_failed", {
+            notebook_id: notebookId,
+            error: errorMessage(error),
+          });
+        }
+      })(),
+    );
+  }
+
+  private async rescheduleRoomAlarm(): Promise<void> {
+    const storage = this.state.storage;
+    if (!storage.setAlarm || !storage.deleteAlarm) {
+      return;
+    }
+
+    const alarmTimes = [
+      await storage.get<unknown>(RUNTIME_PEER_WATCH_ALARM_AT_KEY),
+      await storage.get<unknown>(RUNTIME_IDLE_WATCH_ALARM_AT_KEY),
+      await storage.get<unknown>(ROOM_SUMMARY_REFRESH_ALARM_AT_KEY),
+    ]
+      .filter(isFiniteTimestamp)
+      .sort((left, right) => left - right);
+
+    if (alarmTimes.length === 0) {
+      await storage.deleteAlarm();
+      return;
+    }
+    await storage.setAlarm(alarmTimes[0]);
+  }
+
+  /// DurableObject alarm handler. Fires `RUNTIME_PEER_GONE_GRACE_MS` after the
+  /// last `runtime_peer` left, or periodically while human occupants remain so
+  /// `/api/n` can read a fresh room summary from R2. Each task stores its own
+  /// due time; the single DO alarm always points at the earliest task.
+  async alarm(): Promise<void> {
+    const storage = this.state.storage;
+    const nowMs = Date.now();
+    const runtimeWatch = await this.dueAlarmTask(
+      RUNTIME_PEER_WATCH_KEY,
+      RUNTIME_PEER_WATCH_ALARM_AT_KEY,
+      nowMs,
+    );
+    const runtimeIdleWatch = await this.dueAlarmTask(
+      RUNTIME_IDLE_WATCH_KEY,
+      RUNTIME_IDLE_WATCH_ALARM_AT_KEY,
+      nowMs,
+    );
+    const roomSummaryRefresh = await this.dueAlarmTask(
+      ROOM_SUMMARY_REFRESH_KEY,
+      ROOM_SUMMARY_REFRESH_ALARM_AT_KEY,
+      nowMs,
+    );
+
+    if (runtimeWatch) {
+      await storage.delete(RUNTIME_PEER_WATCH_KEY);
+      await storage.delete(RUNTIME_PEER_WATCH_ALARM_AT_KEY);
+      await this.handleRuntimePeerWatchAlarm(runtimeWatch);
+    }
+
+    if (runtimeIdleWatch) {
+      await storage.delete(RUNTIME_IDLE_WATCH_KEY);
+      await storage.delete(RUNTIME_IDLE_WATCH_ALARM_AT_KEY);
+      await this.handleRuntimeIdleWatchAlarm(runtimeIdleWatch);
+    }
+
+    if (roomSummaryRefresh) {
+      await storage.delete(ROOM_SUMMARY_REFRESH_KEY);
+      await storage.delete(ROOM_SUMMARY_REFRESH_ALARM_AT_KEY);
+      await this.publishRoomSummaryNow(roomSummaryRefresh, "refresh_alarm");
+    }
+
+    await this.rescheduleRoomAlarm();
+  }
+
+  private async dueAlarmTask(
+    key: string,
+    alarmAtKey: string,
+    nowMs: number,
+  ): Promise<string | null> {
+    const notebookId = await this.state.storage.get<unknown>(key);
+    if (typeof notebookId !== "string" || notebookId.length === 0) {
+      return null;
+    }
+    const alarmAt = await this.state.storage.get<unknown>(alarmAtKey);
+    return !isFiniteTimestamp(alarmAt) || alarmAt <= nowMs ? notebookId : null;
+  }
+
+  private async handleRuntimePeerWatchAlarm(notebookId: string): Promise<void> {
     if (this.hasRuntimePeer()) {
       cloudLog("info", "room.runtime_peer_watch.recovered", {
         notebook_id: notebookId,
         counter: "runtime_peer_gone_recovered",
         counter_delta: 1,
       });
+      this.state.waitUntil(this.publishCurrentComputeSessionSummary(notebookId));
       return;
     }
 
+    const materializer = this.materializerFor(notebookId);
     try {
-      const result = await this.materializerFor(notebookId).reconcileRuntimePeerGone(
+      const attachment = await materializer.getWorkstationAttachment();
+      if (attachment?.status === "idle") {
+        cloudLog("info", "room.runtime_peer_watch.skipped_idle", {
+          notebook_id: notebookId,
+          counter: "runtime_peer_watch_skipped_idle",
+          counter_delta: 1,
+        });
+        this.state.waitUntil(this.publishCurrentComputeSessionSummary(notebookId, attachment));
+        return;
+      }
+    } catch (error) {
+      cloudLog("warn", "room.runtime_peer_watch.attachment_read_failed", {
+        notebook_id: notebookId,
+        error: errorMessage(error),
+      });
+    }
+
+    try {
+      const result = await materializer.reconcileRuntimePeerGone(
         "runtime peer left the room and did not return within the grace window",
       );
       this.invalidateSelectedRuntimePeerSession(notebookId);
       if (result.changed) {
         this.deliverRoomHostFrames(notebookId, result);
-        this.scheduleRoomHostCheckpoint(
-          notebookId,
-          this.materializerFor(notebookId),
-          "runtime_peer_watch_reconcile",
-        );
+        this.scheduleRoomHostCheckpoint(notebookId, materializer, "runtime_peer_watch_reconcile");
       }
+      this.state.waitUntil(this.publishCurrentComputeSessionSummary(notebookId));
       cloudLog("info", "room.runtime_peer_watch.reconciled", {
         notebook_id: notebookId,
         changed: result.changed,
@@ -1946,6 +2832,71 @@ export class NotebookRoom {
       cloudLog("error", "room.runtime_peer_watch.reconcile_failed", {
         notebook_id: notebookId,
         error: errorMessage(error),
+      });
+    }
+  }
+
+  private async handleRuntimeIdleWatchAlarm(notebookId: string): Promise<void> {
+    let activity;
+    try {
+      activity = await this.materializerFor(notebookId).getRuntimeExecutionActivity();
+    } catch (error) {
+      cloudLog("warn", "room.runtime_idle_watch.activity_read_failed", {
+        notebook_id: notebookId,
+        error: errorMessage(error),
+      });
+      return;
+    }
+
+    if (activity.executing || activity.queueDepth > 0) {
+      cloudLog("info", "room.runtime_idle_watch.deferred_for_execution", {
+        notebook_id: notebookId,
+        executing: activity.executing,
+        queue_depth: activity.queueDepth,
+        counter: "runtime_idle_teardowns_deferred_for_execution",
+        counter_delta: 1,
+      });
+      return;
+    }
+
+    if (!this.hasRuntimePeer()) {
+      await this.publishCurrentComputeSessionSummary(notebookId);
+      return;
+    }
+
+    const updatedAt = new Date().toISOString();
+    try {
+      await this.markSelectedRuntimeSessionCompletedForIdle(notebookId);
+      const materializer = this.materializerFor(notebookId);
+      const result = await materializer.reconcileRuntimeIdleTimeout(
+        RUNTIME_IDLE_STATUS_MESSAGE,
+        updatedAt,
+      );
+      this.invalidateSelectedRuntimePeerSession(notebookId);
+      this.withRuntimePeerWatchSuppressed(() => {
+        if (result.changed) {
+          this.deliverRoomHostFrames(notebookId, result);
+          this.scheduleRoomHostCheckpoint(notebookId, materializer, "runtime_idle_timeout");
+        }
+        this.removeRuntimePeers(notebookId, {
+          code: RUNTIME_IDLE_CLOSE_CODE,
+          reason: RUNTIME_IDLE_CLOSE_REASON,
+          suppressRuntimePeerWatch: true,
+        });
+      });
+      await this.clearRuntimePeerWatch(notebookId);
+      this.state.waitUntil(this.publishCurrentComputeSessionSummary(notebookId));
+      cloudLog("info", "room.runtime_idle_watch.torn_down", {
+        notebook_id: notebookId,
+        counter: "runtime_idle_teardowns",
+        counter_delta: 1,
+      });
+    } catch (error) {
+      cloudLog("warn", "room.runtime_idle_watch.teardown_failed", {
+        notebook_id: notebookId,
+        error: errorMessage(error),
+        counter: "runtime_idle_teardown_failures",
+        counter_delta: 1,
       });
     }
   }
@@ -2010,22 +2961,89 @@ export function presencePeerLabel(identity: AuthenticatedConnection): string {
   });
 }
 
-function runtimePeerWorkstationAttachment(peer: Peer): WorkstationAttachmentState {
+function runtimePeerWorkstationAttachment(
+  peer: Peer,
+  registered: WorkstationRow | null = null,
+  retained: WorkstationAttachmentState | null = null,
+): WorkstationAttachmentState {
   const workstation = peer.workstation;
+  const workstationId = workstation?.workstationId ?? "runtime-peer";
+  const runtimeSessionId = workstation?.runtimeSessionId ?? null;
+  const registeredFacts = registered?.workstation_id === workstationId ? registered : null;
+  const retainedFacts = retained?.workstation_id === workstationId ? retained : null;
   return {
-    workstation_id: workstation?.workstationId ?? "runtime-peer",
-    display_name: workstation?.displayName ?? "Attached workstation",
-    provider: "runtime_peer",
-    default_environment_label: workstation?.defaultEnvironmentLabel ?? "Current Python",
-    environment_policy: workstation?.environmentPolicy ?? "runtime_peer",
+    workstation_id: workstationId,
+    display_name:
+      workstation?.displayName ??
+      registeredFacts?.display_name ??
+      retainedFacts?.display_name ??
+      "Attached workstation",
+    provider: registeredFacts?.provider ?? retainedFacts?.provider ?? "runtime_peer",
+    default_environment_label:
+      workstation?.defaultEnvironmentLabel ??
+      registeredFacts?.default_environment_label ??
+      retainedFacts?.default_environment_label ??
+      "Current Python",
+    environment_policy:
+      workstation?.environmentPolicy ??
+      registeredFacts?.environment_policy ??
+      retainedFacts?.environment_policy ??
+      "runtime_peer",
     status: "ready",
     status_message: null,
-    cpu_count: null,
-    memory_bytes: null,
-    working_directory: workstation?.workingDirectory ?? null,
+    cpu_count: registeredFacts ? registeredFacts.cpu_count : (retainedFacts?.cpu_count ?? null),
+    memory_bytes: registeredFacts
+      ? registeredFacts.memory_bytes
+      : (retainedFacts?.memory_bytes ?? null),
+    accelerators: registeredFacts
+      ? parseStoredWorkstationAccelerators(registeredFacts.accelerators_json)
+      : (retainedFacts?.accelerators ?? null),
+    working_directory:
+      workstation?.workingDirectory ??
+      registeredFacts?.working_directory ??
+      retainedFacts?.working_directory ??
+      null,
     updated_at: peer.connectedAt,
-    runtime_session_id: workstation?.runtimeSessionId ?? null,
+    runtime_session_id: runtimeSessionId,
   };
+}
+
+function parseStoredWorkstationAccelerators(
+  value: string | null,
+): WorkstationAttachmentState["accelerators"] {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) && parsed.every(isStoredWorkstationAccelerator) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isStoredWorkstationAccelerator(value: unknown): value is WorkstationAccelerator {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const accelerator = value as Record<string, unknown>;
+  return (
+    typeof accelerator.kind === "string" &&
+    accelerator.kind.length > 0 &&
+    (accelerator.vendor === null || typeof accelerator.vendor === "string") &&
+    (accelerator.model === null || typeof accelerator.model === "string") &&
+    typeof accelerator.count === "number" &&
+    Number.isSafeInteger(accelerator.count) &&
+    accelerator.count > 0 &&
+    (accelerator.memory_bytes_per_device === null ||
+      (typeof accelerator.memory_bytes_per_device === "number" &&
+        Number.isSafeInteger(accelerator.memory_bytes_per_device) &&
+        accelerator.memory_bytes_per_device > 0)) &&
+    (accelerator.readiness === "ready" ||
+      accelerator.readiness === "not_ready" ||
+      accelerator.readiness === "unknown") &&
+    (accelerator.diagnostic === null || typeof accelerator.diagnostic === "string")
+  );
 }
 
 function runtimePeerWorkstationId(workstation: RuntimePeerWorkstationMetadata | null): string {
@@ -2053,7 +3071,44 @@ function selectedRuntimePeerSessionFromAttachment(
   return {
     workstationId,
     runtimeSessionId: attachment.runtime_session_id?.trim() || null,
+    status: attachment.status.trim().toLowerCase(),
   };
+}
+
+function runtimePeerSessionStatusAcceptsPeer(status: string): boolean {
+  return status !== "disconnected" && status !== "idle";
+}
+
+function runtimeAttachmentCanResumeForExecution(attachment: WorkstationAttachmentState): boolean {
+  const workstationId = attachment.workstation_id.trim();
+  if (!workstationId || workstationId === "runtime-peer") {
+    return false;
+  }
+  const status = attachment.status.trim().toLowerCase();
+  return status === "ready" || status === "disconnected" || status === "idle";
+}
+
+function workstationAttachmentTargetFromRow(workstation: WorkstationRow) {
+  return {
+    workstationId: workstation.workstation_id,
+    displayName: workstation.display_name,
+    provider: workstation.provider,
+    defaultEnvironmentLabel: workstation.default_environment_label,
+    environmentPolicy: workstation.environment_policy,
+    cpuCount: workstation.cpu_count,
+    memoryBytes: workstation.memory_bytes,
+    accelerators: parseStoredWorkstationAccelerators(workstation.accelerators_json),
+    workingDirectory: workstation.working_directory,
+  };
+}
+
+function workstationLeaseIsFreshEnough(
+  workstation: WorkstationRow,
+  lease: WorkstationLeaseRecord,
+): boolean {
+  const rowSeen = workstation.last_seen_at ? Date.parse(workstation.last_seen_at) : NaN;
+  const leaseSeen = Date.parse(lease.last_seen_at);
+  return !Number.isFinite(rowSeen) || (Number.isFinite(leaseSeen) && leaseSeen >= rowSeen);
 }
 
 function runtimePeerMatchesSelectedSession(
@@ -2077,6 +3132,41 @@ function roomPeerParticipantKey(peer: Peer): string {
     return `anonymous:${peer.id}`;
   }
   return peer.identity.principal;
+}
+
+function isHumanPeer(peer: Peer): boolean {
+  return peer.identity.scope !== "runtime_peer";
+}
+
+// A participant with both a viewer tab and an editor tab is editing, not
+// merely viewing: dedupe keeps the strongest scope.
+function roomSummaryScopeRank(scope: string): number {
+  switch (scope) {
+    case "owner":
+      return 3;
+    case "editor":
+      return 2;
+    case "viewer":
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function sameStringSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  if (left.size !== right.size) {
+    return false;
+  }
+  for (const value of left) {
+    if (!right.has(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isFiniteTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 export function runtimePeerWorkstationMetadataFromRequest(
@@ -2189,6 +3279,14 @@ function workstationAttachmentControlNotebookId(pathname: string): string | unde
 
 function runtimeStateRepairControlNotebookId(pathname: string): string | undefined {
   const match = pathname.match(/^\/internal\/n\/([^/]+)\/runtime-state-repair\/?$/);
+  if (!match) {
+    return undefined;
+  }
+  return decodeURIComponent(match[1]);
+}
+
+function commentAuthorsControlNotebookId(pathname: string): string | undefined {
+  const match = pathname.match(/^\/internal\/n\/([^/]+)\/comment-authors\/?$/);
   if (!match) {
     return undefined;
   }

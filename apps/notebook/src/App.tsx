@@ -1,15 +1,25 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  colorForActorIdentity,
+  contrastColorForActorIdentity,
   deriveEnvManager,
   deriveRuntimeKind,
   NotebookClient,
+  resolveActorDisplay,
+  splitNotebookActorPrincipalOperator,
+  type ActorDisplayPeer,
+  type ApplyBokehSessionPatchOptions,
+  type BokehSessionPatchBroadcast,
+  type CommentAnchor,
+  type CommentThreadSnapshot,
+  type CommentsProjection,
   type ExecuteCellOptions,
   type NotebookResponse,
   type NotebookOutlineItem,
   putBlob,
   type SessionStatus,
 } from "runtimed";
-import { IsolationTest } from "@/components/isolated";
+import { BokehSessionRuntimeProvider, IsolationTest } from "@/components/isolated";
 import { MediaProvider } from "@/components/outputs/media-provider";
 import {
   applyWidgetCommBroadcastToStore,
@@ -28,6 +38,11 @@ import { useSyncedTheme } from "@/hooks/useSyncedSettings";
 import { ErrorBoundary } from "@/lib/error-boundary";
 import { cn } from "@/lib/utils";
 import {
+  markdownProjectionMatchesSource,
+  renderedTextForSourceRange,
+  resolveMarkdownProjection,
+} from "@/lib/markdown-projection";
+import {
   NOTEBOOK_RAIL_TAKEOVER_MEDIA_QUERY,
   NOTEBOOK_RAIL_TAKEOVER_STAGE_CLASS_NAME,
   NotebookPackagesPanel,
@@ -42,16 +57,35 @@ import {
   DaemonStatusBanner,
   DebugBanner,
   EnvBuildDecisionDialog,
+  ComputeDisconnectedNotice,
   KernelLaunchErrorBanner,
+  isRuntimePeerDisconnectedErrorDetails,
+  NotebookCommentsPanel,
   NotebookConnectionIdentity,
   NotebookDocumentRail,
   NotebookDocumentShell,
+  NotebookNotice,
   PoolErrorBanner,
   shouldShowKernelLaunchErrorBanner,
   TrustDialog,
   UntrustedBanner,
+  type CommentAuthor,
+  type NotebookCommentDraftTarget,
 } from "@/components/notebook";
+import { resolveCommentsUiSurface } from "@/components/notebook/comments-ui-gate";
 import { GlobalFindBar } from "@/components/search";
+import { InlineCommentComposer } from "./components/InlineCommentComposer";
+import { setSourceCommentThreads, type SourceCommentThread } from "./lib/comment-highlights";
+import {
+  resolveSourceRangeAnchor,
+  type OutputCommentAnchor,
+  type SourceCommentSelectionRect,
+  type SourceRangeCommentAnchor,
+} from "./lib/comment-source-anchor";
+import {
+  setCommentsProjectionSnapshot,
+  useCommentsProjection,
+} from "./lib/comments-projection-store";
 import { createDesktopConnectionStatusSource } from "./lib/desktop-connection-status";
 import {
   CondaDependencyPanel as CondaDependencyHeader,
@@ -64,7 +98,8 @@ import { PixiDependencyHeader } from "./components/PixiDependencyHeader";
 import { PresenceProvider } from "./contexts/PresenceContext";
 import { useNotebook } from "./hooks/useNotebook";
 import { useCondaDependencies } from "./hooks/useCondaDependencies";
-import { CrdtBridgeProvider } from "./hooks/useCrdtBridge";
+import { CrdtBridgeProvider } from "@/components/notebook";
+import { startCursorDispatch } from "@/components/notebook/cursor-registry";
 import { useDaemonKernel } from "./hooks/useDaemonKernel";
 import { useDenoConfig } from "./hooks/useDenoConfig";
 import { type EnvSyncState, useDependencies } from "./hooks/useDependencies";
@@ -77,22 +112,39 @@ import { usePoolState } from "./hooks/usePoolState";
 import { useTrust } from "./hooks/useTrust";
 import { useUpdater } from "./hooks/useUpdater";
 import { startAttributionDispatch } from "./lib/attribution-registry";
-import { getBlobResolver, useBlobPort } from "./lib/blob-port";
+import { getBlobResolver, useBlobPort, useBlobResolver } from "./lib/blob-port";
 import { useRuntimeState } from "./lib/runtime-state";
-import { useNotebookCellUIStateBridge } from "@/components/notebook/state/cell-ui-state";
-import { startCursorDispatch } from "./lib/cursor-registry";
+import {
+  outputCommentAnchorMatchesLiveState,
+  useDemoteDetachedOutputCommentThreads,
+} from "@/components/notebook/output-comment-demotion";
+import {
+  flushCellUIState,
+  getFocusedCellId,
+  setFocusedCellId,
+  useFocusedCellId,
+  useNotebookCellUIStateBridge,
+} from "@/components/notebook/state/cell-ui-state";
+import {
+  openNotebookRailPanel,
+  setNotebookRailCollapsed,
+  toggleNotebookRailPanel,
+  useNotebookRailUiState,
+} from "@/components/notebook/state/rail-ui-state";
 import { desktopNotebookShellCapabilities } from "./lib/desktop-shell-capabilities";
 import { getTrustApprovalHandoffDisplayStatus, KERNEL_STATUS } from "./lib/kernel-status";
 import { useNotebookActionPolicy } from "./lib/notebook-action-policy";
 import { useObservable } from "./lib/use-observable";
 import { logger } from "./lib/logger";
+import { hostedNotebookWindowTitle } from "./lib/hosted-notebook-url";
+import { fileSourceIssueNotice, notebookDocumentIsDirty } from "./lib/notebook-file-state";
 import {
   attachExecutionPerformanceId,
   installExecutionPerformanceApi,
   markExecutionPerformance,
   startExecutionPerformanceTrace,
 } from "./lib/execution-performance";
-import { getNotebookCellsSnapshot } from "@/components/notebook/state/cell-store";
+import { getCellById, getNotebookCellsSnapshot } from "@/components/notebook/state/cell-store";
 import { useNotebookViewModel } from "@/components/notebook/state/view-model-store";
 import { useDetectRuntime, useNotebookMetadata } from "./lib/notebook-metadata";
 import { useNotebookHost } from "@nteract/notebook-host";
@@ -165,6 +217,42 @@ async function sendMessage(message: unknown): Promise<void> {
 function createClientExecutionId(): string {
   return globalThis.crypto.randomUUID();
 }
+
+function createLocalCommentEntityId(prefix: "thread" | "message"): string {
+  return `${prefix}-${globalThis.crypto.randomUUID()}`;
+}
+
+function canConnectionScopeMutateComments(connectionScope: string | null): boolean {
+  return connectionScope === null || connectionScope === "editor" || connectionScope === "owner";
+}
+
+function commentAnchorThreadOrderScope(anchor: CommentAnchor): string {
+  switch (anchor.kind) {
+    case "notebook":
+      return "notebook";
+    case "cell":
+    case "source_range":
+      return `cell:${anchor.cell_id}`;
+    case "output":
+      return `output:${anchor.cell_id}:${anchor.execution_id ?? ""}:${anchor.output_id ?? ""}`;
+    case "cell_range":
+      return `cell_range:${anchor.start_cell_id}:${anchor.end_cell_id}`;
+  }
+}
+
+function sourceRangeAnchorMatchesCurrentCell(anchor: CommentAnchor): boolean {
+  if (anchor.kind !== "source_range") return false;
+  const cell = getCellById(anchor.cell_id);
+  if (
+    !cell ||
+    (cell.cell_type !== "code" && cell.cell_type !== "raw" && cell.cell_type !== "markdown")
+  )
+    return false;
+  return resolveSourceRangeAnchor(cell.source, anchor) !== null;
+}
+
+const OUTPUT_COMMENT_STALE_MESSAGE =
+  "Selected outputs changed. Comment on the current outputs before submitting.";
 
 function markClientExecuteResponse(
   phase: string,
@@ -244,7 +332,8 @@ function AppContent() {
   const daemonInfo = useDaemonInfo();
 
   // Apply theme to this window
-  const { defaultPythonEnv } = useSyncedTheme();
+  const { defaultPythonEnv, featureFlags } = useSyncedTheme();
+  const commentsUiEnabled = featureFlags.enable_comments;
 
   // Stable peer ID for presence (generated once per window lifetime)
   const peerIdRef = useRef(crypto.randomUUID());
@@ -273,13 +362,12 @@ function AppContent() {
     isLoading,
     canAcceptCellMutations,
     loadError,
-    focusedCellId,
-    setFocusedCellId,
     updateCellSource,
     addCell,
     moveCell,
     deleteCell,
     clearOutputs,
+    setCellType,
     save,
     openNotebook,
     cloneNotebook,
@@ -291,9 +379,12 @@ function AppContent() {
     getHandle,
     getEngine,
     sessionStatus$,
+    hostedBridgeStatus$,
+    notebookDocChanged$,
     triggerSync,
     localActor,
     connectionScope,
+    hostedNotebookUrl,
   } = useNotebook();
 
   // Daemon sync status. Drives the kernel-action gate: until the daemon
@@ -303,11 +394,42 @@ function AppContent() {
   // `useObservable` seeds with `null` until the engine emits.
   const sessionStatus = useObservable<SessionStatus | null>(sessionStatus$, null);
   const sessionReady = sessionStatus?.runtime_state === "ready";
+  const commentsProjection = useCommentsProjection();
+  const [commentsError, setCommentsError] = useState<string | null>(null);
+  const [commentDraftTarget, setCommentDraftTarget] = useState<NotebookCommentDraftTarget | null>(
+    null,
+  );
+  const [sourceCommentRequest, setSourceCommentRequest] = useState<{
+    anchor: SourceRangeCommentAnchor;
+    rect: SourceCommentSelectionRect;
+    quote?: string | null;
+  } | null>(null);
+  const [commentFocus, setCommentFocus] = useState<{ threadId: string; nonce: number } | null>(
+    null,
+  );
+
+  const refreshCommentsProjection = useCallback(() => {
+    const projection =
+      (getHandle()?.get_comments_projection?.() as CommentsProjection | undefined) ?? null;
+    setCommentsProjectionSnapshot(projection);
+    return projection;
+  }, [getHandle]);
+
+  useEffect(() => {
+    refreshCommentsProjection();
+    const engine = getEngine();
+    if (!engine) return;
+    const subscription = engine.commentsProjection$.subscribe((projection) => {
+      setCommentsProjectionSnapshot(projection);
+      setCommentsError(null);
+    });
+    return () => subscription.unsubscribe();
+  }, [getEngine, refreshCommentsProjection, sessionStatus?.notebook_doc]);
+
   // Global find (Cmd+F)
   const globalFind = useGlobalFind(cellIds);
 
-  const [activeRailPanel, setActiveRailPanel] = useState<NotebookRailPanelId>("outline");
-  const [railCollapsed, setRailCollapsed] = useState(true);
+  const { activePanelId: activeRailPanel, collapsed: railCollapsed } = useNotebookRailUiState();
   const stageHadFocusBeforeRailTakeoverRef = useRef(false);
   const [showIsolationTest, setShowIsolationTest] = useState(false);
   const [envBuildDialogOpen, setEnvBuildDialogOpen] = useState(false);
@@ -387,9 +509,9 @@ function AppContent() {
   const runtime = deriveRuntimeKind(runtimeState, detectedRuntime, runtimeHint);
 
   // `true` when the room is in-memory only (untitled); reported by the daemon
-  // via `daemon:ready`. Drives the always-dirty titlebar asterisk. Null until
-  // the first ready event lands — treated conservatively as "unknown, assume
-  // persisted" so we don't flash an asterisk on open-from-disk notebooks.
+  // via `daemon:ready`. Untitled rooms are always dirty. Null until the first
+  // ready event lands — treated conservatively as "unknown, assume persisted"
+  // so we don't flash an asterisk on open-from-disk notebooks.
   const [ephemeral, setEphemeral] = useState<boolean | null>(null);
 
   // Canonical window-title base. Bootstrapped from the host on mount (Rust
@@ -398,6 +520,7 @@ function AppContent() {
   // without a getTitle-then-setTitle round-trip that would race with the
   // concurrent Rust-side title update from `applyPathChanged`.
   const [titleBase, setTitleBase] = useState<string | null>(null);
+  const [fileBackedDirty, setFileBackedDirty] = useState(false);
 
   // UV Dependency management
   const {
@@ -475,6 +598,30 @@ function AppContent() {
     [host, getHandle, getEngine],
   );
 
+  const bokehBlobResolver = useBlobResolver();
+  const bokehPatchSource = getEngine()?.bokehSessionPatchBroadcasts$ ?? null;
+  const bokehSessionTransport = useMemo(() => {
+    if (!bokehBlobResolver) return null;
+    return {
+      fetchBlob: (ref: { blob: string; size?: number; media_type?: string }) =>
+        bokehBlobResolver.fetch(ref),
+      applyPatch: (options: ApplyBokehSessionPatchOptions) =>
+        notebookClient.applyBokehSessionPatch(options),
+      subscribePatches: (listener: (broadcast: BokehSessionPatchBroadcast) => void) => {
+        if (!bokehPatchSource) return () => {};
+        const subscription = bokehPatchSource.subscribe(listener);
+        return () => subscription.unsubscribe();
+      },
+    };
+  }, [bokehBlobResolver, bokehPatchSource, notebookClient]);
+  const bokehSessionRuntime = useMemo(
+    () => ({
+      sessions: runtimeState.bokeh_sessions,
+      transport: bokehSessionTransport,
+    }),
+    [bokehSessionTransport, runtimeState.bokeh_sessions],
+  );
+
   // Daemon-owned kernel execution
   const {
     kernelStatus,
@@ -523,12 +670,435 @@ function AppContent() {
       statusKey,
     ],
   );
+  const canMutateComments =
+    Boolean(commentsProjection) && canConnectionScopeMutateComments(connectionScope);
+  const commentsPanelStatus =
+    commentsProjection === null
+      ? "Comments sync unavailable."
+      : canMutateComments
+        ? null
+        : "Read-only connection.";
+  const failCommentAction = useCallback((message: string): never => {
+    setCommentsError(message);
+    throw new Error(message);
+  }, []);
 
-  // Connection/identity slot source: daemon lifecycle, stable for the
-  // app's lifetime (the dot must transition on daemon restarts).
+  useEffect(() => {
+    if (!canMutateComments) {
+      setCommentDraftTarget(null);
+      setSourceCommentRequest(null);
+    }
+  }, [canMutateComments]);
+
+  const applyLocalCommentEvent = useCallback(
+    (event: unknown): boolean => {
+      const engine = getEngine();
+      if (!engine) {
+        setCommentsError("Comments are not connected.");
+        return false;
+      }
+      const applied = engine.applyLocalMutationEvent(
+        event as Parameters<typeof engine.applyLocalMutationEvent>[0],
+      );
+      if (!applied) {
+        setCommentsError("Unable to update comments.");
+        return false;
+      }
+      setCommentsError(null);
+      engine.scheduleFlush();
+      refreshCommentsProjection();
+      return true;
+    },
+    [getEngine, refreshCommentsProjection],
+  );
+
+  const handleCreateCommentThread = useCallback(
+    async (anchor: CommentAnchor, body: string) => {
+      if (!canMutateComments) {
+        return failCommentAction("Comments are read-only.");
+      }
+      const handle = getHandle();
+      if (!handle || typeof handle.create_comment_thread !== "function") {
+        return failCommentAction("Comments sync unavailable.");
+      }
+      setCommentsError(null);
+      const projection = refreshCommentsProjection() ?? commentsProjection;
+      const orderScope = commentAnchorThreadOrderScope(anchor);
+      const afterThreadId =
+        projection?.threads
+          .filter((thread) => commentAnchorThreadOrderScope(thread.anchor) === orderScope)
+          .at(-1)?.id ?? null;
+      try {
+        const event = handle.create_comment_thread(
+          createLocalCommentEntityId("thread"),
+          createLocalCommentEntityId("message"),
+          anchor,
+          body,
+          afterThreadId,
+          new Date().toISOString(),
+        );
+        if (!applyLocalCommentEvent(event)) {
+          throw new Error("Unable to update comments.");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Create comment failed.";
+        setCommentsError(message);
+        throw error instanceof Error ? error : new Error(message);
+      }
+    },
+    [
+      applyLocalCommentEvent,
+      canMutateComments,
+      commentsProjection,
+      failCommentAction,
+      getHandle,
+      refreshCommentsProjection,
+    ],
+  );
+
+  const handleCreateDocumentComment = useCallback(
+    (body: string) => handleCreateCommentThread({ kind: "notebook" }, body),
+    [handleCreateCommentThread],
+  );
+
+  const handleCreatePanelComment = useCallback(
+    async (body: string) => {
+      if (!commentDraftTarget) {
+        await handleCreateDocumentComment(body);
+        return;
+      }
+      if (
+        commentDraftTarget.anchor.kind === "source_range" &&
+        !sourceRangeAnchorMatchesCurrentCell(commentDraftTarget.anchor)
+      ) {
+        failCommentAction("Selected source changed. Select the text again before commenting.");
+        return;
+      }
+      if (
+        commentDraftTarget.anchor.kind === "output" &&
+        !outputCommentAnchorMatchesLiveState(commentDraftTarget.anchor)
+      ) {
+        failCommentAction(OUTPUT_COMMENT_STALE_MESSAGE);
+        return;
+      }
+      await handleCreateCommentThread(commentDraftTarget.anchor, body);
+      setCommentDraftTarget(null);
+    },
+    [commentDraftTarget, failCommentAction, handleCreateCommentThread, handleCreateDocumentComment],
+  );
+
+  const handleRequestSourceComment = useCallback(
+    (
+      anchor: SourceRangeCommentAnchor,
+      rect: SourceCommentSelectionRect | null,
+      quote?: string | null,
+    ) => {
+      setCommentsError(null);
+      if (rect) {
+        setSourceCommentRequest({ anchor, rect, quote });
+        return;
+      }
+      setSourceCommentRequest(null);
+      setCommentDraftTarget({ anchor, quote: quote ?? anchor.exact_quote ?? null });
+      openNotebookRailPanel("comments");
+    },
+    [],
+  );
+
+  const handleRequestOutputComment = useCallback((anchor: OutputCommentAnchor) => {
+    setCommentsError(null);
+    if (!outputCommentAnchorMatchesLiveState(anchor)) {
+      setCommentsError(OUTPUT_COMMENT_STALE_MESSAGE);
+      return;
+    }
+    setSourceCommentRequest(null);
+    setCommentDraftTarget({ anchor, quote: null });
+    openNotebookRailPanel("comments");
+  }, []);
+
+  const handleSubmitSourceComment = useCallback(
+    async (body: string) => {
+      if (!sourceCommentRequest) return;
+      if (!sourceRangeAnchorMatchesCurrentCell(sourceCommentRequest.anchor)) {
+        setSourceCommentRequest(null);
+        setCommentsError("Selected source changed. Select the text again before commenting.");
+        return;
+      }
+      await handleCreateCommentThread(sourceCommentRequest.anchor, body);
+      setSourceCommentRequest(null);
+    },
+    [handleCreateCommentThread, sourceCommentRequest],
+  );
+
+  const handleCancelSourceComment = useCallback(() => {
+    setSourceCommentRequest(null);
+  }, []);
+
+  // The OS full name only labels the local author. We feed it through a peers
+  // entry keyed by the local principal, mirroring the cloud presence model, so
+  // synced peers and agents resolve their own labels instead of inheriting this
+  // machine's user name.
+  const commentAuthorPeers = useMemo<ActorDisplayPeer[]>(() => {
+    const label = peerLabel.trim();
+    if (!localActor || !label) return [];
+    const [localPrincipal] = splitNotebookActorPrincipalOperator(localActor);
+    return [{ participantKey: localPrincipal, label }];
+  }, [localActor, peerLabel]);
+
+  // Tint the comment surfaces with the local author's canonical color (the same
+  // color as their cursor and edits), plus a legible foreground for text/icons
+  // painted on that color. Both are CSS vars the shared affordance and composer
+  // styles read. Without them the affordance falls back to --primary (a
+  // near-black neutral) and white.
+  useEffect(() => {
+    if (!localActor) return;
+    const color = colorForActorIdentity(localActor);
+    const contrast = contrastColorForActorIdentity(localActor);
+    document.documentElement.style.setProperty("--comment-author-color", color);
+    document.documentElement.style.setProperty("--comment-author-contrast", contrast);
+    return () => {
+      document.documentElement.style.removeProperty("--comment-author-color");
+      document.documentElement.style.removeProperty("--comment-author-contrast");
+    };
+  }, [localActor]);
+
+  const resolveCommentAuthor = useCallback(
+    (actorLabel: string): CommentAuthor => {
+      const display = resolveActorDisplay({
+        actorLabel,
+        peers: commentAuthorPeers,
+        source: connectionScope ? "cloud" : "local",
+      });
+      return {
+        displayName: display.displayName,
+        color: display.color,
+        imageUrl: display.imageUrl,
+        isAgent: display.isAgent,
+        onBehalfOf: display.onBehalfOf,
+        onBehalfOfColor: display.onBehalfOfColor,
+      };
+    },
+    [commentAuthorPeers, connectionScope],
+  );
+
+  const resolveSourceLanguage = useCallback(
+    (cellId: string): string | undefined => {
+      const cell = getCellById(cellId);
+      if (cell?.cell_type !== "code") return undefined;
+      return runtime === "python" ? "python" : runtime === "deno" ? "typescript" : undefined;
+    },
+    [runtime],
+  );
+
+  const resolveSourceQuote = useCallback((anchor: SourceRangeCommentAnchor): string | null => {
+    const cell = getCellById(anchor.cell_id);
+    if (cell?.cell_type !== "markdown") return anchor.exact_quote ?? null;
+    const range = resolveSourceRangeAnchor(cell.source, anchor);
+    if (!range) return anchor.exact_quote ?? null;
+    const plan = resolveMarkdownProjection(cell.markdownProjection, cell.source);
+    if (!plan || !markdownProjectionMatchesSource(plan, cell.source)) {
+      return anchor.exact_quote ?? null;
+    }
+    return renderedTextForSourceRange(plan, range.from, range.to) ?? anchor.exact_quote ?? null;
+  }, []);
+
+  const sourceCommentThreadsByCell = useMemo(() => {
+    const map = new Map<string, SourceCommentThread[]>();
+    for (const thread of commentsProjection?.threads ?? []) {
+      if (thread.anchor.kind !== "source_range") continue;
+      const list = map.get(thread.anchor.cell_id) ?? [];
+      const firstMessage = thread.messages[0];
+      const author = thread.created_by_actor_label
+        ? resolveCommentAuthor(thread.created_by_actor_label)
+        : undefined;
+      list.push({
+        threadId: thread.id,
+        anchor: thread.anchor,
+        resolved: thread.status === "resolved",
+        color: author?.color,
+        preview: firstMessage
+          ? {
+              authorName: author?.displayName ?? "Unknown",
+              authorColor: author?.color,
+              imageUrl: author?.imageUrl,
+              isAgent: author?.isAgent,
+              onBehalfOf: author?.onBehalfOf,
+              onBehalfOfColor: author?.onBehalfOfColor,
+              body: firstMessage.body,
+              replyCount: Math.max(0, thread.messages.length - 1),
+            }
+          : undefined,
+      });
+      map.set(thread.anchor.cell_id, list);
+    }
+    return map;
+  }, [commentsProjection, resolveCommentAuthor]);
+
+  useEffect(() => {
+    setSourceCommentThreads(sourceCommentThreadsByCell);
+  }, [sourceCommentThreadsByCell]);
+
+  const handleActivateCommentThread = useCallback((threadId: string) => {
+    openNotebookRailPanel("comments");
+    setCommentFocus((previous) => ({ threadId, nonce: (previous?.nonce ?? 0) + 1 }));
+  }, []);
+
+  const handleClearCommentDraftTarget = useCallback(() => {
+    setCommentDraftTarget(null);
+  }, []);
+
+  const handleReplyCommentThread = useCallback(
+    async (threadId: string, body: string) => {
+      if (!canMutateComments) return;
+      const handle = getHandle();
+      if (!handle || typeof handle.reply_comment_thread !== "function") {
+        return failCommentAction("Comments sync unavailable.");
+      }
+      setCommentsError(null);
+      const projection = refreshCommentsProjection() ?? commentsProjection;
+      const afterMessageId =
+        projection?.threads.find((thread) => thread.id === threadId)?.messages.at(-1)?.id ?? null;
+      try {
+        const event = handle.reply_comment_thread(
+          threadId,
+          createLocalCommentEntityId("message"),
+          body,
+          afterMessageId,
+          new Date().toISOString(),
+        );
+        if (!applyLocalCommentEvent(event)) {
+          throw new Error("Unable to update comments.");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Reply failed.";
+        setCommentsError(message);
+        throw error instanceof Error ? error : new Error(message);
+      }
+    },
+    [
+      applyLocalCommentEvent,
+      canMutateComments,
+      commentsProjection,
+      failCommentAction,
+      getHandle,
+      refreshCommentsProjection,
+    ],
+  );
+
+  const handleResolveCommentThread = useCallback(
+    async (threadId: string) => {
+      if (!canMutateComments) return;
+      const handle = getHandle();
+      if (!handle || typeof handle.resolve_comment_thread !== "function") {
+        return failCommentAction("Comments sync unavailable.");
+      }
+      try {
+        const event = handle.resolve_comment_thread(threadId, new Date().toISOString());
+        if (!applyLocalCommentEvent(event)) {
+          throw new Error("Unable to update comments.");
+        }
+      } catch (error) {
+        setCommentsError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [applyLocalCommentEvent, canMutateComments, failCommentAction, getHandle],
+  );
+
+  const handleReopenCommentThread = useCallback(
+    async (threadId: string) => {
+      if (!canMutateComments) return;
+      const handle = getHandle();
+      if (!handle || typeof handle.reopen_comment_thread !== "function") {
+        return failCommentAction("Comments sync unavailable.");
+      }
+      try {
+        const event = handle.reopen_comment_thread(threadId);
+        if (!applyLocalCommentEvent(event)) {
+          throw new Error("Unable to update comments.");
+        }
+      } catch (error) {
+        setCommentsError(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [applyLocalCommentEvent, canMutateComments, failCommentAction, getHandle],
+  );
+
+  const handleDemoteDetachedOutputCommentThread = useCallback(
+    (threadId: string): boolean => {
+      // Background auto-repair: report success so the hook only stops retrying
+      // once the demote commits, and stay quiet on the user-facing error state.
+      if (!canMutateComments) return false;
+      const handle = getHandle();
+      if (!handle || typeof handle.demote_comment_thread_to_notebook !== "function") {
+        return false;
+      }
+      try {
+        handle.demote_comment_thread_to_notebook(threadId);
+        refreshCommentsProjection();
+        getEngine()?.scheduleFlush();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [canMutateComments, getEngine, getHandle, refreshCommentsProjection],
+  );
+
+  useDemoteDetachedOutputCommentThreads({
+    commentsProjection,
+    enabled: canMutateComments,
+    demoteThreadToNotebook: handleDemoteDetachedOutputCommentThread,
+  });
+
+  const handleFocusCommentThreadAnchor = useCallback((thread: CommentThreadSnapshot) => {
+    const cellId = thread.badge_cell_ids[0];
+    if (cellId) {
+      setFocusedCellId(cellId);
+      flushCellUIState();
+    }
+  }, []);
+
+  const commentsPanel = (
+    <NotebookCommentsPanel
+      projection={commentsProjection}
+      readOnly={!canMutateComments}
+      draftTarget={canMutateComments ? commentDraftTarget : null}
+      statusMessage={commentsPanelStatus}
+      errorMessage={commentsError}
+      onClearDraftTarget={commentDraftTarget ? handleClearCommentDraftTarget : undefined}
+      onCreateThread={canMutateComments ? handleCreatePanelComment : undefined}
+      onReplyThread={canMutateComments ? handleReplyCommentThread : undefined}
+      onResolveThread={canMutateComments ? handleResolveCommentThread : undefined}
+      onReopenThread={canMutateComments ? handleReopenCommentThread : undefined}
+      onFocusThreadAnchor={handleFocusCommentThreadAnchor}
+      resolveCommentAuthor={resolveCommentAuthor}
+      focusedThreadId={commentFocus?.threadId ?? null}
+      focusNonce={commentFocus?.nonce ?? 0}
+      resolveSourceLanguage={resolveSourceLanguage}
+      resolveSourceQuote={resolveSourceQuote}
+    />
+  );
+  const commentsUiSurface = resolveCommentsUiSurface({
+    commentsUiEnabled,
+    canCreateComments: canMutateComments,
+    commentsPanel,
+    onCreateSourceComment: handleRequestSourceComment,
+    onCreateOutputComment: handleRequestOutputComment,
+    onActivateCommentThread: handleActivateCommentThread,
+  });
+
+  // Connection/identity slot source: daemon lifecycle plus the reconnect
+  // governor, stable for the app's lifetime (the dot must transition on
+  // daemon restarts, and must not claim "reconnecting" while the governor
+  // is latched terminal and nothing is redialing).
   const desktopConnectionStatus = useMemo(
-    () => createDesktopConnectionStatusSource(host.daemonEvents),
-    [host],
+    () =>
+      createDesktopConnectionStatusSource(
+        host.daemonEvents,
+        host.daemon.autoReconnect,
+        hostedBridgeStatus$,
+      ),
+    [host, hostedBridgeStatus$],
   );
   useEffect(() => () => desktopConnectionStatus.dispose(), [desktopConnectionStatus]);
 
@@ -674,9 +1244,20 @@ function AppContent() {
     }
   }, [blobPort, getEngine]);
 
+  const focusedCellId = useFocusedCellId();
+  const focusCellInStore = useCallback((cellId: string) => {
+    setFocusedCellId(cellId);
+    flushCellUIState();
+  }, []);
+  const handleNotebookViewFocus = useCallback(() => {}, []);
+
   const getOutlineStatusLabel = useOutlineStatusLabel();
-  const notebookViewModel = useNotebookViewModel({ getOutlineStatusLabel });
+  const notebookViewModel = useNotebookViewModel({
+    getOutlineStatusLabel,
+    includeDocumentAnchors: true,
+  });
   const outlineItems = notebookViewModel.outlineItems;
+  const documentAnchors = notebookViewModel.documentAnchors;
   const markdownHeadingAnchorsByCellId = notebookViewModel.markdownHeadingAnchorsByCellId;
   const activeOutlineItemId = useActiveOutlineItemId(
     outlineItems,
@@ -686,12 +1267,11 @@ function AppContent() {
   const { selectedOutlineItemId, handleSelectOutlineItem } = useOutlineSelection({
     outlineItems,
     focusedCellId,
-    setFocusedCellId,
+    setFocusedCellId: focusCellInStore,
   });
 
-  // ── Sync host-owned transient UI state into shared cell UI store ─────
+  // ── Sync host-owned transient search state into shared cell UI store ─
   useNotebookCellUIStateBridge({
-    focusedCellId,
     searchQuery: globalFind.query,
     searchCurrentMatch: globalFind.currentMatch,
   });
@@ -802,29 +1382,35 @@ function AppContent() {
     return null;
   }, [envSource, envSyncState]);
 
-  const packagesRailOpen = !railCollapsed && activeRailPanel === "packages";
+  const renderedActiveRailPanel =
+    !commentsUiEnabled && activeRailPanel === "comments" ? "outline" : activeRailPanel;
+  const packagesRailOpen = !railCollapsed && renderedActiveRailPanel === "packages";
 
-  const handleRailPanelChange = useCallback((panelId: NotebookRailPanelId) => {
-    setActiveRailPanel(panelId);
-    setRailCollapsed(false);
-  }, []);
+  const handleRailPanelChange = useCallback(
+    (panelId: NotebookRailPanelId) => {
+      if (!commentsUiEnabled && panelId === "comments") return;
+      openNotebookRailPanel(panelId);
+    },
+    [commentsUiEnabled],
+  );
 
   const handleTogglePackagesRail = useCallback(() => {
     if (!shellCapabilities.canViewPackages) {
       logger.debug("[App] handleTogglePackagesRail: package view capability unavailable, skipping");
       return;
     }
-    if (activeRailPanel === "packages" && !railCollapsed) {
-      setRailCollapsed(true);
-      return;
-    }
-    setActiveRailPanel("packages");
-    setRailCollapsed(false);
-  }, [activeRailPanel, railCollapsed, shellCapabilities.canViewPackages]);
+    toggleNotebookRailPanel("packages");
+  }, [shellCapabilities.canViewPackages]);
 
-  const handleNavigateOutlineItem = useCallback((item: NotebookOutlineItem, href: string) => {
-    return navigateNotebookOutlineItem(item, href, { headingHashTarget: "cell" });
-  }, []);
+  const handleNavigateOutlineItem = useCallback(
+    (item: NotebookOutlineItem, href: string) => {
+      return navigateNotebookOutlineItem(item, href, {
+        documentAnchors,
+        headingHashTarget: "cell",
+      });
+    },
+    [documentAnchors],
+  );
 
   const getObservedHeads = useCallback(() => getHandle()?.get_heads_hex() ?? [], [getHandle]);
 
@@ -1031,16 +1617,24 @@ function AppContent() {
   // between the mount-time `getReadyInfo` pull, the `daemon:ready` event, and
   // the `path_changed` broadcast. Keeping all three paths identical prevents
   // "one of them forgot to update titleBase" bugs.
-  const applyNotebookPath = useCallback((path: string | null | undefined) => {
-    if (path) {
-      const parts = path.split(/[\\/]/);
-      setTitleBase(parts[parts.length - 1] || "Untitled.ipynb");
-      setEphemeral(false);
-    } else {
-      setTitleBase("Untitled.ipynb");
-      setEphemeral(true);
-    }
-  }, []);
+  const applyNotebookPath = useCallback(
+    (path: string | null | undefined, hostedUrl = hostedNotebookUrl) => {
+      if (hostedUrl) {
+        setTitleBase(hostedNotebookWindowTitle(hostedUrl));
+        // The local bridge room is ephemeral, but the hosted document is
+        // remotely durable. Do not show the local untitled/unsaved marker.
+        setEphemeral(false);
+      } else if (path) {
+        const parts = path.split(/[\\/]/);
+        setTitleBase(parts[parts.length - 1] || "Untitled.ipynb");
+        setEphemeral(false);
+      } else {
+        setTitleBase("Untitled.ipynb");
+        setEphemeral(true);
+      }
+    },
+    [hostedNotebookUrl],
+  );
 
   // Path transitions are driven by `RuntimeStateDoc.path` (frame 0x05).
   // A non-null value means the room is file-backed; a null value (only
@@ -1050,20 +1644,54 @@ function AppContent() {
   // straight projection.
   const runtimePath = runtimeState.path;
   useEffect(() => {
-    applyNotebookPath(runtimePath);
-  }, [applyNotebookPath, runtimePath]);
+    applyNotebookPath(runtimePath, hostedNotebookUrl);
+  }, [applyNotebookPath, hostedNotebookUrl, runtimePath]);
 
-  // Title is purely a function of `ephemeral`. Untitled notebooks get
-  // the `*` prefix; saved notebooks render their filename. Autosave
-  // (2s quiet, 10s max) keeps the file current within seconds of any
-  // edit, so the file-backed case never shows an unsaved-changes dot.
+  const fileCheckpointRef = useRef(runtimeState.file_checkpoint);
+  fileCheckpointRef.current = runtimeState.file_checkpoint;
+  const fileCheckpointCausalKey = `${runtimeState.file_checkpoint.save_sequence ?? "none"}\0${runtimeState.file_checkpoint.exported_heads.join("\0")}`;
+  const isFileBacked = ephemeral === false && runtimePath !== null && hostedNotebookUrl === null;
+  useEffect(() => {
+    const refreshDirtyState = () => {
+      setFileBackedDirty(
+        notebookDocumentIsDirty({
+          ephemeral,
+          fileBacked: isFileBacked,
+          fileCheckpoint: fileCheckpointRef.current,
+          handle: getHandle(),
+        }),
+      );
+    };
+
+    refreshDirtyState();
+    const subscription = notebookDocChanged$.subscribe(refreshDirtyState);
+    return () => subscription.unsubscribe();
+  }, [ephemeral, fileCheckpointCausalKey, getHandle, isFileBacked, notebookDocChanged$]);
+
+  const reconnectRuntime = useCallback(() => {
+    setDaemonStatus({ status: "checking" });
+    host.daemon.reconnect({ force: true }).catch((e: unknown) => {
+      setDaemonStatus({
+        status: "failed",
+        error: `Reconnection failed: ${e}`,
+      });
+    });
+  }, [host]);
+
+  const documentDirty = ephemeral === true ? true : isFileBacked ? fileBackedDirty : false;
+
+  // Untitled notebooks remain dirty. File-backed notebooks get the `*`
+  // prefix only while the local NotebookDoc contains changes beyond the
+  // daemon's causally committed exported heads.
   useEffect(() => {
     if (titleBase == null) return;
-    const next = ephemeral === true ? `* ${titleBase}` : titleBase;
+    const next = documentDirty ? `* ${titleBase}` : titleBase;
     host.window.setTitle(next).catch(() => {
       // Window may have been closed mid-render.
     });
-  }, [host, ephemeral, titleBase]);
+  }, [documentDirty, host, titleBase]);
+
+  const sourceIssueNotice = fileSourceIssueNotice(runtimeState.file_checkpoint.source_issue);
 
   // Cmd+F to open global find
   useEffect(() => {
@@ -1094,14 +1722,14 @@ function AppContent() {
   // a single ref. The ref is updated every render; the host-level registration
   // below runs only once per host, so a native menu event that lands during
   // a state-driven re-render never finds the slot empty — the previous
-  // design re-registered every command on focusedCellId change, which
+  // design re-registered every command on focused cell changes, which
   // opened a "no handler" window any menu click could fall into.
   const commandHandlersRef = useRef({
     save,
     openNotebook,
     cloneNotebook,
     handleAddCell,
-    focusedCellId,
+    setCellType,
     clearOutputs,
     handleRunAllCells,
     handleRestartAndRunAll,
@@ -1112,7 +1740,7 @@ function AppContent() {
     openNotebook,
     cloneNotebook,
     handleAddCell,
-    focusedCellId,
+    setCellType,
     clearOutputs,
     handleRunAllCells,
     handleRestartAndRunAll,
@@ -1132,14 +1760,22 @@ function AppContent() {
       }),
       host.commands.register("notebook.insertCell", ({ type }) => {
         const h = commandHandlersRef.current;
-        h.handleAddCell(type, h.focusedCellId);
+        h.handleAddCell(type, getFocusedCellId());
+      }),
+      host.commands.register("notebook.changeCellType", ({ type }) => {
+        const focusedCellId = getFocusedCellId();
+        if (!focusedCellId) return;
+        const cell = getNotebookCellsSnapshot().find((c) => c.id === focusedCellId);
+        if (cell?.cell_type === type) return;
+        commandHandlersRef.current.setCellType(focusedCellId, type);
       }),
       host.commands.register("notebook.clearOutputs", async () => {
         const h = commandHandlersRef.current;
-        if (!h.focusedCellId) return;
-        const cell = getNotebookCellsSnapshot().find((c) => c.id === h.focusedCellId);
+        const focusedCellId = getFocusedCellId();
+        if (!focusedCellId) return;
+        const cell = getNotebookCellsSnapshot().find((c) => c.id === focusedCellId);
         if (!cell || cell.cell_type !== "code") return;
-        await h.clearOutputs(h.focusedCellId);
+        await h.clearOutputs(focusedCellId);
       }),
       host.commands.register("notebook.clearAllOutputs", async () => {
         const h = commandHandlersRef.current;
@@ -1187,9 +1823,21 @@ function AppContent() {
       }
     });
 
-    // Listen for daemon disconnection (mid-session)
+    // Listen for daemon disconnection (mid-session). When the reconnect
+    // driver is latched (terminal initial-load failure), this close is the
+    // daemon rejecting the session. Present the terminal reason instead of
+    // a reconnect spinner. Retry clears the latch via host.daemon.reconnect.
     const unlistenDisconnect = host.daemonEvents.onDisconnected(() => {
       cancelReadyTimeout();
+      const reconnectState = host.daemon.autoReconnect?.getState();
+      if (reconnectState?.kind === "latched") {
+        setDaemonStatus({
+          status: "failed",
+          error: `Couldn't load this notebook: ${reconnectState.reason}`,
+          guidance: "Automatic reconnection is paused. Retry reconnects once.",
+        });
+        return;
+      }
       setDaemonStatus({
         status: "failed",
         error: "Runtime disconnected. Attempting to reconnect...",
@@ -1213,6 +1861,7 @@ function AppContent() {
             runtime?: string;
             ephemeral?: boolean;
             notebook_path?: string | null;
+            hosted_notebook_url?: string | null;
           }
         | null
         | undefined,
@@ -1226,10 +1875,11 @@ function AppContent() {
       // Sync titlebar: derive filename + ephemeral from the path carried
       // on the ready payload.
       if (payload) {
+        const hostedUrl = payload.hosted_notebook_url ?? null;
         if (typeof payload.ephemeral === "boolean") {
-          applyNotebookPath(payload.ephemeral ? null : (payload.notebook_path ?? null));
+          applyNotebookPath(payload.ephemeral ? null : (payload.notebook_path ?? null), hostedUrl);
         } else if (payload.notebook_path !== undefined) {
-          applyNotebookPath(payload.notebook_path);
+          applyNotebookPath(payload.notebook_path, hostedUrl);
         }
       }
     };
@@ -1296,20 +1946,7 @@ function AppContent() {
         <DaemonStatusBanner
           status={daemonStatus}
           onDismiss={() => setDaemonStatus(null)}
-          onRetry={() => {
-            setDaemonStatus({ status: "checking" });
-            host.daemon
-              .reconnect()
-              .then(() => {
-                // Success - daemon:ready event will clear the banner
-              })
-              .catch((e) => {
-                setDaemonStatus({
-                  status: "failed",
-                  error: `Reconnection failed: ${e}`,
-                });
-              });
-          }}
+          onRetry={reconnectRuntime}
         />
         <PoolErrorBanner
           uvError={poolUvError}
@@ -1338,6 +1975,17 @@ function AppContent() {
             </button>
           </div>
         )}
+        {isRuntimePeerDisconnectedErrorDetails(errorDetails) &&
+          dismissedLaunchError !== errorDetails && (
+            <ComputeDisconnectedNotice
+              errorDetails={errorDetails as string}
+              onRetry={() => {
+                setDismissedLaunchError(null);
+                tryStartKernel();
+              }}
+              onDismiss={() => setDismissedLaunchError(errorDetails)}
+            />
+          )}
         {shouldShowKernelLaunchErrorBanner({
           lifecycle,
           errorDetails,
@@ -1386,12 +2034,13 @@ function AppContent() {
             // Connection/identity slot: renders nothing for a purely local
             // session (isRemoteNotebookContext) — conditionality is the
             // point. The source derives from daemon lifecycle events (the
-            // IPC transport's status is constant in practice), and the
-            // copy is scoped to the link it measures.
+            // IPC transport's status is constant in practice). Hosted rooms
+            // compose daemon and bridge health, so their copy names the whole
+            // notebook connection rather than only the first hop.
             <NotebookConnectionIdentity
               capabilities={shellCapabilities}
               connectionStatus$={desktopConnectionStatus}
-              connectionLabel="Daemon connection"
+              connectionLabel={hostedNotebookUrl ? "Notebook connection" : "Daemon connection"}
             />
           }
         />
@@ -1432,6 +2081,17 @@ function AppContent() {
         <NotebookDocumentShell
           capabilities={shellCapabilities}
           stageLabel="Notebook editor"
+          notices={
+            sourceIssueNotice ? (
+              <NotebookNotice
+                tone="warning"
+                title={sourceIssueNotice.title}
+                data-testid="notebook-file-source-issue"
+              >
+                {sourceIssueNotice.message}
+              </NotebookNotice>
+            ) : null
+          }
           stageClassName={cn(
             "flex-row min-w-0 flex-1",
             !railCollapsed && NOTEBOOK_RAIL_TAKEOVER_STAGE_CLASS_NAME,
@@ -1439,16 +2099,17 @@ function AppContent() {
           rail={
             <NotebookDocumentRail
               viewModel={notebookViewModel}
-              activePanelId={activeRailPanel}
+              activePanelId={renderedActiveRailPanel}
               collapsed={railCollapsed}
               outlineCellIds={cellIds}
               activeOutlineItemId={activeOutlineItemId}
               selectedOutlineItemId={selectedOutlineItemId}
               selectedOutlineCellId={focusedCellId}
               onActivePanelChange={handleRailPanelChange}
-              onCollapsedChange={setRailCollapsed}
+              onCollapsedChange={setNotebookRailCollapsed}
               onSelectOutlineItem={handleSelectOutlineItem}
               onNavigateOutlineItem={handleNavigateOutlineItem}
+              commentsPanel={commentsUiSurface.commentsPanel}
               packagesPanel={
                 <NotebookPackagesPanel readOnly={!shellCapabilities.canManagePackages}>
                   {runtime === "python" && hasUvDependencies && hasCondaDependencies && (
@@ -1583,30 +2244,48 @@ function AppContent() {
               onSyncNeeded={triggerSync}
               localActor={localActor}
             >
-              <NotebookView
-                cellIds={cellIds}
-                isLoading={isLoading}
-                capabilities={shellCapabilities}
-                canAcceptCellMutations={canAcceptCellMutations}
-                loadError={loadError}
-                runtime={runtime}
-                sessionRuntimeState={sessionStatus?.runtime_state ?? null}
-                onFocusCell={setFocusedCellId}
-                onExecuteCell={handleExecuteCell}
-                onInterruptKernel={interruptKernel}
-                onDeleteCell={deleteCell}
-                onUpdateCellSource={updateCellSource}
-                onAddCell={handleAddCell}
-                onMoveCell={moveCell}
-                onReportOutputMatchCount={globalFind.reportOutputMatchCount}
-                onSetCellSourceHidden={setCellSourceHidden}
-                onSetCellOutputsHidden={setCellOutputsHidden}
-                markdownHeadingAnchorsByCellId={markdownHeadingAnchorsByCellId}
-              />
+              <BokehSessionRuntimeProvider value={bokehSessionRuntime}>
+                <NotebookView
+                  cellIds={cellIds}
+                  isLoading={isLoading}
+                  capabilities={shellCapabilities}
+                  canAcceptCellMutations={canAcceptCellMutations}
+                  loadError={loadError}
+                  runtime={runtime}
+                  sessionRuntimeState={sessionStatus?.runtime_state ?? null}
+                  onReconnectRuntime={reconnectRuntime}
+                  onFocusCell={handleNotebookViewFocus}
+                  onExecuteCell={handleExecuteCell}
+                  onInterruptKernel={interruptKernel}
+                  onDeleteCell={deleteCell}
+                  onUpdateCellSource={updateCellSource}
+                  onAddCell={handleAddCell}
+                  onMoveCell={moveCell}
+                  onChangeCellType={setCellType}
+                  onReportOutputMatchCount={globalFind.reportOutputMatchCount}
+                  onSetCellSourceHidden={setCellSourceHidden}
+                  onSetCellOutputsHidden={setCellOutputsHidden}
+                  onCreateSourceComment={commentsUiSurface.onCreateSourceComment}
+                  onCreateOutputComment={commentsUiSurface.onCreateOutputComment}
+                  onActivateCommentThread={commentsUiSurface.onActivateCommentThread}
+                  commentThreadsByCell={commentsUiEnabled ? sourceCommentThreadsByCell : undefined}
+                  pendingCommentAnchor={sourceCommentRequest?.anchor ?? null}
+                  markdownHeadingAnchorsByCellId={markdownHeadingAnchorsByCellId}
+                />
+              </BokehSessionRuntimeProvider>
             </CrdtBridgeProvider>
           </div>
         </NotebookDocumentShell>
       </div>
+      {commentsUiEnabled && sourceCommentRequest ? (
+        <InlineCommentComposer
+          rect={sourceCommentRequest.rect}
+          quote={sourceCommentRequest.quote ?? sourceCommentRequest.anchor.exact_quote}
+          disabled={!canMutateComments}
+          onSubmit={handleSubmitSourceComment}
+          onCancel={handleCancelSourceComment}
+        />
+      ) : null}
     </PresenceProvider>
   );
 }

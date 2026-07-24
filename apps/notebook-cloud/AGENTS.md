@@ -34,9 +34,9 @@ The cloud room host materializes and validates the notebook-room documents:
 | Document | Scope | Cloud write authority |
 |---|---|---|
 | `NotebookDoc` | notebook room | owners write all; editors write allowed cell surface only; viewers and runtime peers read |
-| `RuntimeStateDoc` | notebook room | daemon/runtime-peer path writes lifecycle, queue, execution, output, env/trust/project, and comm topology for accepted work |
-| `CommsDoc` | notebook room | editor/owner/runtime widget-state writes gated by RuntimeStateDoc topology |
-| `CommentsDoc` | proposed notebook-room sidecar | ADR only; if implemented, keep optimistic local-first writes inside Automerge and authority-finalize policy fields |
+| `RuntimeStateDoc` | notebook room | room host writes execution intent and room facts; runtime peers write policy-allowed lifecycle, progress, output, and comm topology for accepted work; viewer/editor/owner clients read only |
+| `CommsDoc` | notebook room | editor/owner/runtime-peer widget-state writes gated by RuntimeStateDoc topology |
+| `CommentsDoc` | notebook room sidecar | editor/owner write policy; live room host checkpoints at `CHECKPOINT_COMMENTS_DOC_KEY`, routes `FrameType.COMMENTS_DOC_SYNC` frames, and saves `comments_doc_id` to peers (commit 778fc53e); revision rows record `comments_heads_hash` and `comments_snapshot_key` for catalog recovery |
 | `PoolDoc` | daemon scoped | not a notebook room document; hosted deployments should not assume it belongs in room identity |
 
 Permission and durability boundaries are the reason for separate documents.
@@ -70,6 +70,54 @@ stores, not from using document boundaries as a rerender workaround.
   authenticated notebook APIs. Do not serve user blobs from the renderer asset
   origin.
 
+### Viewer async state
+
+Read the `frontend-dev` skill's "Reactive State and WASM Projection Work"
+section and `docs/adr/frontend-sync-bridge.md` Decision 8 before editing
+`viewer/*store*.ts`, `viewer/use-cloud-*-store.ts`,
+`viewer/browser-signals.ts`, or cloud viewer code that touches RxJS.
+
+- The four source stores in `viewer/` hold cloud host policy per
+  `docs/adr/frontend-sync-bridge.md` Decision 8: `cloud-access-request-store.ts`,
+  `cloud-catalog-store.ts`, and `cloud-workstations-store.ts` extend
+  `ObservableStore`; `cloud-auth-store.ts` is deliberately a multi-subject
+  module store (synchronously seeded so instant paint can read it before React
+  mounts).
+  Mechanism (`ObservableStore`/`select`/`createPoll`/`fetchLatest`) stays
+  DOM-free in `packages/runtimed`; these stores stay viewer-side per the
+  convergence memo's do-not-converge list.
+- Components consume named domain hooks (`useCloudAuthState`,
+  `useHostedCatalogAuth`, `useCloudWorkstationsRegistry`, ...), never
+  `store.select(...)` in a render body and never a second React binding.
+- Each domain hook resolves its store from `useCloudStores()`
+  (`cloud-stores-context.ts`), whose default is the singleton bundle: production
+  mounts no provider and stays byte-identical, while a test or fixture mounts
+  `CloudStoresProvider` to override consumption (not activation, which the
+  singletons keep owning for boot and instant paint).
+- The stores are module singletons shared across surfaces, so every async
+  completion - poll tick, imperative action, and any follow-up refetch - is
+  captured at issue and dropped at apply against an activation epoch plus the
+  auth reference; `dispose`, `reset`, and a signed-out closed gate bump the
+  epoch (a transient `loading` gate is a recoverable dip and keeps in-flight
+  work alive). Comparators are named field-by-field functions with a colocated
+  completeness manifest, never deep-equal or JSON; the manifest break surfaces
+  as a tsc error via `pnpm --dir apps/notebook-cloud typecheck` - the node
+  `test` script will not catch it. Full pattern: frontend-dev skill,
+  "Module-Singleton Source Stores".
+
+## Visual language
+
+Cloud chrome is flat and Ink-forward. State tints are single solid
+`color-mix(...)` values; decorative gradients are prototype-era residue and
+must not be reintroduced, including when mirroring existing atoms into new
+surfaces (that is how they propagate). The one sanctioned gradient is the
+`.cloud-startup-line` skeleton shimmer, which is motion, not decoration.
+Separators are `border-top`/`border-right` hairlines with tinted washes, not
+raised cards or drop shadows. Standalone entries that skip the viewer
+stylesheet (the OIDC callback) carry mirrored tokens from
+`src/styles/notebook-base.css`; keep them in sync when the host chrome
+retunes.
+
 ## Verification
 
 Use the narrowest relevant command:
@@ -101,11 +149,3 @@ Before committing any repo change, still run the root-required formatter/lint:
 ```bash
 cargo xtask lint --fix
 ```
-
-## Reference ADRs
-
-- `docs/adr/hosted-room-authorization.md`
-- `docs/adr/runtime-principal-promotion.md`
-- `docs/adr/live-notebook-projection-policy.md`
-- `docs/adr/document-split.md`
-- `docs/adr/notebook-comments-document.md`

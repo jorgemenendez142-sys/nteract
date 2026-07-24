@@ -15,8 +15,9 @@
 //! This module is the daemon-side half. It is additive and gated behind the
 //! cloud transport; the desktop/UDS path is unaffected. The hosted half
 //! (workstation registry, attach jobs) lives in `apps/notebook-cloud`; the
-//! operator path is `docs/remote-workstation.md`.
+//! operator path is `docs/runbooks/remote-workstation.md`.
 
+pub mod accelerators;
 pub mod agent_loop;
 pub mod allocate;
 pub mod cloud_agent_cli;
@@ -29,7 +30,8 @@ pub use agent_loop::{
 };
 pub use allocate::{
     allocate_current_python_runtime, current_python_launch_working_dir,
-    current_python_workstation_metadata, plan_current_python_allocation, Allocation, RoomTarget,
+    current_python_workstation_metadata, plan_current_python_allocation, Allocation,
+    CurrentPythonLaunchSpec, RoomTarget,
 };
 pub use cloud_agent_cli::{build_cloud_config, CloudAgentArgs, CloudAuthKind, CLOUD_TOKEN_ENV};
 pub use environments::{

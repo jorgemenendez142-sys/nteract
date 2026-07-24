@@ -12,6 +12,7 @@ import {
   retryAfterMs,
   retryCooldownMs,
   runtimePeerExitMessage,
+  STALE_WORKSTATION_RETRYABLE_STATUS_CODES,
   stableWorkstationId,
 } from "../scripts/hosted-workstation-agent-core.mjs";
 
@@ -56,6 +57,28 @@ describe("hosted workstation agent launch contract", () => {
       "--workstation-display-name",
       "lab2 workstation",
     ]);
+  });
+
+  it("uses execute launch mode for resume attach jobs", () => {
+    const plan = buildAttachJobSpawnPlan({
+      job: {
+        job_id: "job-resume",
+        notebook_id: "nb-resume",
+        trigger: "resume",
+      },
+      pythonPath: "/opt/k/bin/python",
+      agentRoot: "/tmp/agent",
+      baseUrl: "https://preview.runt.run",
+      workingDirectory: "/home/ubuntu/project",
+      workstationId: "ws-lab2",
+      displayName: "lab2 workstation",
+    });
+
+    assert.equal(
+      plan.args.some((arg, index) => arg === "--launch-mode" && plan.args[index + 1] === "execute"),
+      true,
+    );
+    assert.equal(plan.args.includes("/opt/k/bin/python"), true);
   });
 
   it("can launch runtime peers with OIDC bearer auth without an API-key provider header", () => {
@@ -140,6 +163,8 @@ describe("hosted workstation agent launch contract", () => {
         displayName: "lab2 workstation",
         workingDirectory: "/home/ubuntu/project",
         pythonPath: "/opt/k/bin/python",
+        installedBuild: "0.1.0+abc123",
+        channel: "nightly",
         cpuCount: 8,
         memoryBytes: 16_000_000_000,
       }),
@@ -149,6 +174,8 @@ describe("hosted workstation agent launch contract", () => {
         provider: "runtime_peer",
         default_environment_label: "Current Python",
         environment_policy: "current_python",
+        installed_build: "0.1.0+abc123",
+        channel: "nightly",
         working_directory: "/home/ubuntu/project",
         cpu_count: 8,
         memory_bytes: 16_000_000_000,
@@ -161,6 +188,20 @@ describe("hosted workstation agent launch contract", () => {
         },
       },
     );
+  });
+
+  it("omits hosted agent build metadata when no detector supplies it", () => {
+    const payload = buildWorkstationRegistrationPayload({
+      workstationId: "ws-hosted",
+      displayName: "hosted workstation",
+      workingDirectory: "/home/ubuntu/project",
+      pythonPath: "/opt/k/bin/python",
+      cpuCount: 8,
+      memoryBytes: 16_000_000_000,
+    });
+
+    assert.equal(Object.hasOwn(payload, "installed_build"), false);
+    assert.equal(Object.hasOwn(payload, "channel"), false);
   });
 
   it("keeps generated workstation ids and polling intervals bounded", () => {
@@ -207,6 +248,26 @@ describe("hosted workstation agent launch contract", () => {
       `date retry delay should be bounded, got ${retryDateDelay}`,
     );
     assert.equal(retryAfterMs(new Response("no hint", { status: 503 }), 12_345), 12_345);
+    assert.equal(retryAfterMs(new Response("missing", { status: 404 })), 0);
+    assert.equal(
+      retryAfterMs(
+        new Response("missing", {
+          status: 404,
+          headers: { "Retry-After": "900" },
+        }),
+        undefined,
+        STALE_WORKSTATION_RETRYABLE_STATUS_CODES,
+      ),
+      900_000,
+    );
+    assert.equal(
+      retryAfterMs(
+        new Response("gone", { status: 410 }),
+        undefined,
+        STALE_WORKSTATION_RETRYABLE_STATUS_CODES,
+      ),
+      900_000,
+    );
   });
 
   it("expands retry cooldowns for repeated rate-limit responses", () => {

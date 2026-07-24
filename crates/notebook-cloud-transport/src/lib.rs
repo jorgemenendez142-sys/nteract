@@ -35,9 +35,12 @@
 //!
 //! A cloud peer is a *consumer* of the room's authoritative RuntimeStateDoc, so
 //! it must apply incoming changes with `receive_sync_message_with_changes`, not
-//! the daemon-authoritative `receive_sync_message` (which strips them). That is
+//! the read-only-peer `receive_sync_message` path (which strips them). That is
 //! an agent-loop policy decision, recorded in the #16 decision log; this crate
 //! only moves bytes.
+
+#[cfg(feature = "registry")]
+pub mod registry;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -57,6 +60,7 @@ use tracing::{debug, info, warn};
 /// First-byte constant for the session-control channel (`cloud_room_ready`
 /// arrives here). Re-export of the wire constant for local readability.
 const SESSION_CONTROL: u8 = notebook_wire::frame_types::SESSION_CONTROL;
+pub const RUNTIME_IDLE_TIMEOUT_CLOSE_REASON: &str = "runtime idle timeout";
 
 /// How long [`CloudWsFrameTransport::connect`] waits for the room to reach the
 /// `cloud_room_ready` / `cloud_frame_rejected` state after a successful WS
@@ -302,12 +306,56 @@ fn cloud_frame_rejection_error(payload: &[u8]) -> Option<std::io::Error> {
     ))
 }
 
+fn upgrade_rejection_error(
+    status: tokio_tungstenite::tungstenite::http::StatusCode,
+    body: &str,
+) -> std::io::Error {
+    let message = format!("upgrade rejected: HTTP {status}: {body}");
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, message)
+    } else {
+        std::io::Error::other(message)
+    }
+}
+
+fn is_recoverable_cloud_frame_rejection_error(error: &std::io::Error) -> bool {
+    if error.kind() != std::io::ErrorKind::PermissionDenied {
+        return false;
+    }
+
+    let message = error.to_string();
+    if !message.starts_with("cloud room rejected frame:") {
+        return false;
+    }
+    let sync_frame = [
+        "frame_type=0 ",
+        "frame_type=5 ",
+        "frame_type=9 ",
+        "frame_type=automerge_sync ",
+        "frame_type=runtime_state_sync ",
+        "frame_type=comms_doc_sync ",
+        "frame_type=AUTOMERGE_SYNC ",
+        "frame_type=RUNTIME_STATE_SYNC ",
+        "frame_type=COMMS_DOC_SYNC ",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle));
+    if !sync_frame {
+        return false;
+    }
+
+    message.contains("recursive use of an object detected which would lead to unsafe aliasing")
+        || message.contains("PatchLogMismatch")
+        || message.contains("patch logs cannot be shared between documents")
+}
+
 fn terminal_cloud_close_error(code: Option<u16>, reason: &str) -> Option<std::io::Error> {
     let reason = reason.trim();
     let terminal_by_reason = matches!(
         reason,
         "too many rejected frames"
             | "replaced by newer runtime peer"
+            | RUNTIME_IDLE_TIMEOUT_CLOSE_REASON
             | "workstation attachment replaced"
             | "workstation restart requested"
             | "workstation mismatch"
@@ -329,6 +377,13 @@ fn terminal_cloud_close_error(code: Option<u16>, reason: &str) -> Option<std::io
             }
         ),
     ))
+}
+
+pub fn cloud_close_is_graceful_shutdown(error: &std::io::Error) -> bool {
+    let message = error.to_string();
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        && message.starts_with("cloud room closed runtime peer:")
+        && message.ends_with("reason=runtime idle timeout")
 }
 
 /// Read frames from `source` until the room reaches a terminal ready state,
@@ -683,9 +738,7 @@ impl CloudWsFrameTransport {
                     .into_body()
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
                     .unwrap_or_default();
-                return Err(std::io::Error::other(format!(
-                    "upgrade rejected: HTTP {status}: {body}"
-                )));
+                return Err(upgrade_rejection_error(status, &body));
             }
             Err(e) => return Err(std::io::Error::other(format!("websocket connect: {e}"))),
         };
@@ -742,7 +795,14 @@ impl FrameTransport for CloudWsFrameTransport {
     }
 
     fn stream_error_is_recoverable(&self, error: &std::io::Error) -> bool {
+        if is_recoverable_cloud_frame_rejection_error(error) {
+            return true;
+        }
         error.kind() != std::io::ErrorKind::PermissionDenied
+    }
+
+    fn stream_error_is_graceful_shutdown(&self, error: &std::io::Error) -> bool {
+        cloud_close_is_graceful_shutdown(error)
     }
 
     async fn connect(&self) -> std::io::Result<(Self::Source, Self::Sink)> {
@@ -777,6 +837,24 @@ mod tests {
     #[allow(dead_code)]
     fn cloud_transport_is_a_frame_transport() {
         assert_satisfies_frame_transport::<CloudWsFrameTransport>();
+    }
+
+    #[test]
+    fn upgrade_auth_rejections_are_permission_denied() {
+        use tokio_tungstenite::tungstenite::http::StatusCode;
+
+        assert_eq!(
+            upgrade_rejection_error(StatusCode::UNAUTHORIZED, "expired").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            upgrade_rejection_error(StatusCode::FORBIDDEN, "scope denied").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            upgrade_rejection_error(StatusCode::SERVICE_UNAVAILABLE, "retry").kind(),
+            std::io::ErrorKind::Other
+        );
     }
 
     #[test]
@@ -877,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_frame_rejection_error_is_non_recoverable_shape() {
+    fn cloud_frame_rejection_error_surfaces_rejection_reason() {
         let payload = serde_json::to_vec(&serde_json::json!({
             "type": "cloud_frame_rejected",
             "frame_type": 5,
@@ -895,6 +973,39 @@ mod tests {
         }))
         .unwrap();
         assert!(cloud_frame_rejection_error(&accepted).is_none());
+    }
+
+    #[test]
+    fn sync_frame_rejection_from_automerge_boundary_is_recoverable() {
+        let transport = CloudWsFrameTransport::new(test_config());
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "type": "cloud_frame_rejected",
+            "frame_type": 5,
+            "reason": "room host rejected runtime_state_sync frame: Error: recursive use of an object detected which would lead to unsafe aliasing in rust",
+        }))
+        .unwrap();
+        let error = cloud_frame_rejection_error(&payload).expect("rejection becomes an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            transport.stream_error_is_recoverable(&error),
+            "sync divergence rejections should reconnect instead of killing the runtime peer",
+        );
+    }
+
+    #[test]
+    fn authz_frame_rejection_remains_terminal() {
+        let transport = CloudWsFrameTransport::new(test_config());
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "type": "cloud_frame_rejected",
+            "frame_type": 5,
+            "reason": "actor label must be '<principal>/<operator>'",
+        }))
+        .unwrap();
+        let error = cloud_frame_rejection_error(&payload).expect("rejection becomes an error");
+        assert!(
+            !transport.stream_error_is_recoverable(&error),
+            "permission and authority rejects should still stop the runtime peer",
+        );
     }
 
     #[test]
@@ -928,6 +1039,59 @@ mod tests {
         assert!(restart
             .to_string()
             .contains("workstation restart requested"));
+    }
+
+    #[test]
+    fn runtime_idle_timeout_close_reason_is_pinned_to_room_constant() {
+        // Mirrors apps/notebook-cloud/src/notebook-room.ts RUNTIME_IDLE_CLOSE_REASON.
+        assert_eq!(RUNTIME_IDLE_TIMEOUT_CLOSE_REASON, "runtime idle timeout");
+    }
+
+    #[test]
+    fn runtime_idle_timeout_close_is_terminal_and_graceful() {
+        let transport = CloudWsFrameTransport::new(test_config());
+        let idle = terminal_cloud_close_error(Some(1012), RUNTIME_IDLE_TIMEOUT_CLOSE_REASON)
+            .expect("runtime idle timeout should be terminal");
+        assert_eq!(idle.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(cloud_close_is_graceful_shutdown(&idle));
+        assert!(!transport.stream_error_is_recoverable(&idle));
+        assert!(transport.stream_error_is_graceful_shutdown(&idle));
+    }
+
+    #[test]
+    fn graceful_shutdown_helper_rejects_other_terminal_and_clean_closes() {
+        let transport = CloudWsFrameTransport::new(test_config());
+        for reason in [
+            "too many rejected frames",
+            "replaced by newer runtime peer",
+            "workstation attachment replaced",
+            "workstation restart requested",
+            "workstation mismatch",
+        ] {
+            let error = terminal_cloud_close_error(Some(1008), reason)
+                .expect("allowlisted reason should be terminal");
+            assert!(
+                !cloud_close_is_graceful_shutdown(&error),
+                "{reason} must remain terminal-failed"
+            );
+            assert!(!transport.stream_error_is_graceful_shutdown(&error));
+        }
+
+        assert!(terminal_cloud_close_error(Some(1000), "going away").is_none());
+        assert!(terminal_cloud_close_error(Some(1012), "server restart").is_none());
+        let arbitrary_clean_close = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cloud room closed runtime peer: code=1000 reason=going away",
+        );
+        assert!(!cloud_close_is_graceful_shutdown(&arbitrary_clean_close));
+        assert!(!transport.stream_error_is_graceful_shutdown(&arbitrary_clean_close));
+
+        let rejected_frame = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cloud frame rejected: reason=runtime idle timeout is not valid in this context",
+        );
+        assert!(!cloud_close_is_graceful_shutdown(&rejected_frame));
+        assert!(!transport.stream_error_is_graceful_shutdown(&rejected_frame));
     }
 
     #[test]

@@ -85,13 +85,25 @@ describe("createBrowserHost()", () => {
     ws.message(
       JSON.stringify({
         type: "ready",
-        payload: { notebook_id: "nb-1", cell_count: 0, ephemeral: true },
+        payload: {
+          notebook_id: "nb-1",
+          cell_count: 0,
+          ephemeral: true,
+          comments_doc_id: "comments:local-room:nb-1",
+          comments_notebook_ref: { kind: "local_room", room_id: "nb-1" },
+        },
         blob_port: 48124,
         daemon: config.daemon,
       }),
     );
 
-    expect(ready).toHaveBeenCalledWith({ notebook_id: "nb-1", cell_count: 0, ephemeral: true });
+    expect(ready).toHaveBeenCalledWith({
+      notebook_id: "nb-1",
+      cell_count: 0,
+      ephemeral: true,
+      comments_doc_id: "comments:local-room:nb-1",
+      comments_notebook_ref: { kind: "local_room", room_id: "nb-1" },
+    });
     await expect(host.blobs.port()).resolves.toBe(48124);
     await expect(host.blobs.resolver()).resolves.toMatchObject({ port: 48124 });
     expect((await host.blobs.resolver()).url({ blob: "abc123" })).toBe(
@@ -146,5 +158,39 @@ describe("createBrowserHost()", () => {
       }).buffer,
     );
     await expect(result).resolves.toEqual({ result: "ok", entries: [] });
+  });
+
+  it("keeps browser synced settings in memory and notifies subscribers", async () => {
+    FakeWebSocket.instances = [];
+    const host = await createBrowserHost({
+      fetchImpl: fetchConfig(),
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+    });
+
+    const changed = vi.fn();
+    const unlisten = host.settings.onChanged(changed);
+
+    await expect(host.settings.getSynced()).resolves.toEqual({});
+    await host.settings.setSynced("theme", "dark");
+    await expect(host.settings.getSynced()).resolves.toEqual({ theme: "dark" });
+    expect(changed).toHaveBeenCalledWith({ theme: "dark" });
+
+    await host.settings.setSynced("uv.default_packages", ["numpy", "pandas"]);
+    await expect(host.settings.getSynced()).resolves.toEqual({
+      theme: "dark",
+      uv: { default_packages: ["numpy", "pandas"] },
+    });
+    expect(changed).toHaveBeenLastCalledWith({
+      theme: "dark",
+      uv: { default_packages: ["numpy", "pandas"] },
+    });
+
+    await expect(host.settings.rotateInstallId()).resolves.toEqual(expect.any(String));
+    const snapshot = await host.settings.getSynced();
+    expect(snapshot.install_id).toEqual(expect.any(String));
+
+    unlisten();
+    await host.settings.setSynced("theme", "light");
+    expect(changed).toHaveBeenCalledTimes(3);
   });
 });

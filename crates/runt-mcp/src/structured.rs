@@ -12,10 +12,14 @@
 use notebook_doc::mime::MimeKind;
 use runtime_doc::CommDocEntry;
 use runtimed_outputs::output_resolver;
+use runtimed_outputs::resolved_output::{DataValue, Output};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
 const WIDGET_VIEW_MIME: &str = "application/vnd.jupyter.widget-view+json";
+const JUPYTER_MATPLOTLIB_MODULE: &str = "jupyter-matplotlib";
+const MPL_CANVAS_MODEL: &str = "MPLCanvasModel";
+const MPL_CANVAS_CHECKPOINT_KEY: &str = "_nteract_mpl_canvas";
 
 /// Check if a MIME type is a visualization spec (Plotly, Vega-Lite, Vega).
 fn is_viz_mime(mime: &str) -> bool {
@@ -25,6 +29,13 @@ fn is_viz_mime(mime: &str) -> bool {
         || (mime.starts_with("application/vnd.vega.v")
             && !mime.starts_with("application/vnd.vegalite.")
             && (mime.ends_with("+json") || mime.ends_with(".json")))
+}
+
+fn is_static_raster_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
 }
 
 /// Inputs for [`cell_structured_content_from_manifests`].
@@ -37,6 +48,7 @@ pub struct CellStructuredContentManifestInput<'a> {
     pub status: &'a str,
     pub blob_base_url: &'a Option<String>,
     pub comms: Option<&'a HashMap<String, CommDocEntry>>,
+    pub resolved_outputs_by_manifest: Option<&'a [Option<Output>]>,
 }
 
 /// Build structuredContent JSON directly from manifest Values and blob URLs.
@@ -47,12 +59,29 @@ pub struct CellStructuredContentManifestInput<'a> {
 pub fn cell_structured_content_from_manifests(
     input: CellStructuredContentManifestInput<'_>,
 ) -> Value {
+    let outputs = input
+        .output_manifests
+        .iter()
+        .enumerate()
+        .map(|(index, manifest)| {
+            manifest_output_to_structured_with_resolved(
+                manifest,
+                input.blob_base_url,
+                input.comms,
+                input
+                    .resolved_outputs_by_manifest
+                    .and_then(|outputs| outputs.get(index))
+                    .and_then(Option::as_ref),
+            )
+        })
+        .collect::<Vec<_>>();
+
     let mut content = json!({
         "cell": {
             "cell_id": input.cell_id,
             "source": input.source,
             "cell_type": input.cell_type,
-            "outputs": input.output_manifests.iter().map(|m| manifest_output_to_structured(m, input.blob_base_url, input.comms)).collect::<Vec<_>>(),
+            "outputs": outputs,
             "execution_count": input.execution_count,
             "status": input.status,
         }
@@ -69,10 +98,20 @@ pub fn cell_structured_content_from_manifests(
 ///
 /// Reads inline content directly from ContentRef entries and emits blob URLs
 /// for blob-stored content. No blob fetches are performed.
+#[cfg(test)]
 fn manifest_output_to_structured(
     manifest: &Value,
     blob_base_url: &Option<String>,
     comms: Option<&HashMap<String, CommDocEntry>>,
+) -> Value {
+    manifest_output_to_structured_with_resolved(manifest, blob_base_url, comms, None)
+}
+
+fn manifest_output_to_structured_with_resolved(
+    manifest: &Value,
+    blob_base_url: &Option<String>,
+    comms: Option<&HashMap<String, CommDocEntry>>,
+    resolved_output: Option<&Output>,
 ) -> Value {
     let output_type = manifest
         .get("output_type")
@@ -154,12 +193,16 @@ fn manifest_output_to_structured(
             let mut data = serde_json::Map::new();
 
             if let Some(data_map) = manifest.get("data").and_then(|v| v.as_object()) {
-                // Check for renderable raster images to skip redundant text/html
-                let has_renderable_image = data_map.keys().any(|m| {
-                    matches!(
-                        m.as_str(),
-                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                    )
+                // Check for blob-backed raster images that will survive as
+                // Blob Store URLs, then skip redundant text/html. Inline
+                // rasters are intentionally omitted from MCP tool responses,
+                // so they must not suppress richer HTML fallbacks.
+                let has_renderable_image = data_map.iter().any(|(mime, content_ref)| {
+                    is_static_raster_mime(mime)
+                        && blob_base_url.is_some()
+                        && output_resolver::content_ref_meta(content_ref)
+                            .blob_hash
+                            .is_some()
                 });
 
                 for (mime, content_ref) in data_map {
@@ -191,13 +234,12 @@ fn manifest_output_to_structured(
 
                     let meta = output_resolver::content_ref_meta(content_ref);
 
-                    // Images are binary but their inline form is base64,
-                    // which renderers handle as data: URIs. Non-image binary
-                    // MIMEs (parquet, audio, video, application/octet-stream)
-                    // produce garbled text when inlined as JSON strings.
-                    let is_non_renderable_binary = notebook_doc::mime::mime_kind(mime)
+                    // Binary blobs can be rendered via Blob Store URLs. Inline
+                    // binary has no URL to hand to the MCP app, and inlining
+                    // raster base64 would expose image bytes in tool responses.
+                    let should_drop_inline_binary = notebook_doc::mime::mime_kind(mime)
                         == MimeKind::Binary
-                        && !mime.starts_with("image/");
+                        && (!mime.starts_with("image/") || is_static_raster_mime(mime));
 
                     let json_value = if let Some(hash) = meta.blob_hash {
                         // Blob-stored content — always emit blob URL regardless
@@ -205,11 +247,10 @@ fn manifest_output_to_structured(
                         blob_base_url
                             .as_ref()
                             .map(|base| Value::String(format!("{}/blob/{}", base, hash)))
-                    } else if meta.is_inline && !is_non_renderable_binary {
-                        // Inline text/JSON/image content — extract directly.
-                        // Non-renderable binary (parquet, audio, etc.) is
-                        // silently dropped; the client falls back to
-                        // text/plain or text/llm+plain.
+                    } else if meta.is_inline && !should_drop_inline_binary {
+                        // Inline text/JSON content — extract directly. Inline
+                        // binary/raster content is silently dropped; the client
+                        // falls back to text/plain or text/llm+plain.
                         content_ref.get("inline").cloned()
                     } else {
                         None
@@ -247,6 +288,23 @@ fn manifest_output_to_structured(
             // Synthesize a safe widget summary for MCP App/static clients that
             // cannot attach to the live comm bridge. Do not include raw widget
             // state here; Password widgets can store plaintext values.
+            if let (Some(data_map), Some(comms)) =
+                (manifest.get("data").and_then(|v| v.as_object()), comms)
+            {
+                if let Some(checkpoint) =
+                    matplotlib_checkpoint_from_data_map(data_map, comms, blob_base_url)
+                {
+                    if let Some(image_url) = checkpoint.image_url {
+                        data.insert("image/png".to_string(), Value::String(image_url));
+                    }
+                    if !data.contains_key("text/llm+plain") {
+                        data.insert(
+                            "text/llm+plain".to_string(),
+                            Value::String(checkpoint.summary),
+                        );
+                    }
+                }
+            }
             if !data.contains_key("text/llm+plain") {
                 if let (Some(data_map), Some(comms)) =
                     (manifest.get("data").and_then(|v| v.as_object()), comms)
@@ -256,6 +314,8 @@ fn manifest_output_to_structured(
                     }
                 }
             }
+
+            merge_resolved_priority_text(&mut data, resolved_output, blob_base_url);
 
             let mut result = json!({
                 "output_type": output_type,
@@ -269,6 +329,51 @@ fn manifest_output_to_structured(
             attach_id(result)
         }
         _ => attach_id(json!({"output_type": output_type})),
+    }
+}
+
+/// Agents read priority text from the tool result itself; a blob URL is a
+/// fallback for content nothing resolved, never a substitute for text the
+/// resolver already holds. The data-map walk above emits blob URLs for
+/// blob-stored ContentRefs, including the CONTENT_PRIORITY text MIMEs, so
+/// resolved text replaces those URL placeholders. Inline content that came
+/// through the manifest (author-provided summaries under the CRDT inline
+/// threshold) stays; only absent entries and blob-URL placeholders yield.
+fn merge_resolved_priority_text(
+    data: &mut serde_json::Map<String, Value>,
+    resolved_output: Option<&Output>,
+    blob_base_url: &Option<String>,
+) {
+    let Some(resolved_output) = resolved_output else {
+        return;
+    };
+    if !matches!(
+        resolved_output.output_type.as_str(),
+        "display_data" | "execute_result"
+    ) {
+        return;
+    }
+    let Some(resolved_data) = resolved_output.data.as_ref() else {
+        return;
+    };
+    let is_blob_url_placeholder = |value: &Value| -> bool {
+        let (Some(base), Some(s)) = (blob_base_url.as_ref(), value.as_str()) else {
+            return false;
+        };
+        s.starts_with(base.as_str()) && s[base.len()..].starts_with("/blob/")
+    };
+    for &mime in output_resolver::CONTENT_PRIORITY {
+        if let Some(DataValue::Text(text)) = resolved_data.get(mime) {
+            match data.get(mime) {
+                None => {
+                    data.insert(mime.to_string(), Value::String(text.clone()));
+                }
+                Some(existing) if is_blob_url_placeholder(existing) => {
+                    data.insert(mime.to_string(), Value::String(text.clone()));
+                }
+                Some(_) => {}
+            }
+        }
     }
 }
 
@@ -302,6 +407,44 @@ fn widget_summary_from_data_map(
     Some(output_resolver::format_widget_summary(
         &model_id, entry, comms,
     ))
+}
+
+struct MatplotlibCheckpoint {
+    image_url: Option<String>,
+    summary: String,
+}
+
+fn matplotlib_checkpoint_from_data_map(
+    data_map: &serde_json::Map<String, Value>,
+    comms: &HashMap<String, CommDocEntry>,
+    blob_base_url: &Option<String>,
+) -> Option<MatplotlibCheckpoint> {
+    let model_id = widget_model_id_from_content_ref(data_map.get(WIDGET_VIEW_MIME)?)?;
+    let entry = comms.get(&model_id)?;
+    if entry.model_module != JUPYTER_MATPLOTLIB_MODULE || entry.model_name != MPL_CANVAS_MODEL {
+        return None;
+    }
+
+    let checkpoint = entry.state.get(MPL_CANVAS_CHECKPOINT_KEY)?;
+    let frame = checkpoint.get("frame")?;
+    let hash = frame.get("blob").and_then(|v| v.as_str())?;
+    let image_url = blob_base_url
+        .as_ref()
+        .map(|base| format!("{}/blob/{}", base, hash));
+    let size = checkpoint
+        .get("size")
+        .and_then(|v| v.as_array())
+        .and_then(|items| {
+            let width = items.first()?.as_u64()?;
+            let height = items.get(1)?.as_u64()?;
+            Some(format!(" {width}x{height}"))
+        })
+        .unwrap_or_default();
+
+    Some(MatplotlibCheckpoint {
+        image_url,
+        summary: format!("[matplotlib widget checkpoint: image/png{size}]"),
+    })
 }
 
 /// Resolve a text ContentRef to a JSON value (inline text or blob URL).
@@ -424,6 +567,26 @@ mod tests {
     }
 
     #[test]
+    fn structured_inline_image_does_not_suppress_html() {
+        let manifest = json!({
+            "output_type": "display_data",
+            "data": {
+                "text/html": inline_ref("<img src='data:...' />"),
+                "image/png": inline_ref("iVBORw0KGgoAAAA...base64..."),
+                "text/plain": inline_ref("<Figure>"),
+            },
+        });
+        let blob_base = Some("http://localhost:9999".to_string());
+        let result = manifest_output_to_structured(&manifest, &blob_base, None);
+        let Some(data) = result["data"].as_object() else {
+            panic!("data should be an object");
+        };
+        assert_eq!(data["text/html"], "<img src='data:...' />");
+        assert!(!data.contains_key("image/png"));
+        assert_eq!(data["text/plain"], "<Figure>");
+    }
+
+    #[test]
     fn structured_output_id_propagates_on_every_variant() {
         // The daemon stamps `output_id` on every manifest and the MCP App
         // uses it as a React key. Structured output must preserve it.
@@ -539,9 +702,9 @@ mod tests {
     }
 
     #[test]
-    fn structured_image_inline_passes_through() {
-        // Images are binary but inline as base64 which renderers handle
-        // as data: URIs. They must NOT be suppressed.
+    fn structured_image_inline_is_omitted() {
+        // Inline raster content would put image bytes directly in MCP tool
+        // responses. Blob-backed images still emit Blob Store URLs.
         let manifest = json!({
             "output_type": "display_data",
             "data": {
@@ -553,9 +716,9 @@ mod tests {
         let data = result["data"]
             .as_object()
             .expect("data should be an object");
-        assert_eq!(
-            data["image/png"], "iVBORw0KGgoAAAA...base64...",
-            "inline base64 images should pass through for data: URI rendering"
+        assert!(
+            !data.contains_key("image/png"),
+            "inline base64 images should not be serialized in structured content"
         );
         assert_eq!(data["text/plain"], "<Figure>");
     }
@@ -616,6 +779,230 @@ mod tests {
     }
 
     #[test]
+    fn structured_merges_resolved_llm_plain_for_blob_backed_viz_specs() {
+        // Real Plotly/Vega specs usually exceed the inline ContentRef threshold.
+        // The structured renderer still needs the blob URL, while the MCP output
+        // payload should carry the already-resolved LLM summary.
+        let manifest = json!({
+            "output_type": "display_data",
+            "data": {
+                "application/vnd.plotly.v1+json": blob_ref("plotly_hash", 4_096),
+                "text/plain": inline_ref("Figure()"),
+            },
+        });
+        let resolved_outputs_by_manifest = vec![Some(Output::display_data(HashMap::from([(
+            "text/llm+plain".to_string(),
+            runtimed_outputs::resolved_output::DataValue::Text(
+                "Plotly chart: 1 bar trace".to_string(),
+            ),
+        )])))];
+        let blob_base = Some("http://localhost:9999".to_string());
+
+        let result = cell_structured_content_from_manifests(CellStructuredContentManifestInput {
+            cell_id: "cell-plotly",
+            cell_type: "code",
+            source: "fig",
+            output_manifests: &[manifest],
+            execution_count: Some(1),
+            status: "done",
+            blob_base_url: &blob_base,
+            comms: None,
+            resolved_outputs_by_manifest: Some(&resolved_outputs_by_manifest),
+        });
+
+        let data = result["cell"]["outputs"][0]["data"]
+            .as_object()
+            .expect("output data should be an object");
+        assert_eq!(
+            data["application/vnd.plotly.v1+json"],
+            "http://localhost:9999/blob/plotly_hash"
+        );
+        assert_eq!(data["text/llm+plain"], "Plotly chart: 1 bar trace");
+    }
+
+    #[test]
+    fn structured_resolved_llm_plain_stays_aligned_when_manifest_resolution_drops_output() {
+        let dropped_manifest = json!({
+            "output_type": "display_data",
+        });
+        let plotly_manifest = json!({
+            "output_type": "display_data",
+            "data": {
+                "application/vnd.plotly.v1+json": blob_ref("plotly_hash", 4_096),
+            },
+        });
+        let resolved_outputs_by_manifest = vec![
+            None,
+            Some(Output::display_data(HashMap::from([(
+                "text/llm+plain".to_string(),
+                runtimed_outputs::resolved_output::DataValue::Text(
+                    "Plotly chart: aligned summary".to_string(),
+                ),
+            )]))),
+        ];
+        let manifests = vec![dropped_manifest, plotly_manifest];
+        let blob_base = Some("http://localhost:9999".to_string());
+
+        let result = cell_structured_content_from_manifests(CellStructuredContentManifestInput {
+            cell_id: "cell-plotly",
+            cell_type: "code",
+            source: "fig",
+            output_manifests: &manifests,
+            execution_count: Some(1),
+            status: "done",
+            blob_base_url: &blob_base,
+            comms: None,
+            resolved_outputs_by_manifest: Some(&resolved_outputs_by_manifest),
+        });
+
+        let outputs = result["cell"]["outputs"]
+            .as_array()
+            .expect("outputs should be an array");
+        let first_data = outputs[0]["data"]
+            .as_object()
+            .expect("first output data should be an object");
+        assert!(
+            !first_data.contains_key("text/llm+plain"),
+            "summary must not be injected into a preceding dropped manifest"
+        );
+        let second_data = outputs[1]["data"]
+            .as_object()
+            .expect("second output data should be an object");
+        assert_eq!(
+            second_data["application/vnd.plotly.v1+json"],
+            "http://localhost:9999/blob/plotly_hash"
+        );
+        assert_eq!(
+            second_data["text/llm+plain"],
+            "Plotly chart: aligned summary"
+        );
+    }
+
+    #[test]
+    fn structured_resolved_text_replaces_blob_url_placeholders() {
+        // A dataframe execute_result: every MIME crossed the inline threshold,
+        // so the manifest walk emits blob URLs for all of them, including the
+        // agent-facing text representations. The resolved text must replace
+        // those URL placeholders while the heavy payloads stay as URLs.
+        let manifest = json!({
+            "output_type": "execute_result",
+            "execution_count": 5,
+            "data": {
+                "application/vnd.apache.arrow.stream": blob_ref("arrow_hash", 500_000),
+                "text/html": blob_ref("html_hash", 20_000),
+                "text/llm+plain": blob_ref("llm_hash", 2_048),
+                "text/plain": blob_ref("plain_hash", 4_096),
+            },
+        });
+        let resolved_outputs_by_manifest = vec![Some(Output::execute_result(
+            HashMap::from([(
+                "text/llm+plain".to_string(),
+                runtimed_outputs::resolved_output::DataValue::Text(
+                    "DataFrame: 104 rows x 9 cols. Columns: client_id, ...".to_string(),
+                ),
+            )]),
+            5,
+        ))];
+        let blob_base = Some("http://localhost:9999".to_string());
+
+        let result = cell_structured_content_from_manifests(CellStructuredContentManifestInput {
+            cell_id: "cell-df",
+            cell_type: "code",
+            source: "dim_clients.head()",
+            output_manifests: &[manifest],
+            execution_count: Some(5),
+            status: "done",
+            blob_base_url: &blob_base,
+            comms: None,
+            resolved_outputs_by_manifest: Some(&resolved_outputs_by_manifest),
+        });
+
+        let data = result["cell"]["outputs"][0]["data"]
+            .as_object()
+            .expect("output data should be an object");
+        assert_eq!(
+            data["text/llm+plain"], "DataFrame: 104 rows x 9 cols. Columns: client_id, ...",
+            "resolved priority text must replace the blob URL placeholder"
+        );
+        assert_eq!(
+            data["application/vnd.apache.arrow.stream"], "http://localhost:9999/blob/arrow_hash",
+            "heavy payloads keep their blob URLs"
+        );
+        assert_eq!(data["text/html"], "http://localhost:9999/blob/html_hash");
+    }
+
+    #[test]
+    fn structured_resolved_plain_text_replaces_url_when_no_llm_plain_resolved() {
+        // The resolver walks CONTENT_PRIORITY and may resolve text/plain when
+        // no llm+plain exists. That text must also land inline, not as a URL.
+        let manifest = json!({
+            "output_type": "execute_result",
+            "execution_count": 2,
+            "data": {
+                "text/plain": blob_ref("plain_hash", 4_096),
+            },
+        });
+        let resolved_outputs_by_manifest = vec![Some(Output::execute_result(
+            HashMap::from([(
+                "text/plain".to_string(),
+                runtimed_outputs::resolved_output::DataValue::Text(
+                    "0    1\ndtype: int64".to_string(),
+                ),
+            )]),
+            2,
+        ))];
+        let blob_base = Some("http://localhost:9999".to_string());
+
+        let result = cell_structured_content_from_manifests(CellStructuredContentManifestInput {
+            cell_id: "cell-series",
+            cell_type: "code",
+            source: "s",
+            output_manifests: &[manifest],
+            execution_count: Some(2),
+            status: "done",
+            blob_base_url: &blob_base,
+            comms: None,
+            resolved_outputs_by_manifest: Some(&resolved_outputs_by_manifest),
+        });
+
+        assert_eq!(
+            result["cell"]["outputs"][0]["data"]["text/plain"],
+            "0    1\ndtype: int64"
+        );
+    }
+
+    #[test]
+    fn structured_resolved_llm_plain_does_not_overwrite_existing_summary() {
+        let manifest = json!({
+            "output_type": "display_data",
+            "data": {
+                "text/llm+plain": inline_ref("author summary"),
+            },
+        });
+        let resolved_outputs_by_manifest = vec![Some(Output::display_data(HashMap::from([(
+            "text/llm+plain".to_string(),
+            runtimed_outputs::resolved_output::DataValue::Text("resolved summary".to_string()),
+        )])))];
+
+        let result = cell_structured_content_from_manifests(CellStructuredContentManifestInput {
+            cell_id: "cell-summary",
+            cell_type: "code",
+            source: "display",
+            output_manifests: &[manifest],
+            execution_count: Some(1),
+            status: "done",
+            blob_base_url: &None,
+            comms: None,
+            resolved_outputs_by_manifest: Some(&resolved_outputs_by_manifest),
+        });
+
+        assert_eq!(
+            result["cell"]["outputs"][0]["data"]["text/llm+plain"],
+            "author summary"
+        );
+    }
+
+    #[test]
     fn structured_widget_view_gets_safe_summary_from_comms() {
         let manifest = json!({
             "output_type": "display_data",
@@ -644,6 +1031,53 @@ mod tests {
 
         assert!(summary.contains("IntSlider"));
         assert!(summary.contains("7"));
+    }
+
+    #[test]
+    fn structured_matplotlib_widget_view_emits_checkpoint_image_url() {
+        let manifest = json!({
+            "output_type": "display_data",
+            "data": {
+                "application/vnd.jupyter.widget-view+json": inline_ref(r#"{"model_id":"mpl-1"}"#),
+            },
+        });
+        let mut comms = HashMap::new();
+        comms.insert(
+            "mpl-1".to_string(),
+            CommDocEntry {
+                target_name: "jupyter.widget".to_string(),
+                model_module: "jupyter-matplotlib".to_string(),
+                model_name: "MPLCanvasModel".to_string(),
+                state: json!({
+                    "_nteract_mpl_canvas": {
+                        "version": 1,
+                        "frame": {
+                            "blob": "pnghash",
+                            "size": 100,
+                            "media_type": "image/png"
+                        },
+                        "image_mode": "full",
+                        "size": [320, 240],
+                        "frame_seq": 1
+                    }
+                }),
+                outputs: Vec::new(),
+                seq: 0,
+                capture_msg_id: String::new(),
+            },
+        );
+        let blob_base = Some("http://localhost:9999".to_string());
+
+        let result = manifest_output_to_structured(&manifest, &blob_base, Some(&comms));
+
+        assert_eq!(
+            result["data"]["image/png"],
+            "http://localhost:9999/blob/pnghash"
+        );
+        assert_eq!(
+            result["data"]["text/llm+plain"],
+            "[matplotlib widget checkpoint: image/png 320x240]"
+        );
     }
 
     #[test]
@@ -839,6 +1273,7 @@ mod tests {
             status: "done",
             blob_base_url: &blob_base,
             comms: None,
+            resolved_outputs_by_manifest: None,
         });
         assert_eq!(result["cell"]["cell_id"], "cell-123");
         assert_eq!(result["cell"]["cell_type"], "code");

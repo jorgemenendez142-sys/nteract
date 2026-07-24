@@ -4,6 +4,8 @@ import path from "node:path";
 export const DEFAULT_WORKSTATION_AUTH_KIND = "anaconda-key";
 export const DEFAULT_WORKSTATION_RETRY_AFTER_MS = 60_000;
 export const MAX_WORKSTATION_RETRY_AFTER_MS = 15 * 60_000;
+export const WORKSTATION_RETRYABLE_STATUS_CODES = new Set([429, 503]);
+export const STALE_WORKSTATION_RETRYABLE_STATUS_CODES = new Set([404, 410, 429, 503]);
 export const WORKSTATION_AUTH_KINDS = new Set([DEFAULT_WORKSTATION_AUTH_KIND, "oidc"]);
 
 export function buildWorkstationRegistrationPayload({
@@ -11,10 +13,12 @@ export function buildWorkstationRegistrationPayload({
   displayName,
   workingDirectory,
   pythonPath,
+  installedBuild,
+  channel,
   cpuCount = os.cpus().length,
   memoryBytes = os.totalmem(),
 }) {
-  return {
+  const payload = {
     workstation_id: workstationId,
     display_name: displayName,
     provider: "runtime_peer",
@@ -31,6 +35,13 @@ export function buildWorkstationRegistrationPayload({
       python_path: pythonPath,
     },
   };
+  if (typeof installedBuild === "string" && installedBuild.trim().length > 0) {
+    payload.installed_build = installedBuild;
+  }
+  if (typeof channel === "string" && channel.trim().length > 0) {
+    payload.channel = channel;
+  }
+  return payload;
 }
 
 export function buildAttachJobSpawnPlan({
@@ -77,6 +88,10 @@ export function buildAttachJobSpawnPlan({
     "--workstation-display-name",
     displayName,
   ];
+
+  if (job.trigger === "resume") {
+    args.splice(args.length - 2, 0, "--launch-mode", "execute");
+  }
 
   if (typeof job.notebook_path === "string" && job.notebook_path.length > 0) {
     args.push("--notebook-path", job.notebook_path);
@@ -175,10 +190,14 @@ export async function parseHttpResponseBody(response) {
   }
 }
 
-export function retryAfterMs(response, fallbackMs = DEFAULT_WORKSTATION_RETRY_AFTER_MS) {
-  if (response.status !== 429 && response.status !== 503) return 0;
+export function retryAfterMs(
+  response,
+  fallbackMs = DEFAULT_WORKSTATION_RETRY_AFTER_MS,
+  retryStatuses = WORKSTATION_RETRYABLE_STATUS_CODES,
+) {
+  if (!retryStatuses.has(response.status)) return 0;
   const header = response.headers?.get?.("Retry-After");
-  if (!header) return fallbackMs;
+  if (!header) return retryFallbackMs(response.status, fallbackMs);
 
   const seconds = Number(header);
   if (Number.isFinite(seconds) && seconds >= 0) {
@@ -190,6 +209,13 @@ export function retryAfterMs(response, fallbackMs = DEFAULT_WORKSTATION_RETRY_AF
     return Math.max(1_000, dateMs - Date.now());
   }
 
+  return retryFallbackMs(response.status, fallbackMs);
+}
+
+function retryFallbackMs(status, fallbackMs) {
+  if (status === 404 || status === 410) {
+    return MAX_WORKSTATION_RETRY_AFTER_MS;
+  }
   return fallbackMs;
 }
 

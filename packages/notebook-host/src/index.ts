@@ -4,6 +4,7 @@ export type {
   DaemonReadyPayload,
   DaemonUnavailablePayload,
   GitInfo,
+  HostAutoReconnect,
   HostBlobRef,
   HostBlobResolver,
   HostBlobs,
@@ -16,9 +17,11 @@ export type {
   HostDialogSaveOptions,
   HostExternalLinks,
   HostLog,
+  HostNativeTheme,
   HostNotebook,
   HostRelay,
   HostSettings,
+  HostSyncedSettings,
   HostSystem,
   HostTrust,
   HostUpdateInfo,
@@ -41,6 +44,14 @@ export {
 } from "./commands";
 
 export { NotebookHostProvider, type NotebookHostProviderProps, useNotebookHost } from "./react";
+
+export {
+  DEFAULT_FONT_FAMILIES,
+  fontFamilyNameToCssValue,
+  singleFontFamilyFromCssValue,
+  stripCssFamilyQuotes,
+  uniqueSortedFontFamilies,
+} from "./font-families";
 
 export {
   startRelayBootstrapCoordinator,

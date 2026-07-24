@@ -35,7 +35,7 @@ use runt_workspace::cache_namespace;
 use runt_workspace::daemon_binary_basename;
 #[cfg(target_os = "macos")]
 use runt_workspace::daemon_launchd_label;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 use runt_workspace::daemon_service_basename;
 
 /// Service configuration.
@@ -121,6 +121,9 @@ pub enum ServiceError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("{0}")]
+    SystemdUnavailable(String),
+
     #[error("Service already installed")]
     AlreadyInstalled,
 
@@ -146,6 +149,19 @@ pub enum ServiceError {
 /// Service manager for runtimed.
 pub struct ServiceManager {
     config: ServiceConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceConfigMode {
+    Register,
+    StageOnly,
+}
+
+impl ServiceConfigMode {
+    #[cfg(any(target_os = "linux", test))]
+    fn should_register(self) -> bool {
+        matches!(self, Self::Register)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -187,6 +203,91 @@ fn systemctl_command() -> Command {
     command
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_linux_user_systemd_available() -> ServiceResult<()> {
+    let output = match systemctl_command()
+        .args(["--user", "show-environment"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let detail = if error.kind() == std::io::ErrorKind::NotFound {
+                "systemctl was not found on this host".to_string()
+            } else {
+                format!("could not run systemctl --user show-environment: {error}")
+            };
+            return Err(ServiceError::SystemdUnavailable(
+                linux_user_systemd_unavailable_message(&detail),
+            ));
+        }
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .find(|value| !value.is_empty())
+        .unwrap_or("systemctl --user did not report details");
+    Err(ServiceError::SystemdUnavailable(
+        linux_user_systemd_unavailable_message(detail),
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_user_systemd_unavailable_message(detail: &str) -> String {
+    format!(
+        "Linux user systemd is not available in this session: {detail}\n\
+         The daemon service cannot be installed or started automatically here.\n\
+         Use a normal login session with XDG_RUNTIME_DIR/DBus available, or ask an admin to enable lingering with `loginctl enable-linger $USER` if the daemon should stay available after logout.\n\
+         For headless workstation sessions, use foreground mode: `{} workstation run`.",
+        runt_workspace::cli_command_name()
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_systemd_service_content(binary_path: &Path, home: &Path) -> String {
+    let service_name = daemon_service_basename();
+    let home_str = home.to_string_lossy();
+    format!(
+        r#"[Unit]
+Description={name} - Jupyter Runtime Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={binary}
+Restart=on-failure
+RestartSec=5
+Environment=HOME={home}
+Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+"#,
+        name = service_name,
+        binary = binary_path.display(),
+        home = home_str,
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn write_linux_systemd_service_file(
+    service_file_path: &Path,
+    binary_path: &Path,
+    home: &Path,
+    mode: ServiceConfigMode,
+) -> ServiceResult<bool> {
+    if let Some(parent) = service_file_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let service_content = linux_systemd_service_content(binary_path, home);
+    std::fs::write(service_file_path, service_content)?;
+    Ok(mode.should_register())
+}
+
 impl Default for ServiceManager {
     fn default() -> Self {
         Self::new(ServiceConfig::default())
@@ -214,6 +315,23 @@ impl ServiceManager {
     /// is a custom path (e.g. `--binary /path/to/runtimed`), it is honored and
     /// copied to the configured install location.
     pub fn install(&mut self, source_binary: &PathBuf) -> ServiceResult<()> {
+        self.install_inner(source_binary, ServiceConfigMode::Register)
+    }
+
+    /// Install daemon artifacts without registering or starting the service.
+    ///
+    /// Used by `runt daemon doctor --fix --no-start` and packaging smoke tests
+    /// that need to verify the durable binary and service definition from a
+    /// headless container where Linux user systemd is unavailable.
+    pub fn install_no_start(&mut self, source_binary: &PathBuf) -> ServiceResult<()> {
+        self.install_inner(source_binary, ServiceConfigMode::StageOnly)
+    }
+
+    fn install_inner(
+        &mut self,
+        source_binary: &PathBuf,
+        config_mode: ServiceConfigMode,
+    ) -> ServiceResult<()> {
         if !source_binary.exists() {
             return Err(ServiceError::BinaryNotFound(source_binary.clone()));
         }
@@ -234,7 +352,7 @@ impl ServiceManager {
 
         // Always write the legacy plist — launchctl start/stop and the CLI
         // `runt daemon doctor` depend on it. This is the primary registration.
-        self.create_service_config()?;
+        self.create_service_config(config_mode)?;
 
         // macOS 13+: Additionally register via SMAppService for Login Items
         // visibility. Best-effort — if the bundle is unsigned, read-only,
@@ -382,11 +500,11 @@ impl ServiceManager {
 
     /// Upgrade the daemon binary without starting it after.
     ///
-    /// Used by `runt daemon doctor --no-start`, which the NSIS post-install
-    /// hook calls. Spawning the daemon during a Windows installer step trapped
-    /// the long-running process in the installer's Job Object and hung CI.
-    /// The Startup folder script (or launchd plist) installed by
-    /// `create_service_config` brings the daemon up at next login.
+    /// Used by `runt daemon doctor --fix --no-start`. On Windows, the NSIS
+    /// post-install hook uses this so spawning the daemon during installation
+    /// does not trap a long-running process in the installer's Job Object. On
+    /// Linux, packaging smoke tests use it to stage the service definition in
+    /// headless sessions where user systemd is unavailable.
     pub fn upgrade_no_start(&mut self, source_binary: &PathBuf) -> ServiceResult<()> {
         self.upgrade_inner(source_binary, false)
     }
@@ -409,8 +527,15 @@ impl ServiceManager {
             self.atomic_copy_binary(source_binary)?;
         }
 
-        // Always update the legacy plist
-        self.create_service_config()?;
+        // Always update the legacy service definition. For no-start repairs we
+        // stage it without talking to the service manager; this keeps AppImage
+        // and installer repair paths usable in headless sessions.
+        let config_mode = if start_after {
+            ServiceConfigMode::Register
+        } else {
+            ServiceConfigMode::StageOnly
+        };
+        self.create_service_config(config_mode)?;
         info!("[service] Updated service config");
 
         // macOS 13+: Re-register via SMAppService (best-effort)
@@ -423,13 +548,14 @@ impl ServiceManager {
         }
 
         if start_after {
-            // Bootstrap only. The stop() call above is best-effort and may have
-            // already performed the launchd bootout, but upgrade intentionally
-            // does not issue another bootout here. Using launchd_start() would
-            // add a second bootout attempt and can put launchd into a
-            // transient error-5 state.
+            // Registering the launchd job is separate from waking the daemon.
+            // Avoid an extra bootout here because stop() already handled it.
             #[cfg(target_os = "macos")]
-            runt_workspace::launchd_bootstrap_only().map_err(ServiceError::StartFailed)?;
+            {
+                runt_workspace::launchd_bootstrap_only().map_err(ServiceError::StartFailed)?;
+                runt_workspace::launchd_kickstart_start_only()
+                    .map_err(ServiceError::StartFailed)?;
+            }
 
             #[cfg(not(target_os = "macos"))]
             self.start()?;
@@ -545,19 +671,21 @@ impl ServiceManager {
     }
 
     /// Create the platform-specific service configuration.
-    fn create_service_config(&self) -> ServiceResult<()> {
+    fn create_service_config(&self, mode: ServiceConfigMode) -> ServiceResult<()> {
         #[cfg(target_os = "macos")]
         {
+            let _ = mode;
             self.create_macos_plist()
         }
 
         #[cfg(target_os = "linux")]
         {
-            self.create_linux_systemd()
+            self.create_linux_systemd(mode)
         }
 
         #[cfg(target_os = "windows")]
         {
+            let _ = mode;
             self.create_windows_startup()
         }
 
@@ -694,6 +822,8 @@ impl ServiceManager {
         } else {
             info!("[service] Launchd service already loaded");
         }
+        runt_workspace::launchd_kickstart_start_only().map_err(ServiceError::StartFailed)?;
+        info!("[service] Kickstarted launchd service");
         Ok(())
     }
 
@@ -713,44 +843,31 @@ impl ServiceManager {
 
     // Linux-specific implementations
     #[cfg(target_os = "linux")]
-    fn create_linux_systemd(&self) -> ServiceResult<()> {
+    fn create_linux_systemd(&self, mode: ServiceConfigMode) -> ServiceResult<()> {
+        if mode.should_register() {
+            ensure_linux_user_systemd_available()?;
+        }
+
         // Get home directory at service generation time - systemd doesn't expand ~
         let home = dirs::home_dir().ok_or_else(|| {
             ServiceError::InstallFailed(
                 "Cannot determine home directory for service install".into(),
             )
         })?;
-        let home_str = home.to_string_lossy();
-
-        let service_name = daemon_service_basename();
-        let service_content = format!(
-            r#"[Unit]
-Description={name} - Jupyter Runtime Daemon
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={binary}
-Restart=on-failure
-RestartSec=5
-Environment=HOME={home}
-Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin
-
-[Install]
-WantedBy=default.target
-"#,
-            name = service_name,
-            binary = self.config.binary_path.display(),
-            home = home_str,
-        );
 
         let service_file_path = systemd_service_path();
-        if let Some(parent) = service_file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        std::fs::write(&service_file_path, service_content)?;
+        let should_register = write_linux_systemd_service_file(
+            &service_file_path,
+            &self.config.binary_path,
+            &home,
+            mode,
+        )?;
         info!("[service] Created {:?}", service_file_path);
+
+        if !should_register {
+            info!("[service] Staged systemd service without user systemd registration");
+            return Ok(());
+        }
 
         // Reload systemd
         systemctl_command()
@@ -768,6 +885,8 @@ WantedBy=default.target
 
     #[cfg(target_os = "linux")]
     fn start_linux(&self) -> ServiceResult<()> {
+        ensure_linux_user_systemd_available()?;
+
         let output = systemctl_command()
             .args(["--user", "start"])
             .arg(systemd_service_unit_name())
@@ -784,6 +903,8 @@ WantedBy=default.target
 
     #[cfg(target_os = "linux")]
     fn stop_linux(&self) -> ServiceResult<()> {
+        ensure_linux_user_systemd_available()?;
+
         let output = systemctl_command()
             .args(["--user", "stop"])
             .arg(systemd_service_unit_name())
@@ -1206,5 +1327,60 @@ mod tests {
                 .any(|(key, value)| *key == std::ffi::OsStr::new(var) && value.is_none());
             assert!(removed, "{var} should be removed for host systemctl");
         }
+    }
+
+    #[test]
+    fn linux_user_systemd_unavailable_message_mentions_foreground_workstation() {
+        let message =
+            linux_user_systemd_unavailable_message("systemctl was not found on this host");
+        let fallback = format!(
+            "For headless workstation sessions, use foreground mode: `{} workstation run`.",
+            runt_workspace::cli_command_name()
+        );
+
+        assert!(message.contains(
+            "Linux user systemd is not available in this session: systemctl was not found on this host"
+        ));
+        assert!(message
+            .contains("The daemon service cannot be installed or started automatically here."));
+        assert!(message.contains(&fallback));
+    }
+
+    #[test]
+    fn linux_systemd_service_content_uses_durable_paths() {
+        let binary = PathBuf::from("/tmp/runt-home/.local/share/runt-nightly/bin/runtimed-nightly");
+        let home = PathBuf::from("/tmp/runt-home");
+        let content = linux_systemd_service_content(&binary, &home);
+
+        assert!(content
+            .contains("ExecStart=/tmp/runt-home/.local/share/runt-nightly/bin/runtimed-nightly"));
+        assert!(content.contains("Environment=HOME=/tmp/runt-home"));
+        assert!(content.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn linux_stage_only_service_file_write_skips_registration() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let service_file = temp_dir
+            .path()
+            .join("systemd/user/runtimed-nightly.service");
+        let binary = temp_dir
+            .path()
+            .join(".local/share/runt-nightly/bin/runtimed-nightly");
+        let home = temp_dir.path().join("home");
+
+        let should_register = write_linux_systemd_service_file(
+            &service_file,
+            &binary,
+            &home,
+            ServiceConfigMode::StageOnly,
+        )
+        .unwrap();
+
+        assert!(!should_register);
+        let content = std::fs::read_to_string(&service_file).unwrap();
+        assert!(content.contains(&format!("ExecStart={}", binary.display())));
+        assert!(content.contains(&format!("Environment=HOME={}", home.display())));
+        assert!(content.contains("WantedBy=default.target"));
     }
 }

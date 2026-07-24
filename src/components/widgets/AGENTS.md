@@ -44,21 +44,6 @@ Scope: `src/components/widgets/**`. The JSON-RPC transport and iframe lifecycle 
 
 `nteract.dx.*` target-names are reserved for nteract kernel-side protocols. The runtime agent filters this namespace out of runtime comm topology/state and `NotebookBroadcast::Comm`, so it is not widget state and never reaches `WidgetStore`. v1 has no live `nteract.dx.blob` handler; reserved messages are dropped with a warning while current blob refs ride IOPub `display_data` buffers. Pick a different prefix for widget targets.
 
-## Key files
-
-| File | Role |
-|------|------|
-| `src/components/widgets/widget-store.ts` | Model state (`useSyncExternalStore`) |
-| `src/components/widgets/widget-registry.ts` | Model name → React component |
-| `src/components/widgets/controls/` | 54 built-in ipywidgets |
-| `src/components/widgets/controls/index.ts` | Built-in widget registration |
-| `src/components/widgets/anywidget-view.tsx` | Anywidget ESM loader |
-| `src/components/widgets/widget-view.tsx` | Registry lookup + render |
-| `src/components/isolated/comm-bridge-manager.ts` | Parent ↔ iframe comm routing |
-| `src/components/isolated/jsonrpc-transport.ts` | JSON-RPC 2.0 transport |
-| `src/components/isolated/rpc-methods.ts` | Widget-bridge method constants |
-| `src/isolated-renderer/widget-bridge-client.ts` | Iframe-side widget bridge |
-
 ## WidgetStore API
 
 ```typescript
@@ -67,7 +52,12 @@ interface WidgetStore {
   getSnapshot(): Map<string, WidgetModel>;
 
   getModel(modelId: string): WidgetModel | undefined;
-  createModel(commId: string, state: Record<string, unknown>, bufferPaths?: string[][]): void;
+  createModel(
+    commId: string,
+    state: Record<string, unknown>,
+    bufferPaths?: string[][],
+    targetName?: string,
+  ): void;
   updateModel(commId: string, statePatch: Record<string, unknown>, bufferPaths?: string[][]): void;
   deleteModel(commId: string): void;
   wasModelClosed(commId: string): boolean;
@@ -167,7 +157,7 @@ slider = widgets.IntSlider(value=50, min=0, max=100)
 display(slider)
 ```
 
-In dev builds `apps/notebook/src/lib/logger.ts` calls `attachConsole()` so frontend logs appear in browser devtools. For comm-level tracing:
+The shared frontend logger in `src/lib/logger.ts` routes through the active host log sink. For comm-level tracing:
 
 ```bash
 runt daemon logs -f | grep -i comm

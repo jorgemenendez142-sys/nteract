@@ -19,7 +19,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use jupyter_protocol::{
     CompleteRequest, ConnectionInfo, ExecuteRequest, HistoryRequest, InterruptRequest,
-    JupyterMessage, JupyterMessageContent, KernelInfoRequest, ShutdownRequest,
+    JupyterMessage, JupyterMessageContent, KernelInfoRequest, ShutdownRequest, UnknownMessage,
 };
 use runtime_doc::{KernelActivity, RuntimeLifecycle};
 use tokio::net::TcpListener;
@@ -31,12 +31,18 @@ use uuid::Uuid;
 use crate::async_outcome::{
     await_result_with_timeout, recv_oneshot_with_timeout, TimedOneShot, TimedResult,
 };
+use crate::bokeh_session::{
+    checkpoint_request_wire, parse_checkpoint_reply, parse_patch_reply, patch_request_wire,
+    BokehCheckpointFuture, BokehKernelCheckpoint, BokehKernelPatchResponse, RawBokehKernelMessage,
+    BOKEH_CHECKPOINT_REQUEST, BOKEH_PATCH_REPLY, BOKEH_PATCH_REQUEST,
+};
 use crate::kernel_connection::{KernelConnection, KernelLaunchConfig, KernelSharedRefs};
 use crate::output_committer::{OrdinaryOutputCommit, OrdinaryOutputKind};
 use crate::output_prep::{
     blob_store_large_state_values, escape_glob_pattern, extract_buffer_paths,
     media_to_display_data, message_content_to_nbformat, queue_command_channels,
-    store_widget_buffers, LifecycleSignal, QueueCommandReceivers, WorkCommand,
+    store_widget_buffers, LifecycleSignal, QueueCommandReceivers, VisualizationStateCommand,
+    WorkCommand,
 };
 use crate::output_redaction::OutputRedactor;
 use crate::output_store::{self, OutputManifest, DEFAULT_INLINE_THRESHOLD};
@@ -46,7 +52,9 @@ use crate::stream_terminal::StreamTerminals;
 use crate::task_supervisor::{spawn_best_effort, spawn_supervised};
 use crate::terminal_size::{TERMINAL_COLUMNS_STR, TERMINAL_LINES_STR};
 use crate::EnvType;
-use notebook_protocol::protocol::{CommRequestMessage, KernelPorts, LaunchedEnvConfig};
+use notebook_protocol::protocol::{
+    BokehSessionPatchRequest, CommRequestMessage, KernelPorts, LaunchedEnvConfig,
+};
 
 const REDACT_ENV_VALUES_IN_OUTPUTS_ENV: &str = "NTERACT_REDACT_ENV_VALUES_IN_OUTPUTS";
 const KERNEL_ENV_SECRET_BLOCKLIST: &[&str] = &[
@@ -54,6 +62,47 @@ const KERNEL_ENV_SECRET_BLOCKLIST: &[&str] = &[
     "NTERACT_API_KEY",
     "NOTEBOOK_CLOUD_PUBLISH_BEARER_TOKEN",
 ];
+
+enum CommCoalesceMessage {
+    StateDelta {
+        comm_id: String,
+        delta: serde_json::Value,
+    },
+    MplCanvasFrame {
+        comm_id: String,
+        png: Vec<u8>,
+        size: Option<(u64, u64)>,
+    },
+}
+
+struct PendingMplCanvasFrame {
+    png: Vec<u8>,
+    size: Option<(u64, u64)>,
+}
+
+fn mpl_size_from_state(state: &serde_json::Value) -> Option<(u64, u64)> {
+    let size = state.get("_size").and_then(|v| v.as_array())?;
+    let width = size.first()?.as_u64()?;
+    let height = size.get(1)?.as_u64()?;
+    Some((width, height))
+}
+
+fn content_with_mpl_canvas_image_mode(
+    mut content: serde_json::Value,
+    mode: &str,
+) -> serde_json::Value {
+    if let Some(inner) = content
+        .get_mut("data")
+        .and_then(|data| data.get_mut("content"))
+        .and_then(|inner| inner.as_object_mut())
+    {
+        inner.insert(
+            "_nteract_image_mode".to_string(),
+            serde_json::Value::String(mode.to_string()),
+        );
+    }
+    content
+}
 
 fn is_tolerated_kernel_info_reply_parse_error(error: &jupyter_zmq_client::RuntimeError) -> bool {
     match error {
@@ -165,6 +214,114 @@ async fn bind_kernel_port_listeners(ip: IpAddr, ports: KernelPorts) -> Result<Ve
 /// Type alias for pending completion response channels.
 type PendingCompletions =
     Arc<StdMutex<HashMap<String, oneshot::Sender<(Vec<CompletionItem>, usize, usize)>>>>;
+type PendingBokehRequests = Arc<StdMutex<HashMap<String, oneshot::Sender<RawBokehKernelMessage>>>>;
+
+struct BokehCheckpointCommand {
+    session_id: String,
+    reply: oneshot::Sender<Result<BokehKernelCheckpoint>>,
+}
+
+#[derive(Clone)]
+struct BokehCheckpointRequester {
+    tx: mpsc::Sender<BokehCheckpointCommand>,
+}
+
+impl BokehCheckpointRequester {
+    async fn request(&self, session_id: String) -> Result<BokehKernelCheckpoint> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(BokehCheckpointCommand { session_id, reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("Bokeh checkpoint requester stopped"))?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("Bokeh checkpoint requester dropped its response"))?
+    }
+}
+
+async fn run_bokeh_checkpoint_requester(
+    connection_info: ConnectionInfo,
+    kernel_session_id: String,
+    mut requests: mpsc::Receiver<BokehCheckpointCommand>,
+) {
+    let checkpoint_session_id = format!("{kernel_session_id}-bokeh-checkpoint");
+    let mut shell: Option<jupyter_zmq_client::ClientShellConnection> = None;
+    while let Some(command) = requests.recv().await {
+        if shell.is_none() {
+            let connection = async {
+                let identity =
+                    jupyter_zmq_client::peer_identity_for_session(&checkpoint_session_id)?;
+                jupyter_zmq_client::create_client_shell_connection_with_identity(
+                    &connection_info,
+                    &checkpoint_session_id,
+                    identity,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+            }
+            .await;
+            match connection {
+                Ok(connection) => shell = Some(connection),
+                Err(error) => {
+                    let _ = command.reply.send(Err(error));
+                    continue;
+                }
+            }
+        }
+
+        let Some(checkpoint_shell) = shell.as_mut() else {
+            let _ = command
+                .reply
+                .send(Err(anyhow::anyhow!("checkpoint shell was not initialized")));
+            continue;
+        };
+        let result = request_bokeh_checkpoint(checkpoint_shell, &command.session_id).await;
+        if result.is_err() {
+            shell = None;
+        }
+        let _ = command.reply.send(result);
+    }
+}
+
+async fn request_bokeh_checkpoint(
+    shell: &mut jupyter_zmq_client::ClientShellConnection,
+    session_id: &str,
+) -> Result<BokehKernelCheckpoint> {
+    let transaction_id = Uuid::new_v4().to_string();
+    let content = checkpoint_request_wire(session_id, &transaction_id);
+    let mut request: JupyterMessage = UnknownMessage {
+        msg_type: BOKEH_CHECKPOINT_REQUEST.to_string(),
+        content,
+    }
+    .into();
+    let request_id = request.header.msg_id.clone();
+    request.buffers = Vec::new();
+    shell.send(request).await?;
+
+    let message = tokio::time::timeout(std::time::Duration::from_secs(10), shell.read())
+        .await
+        .map_err(|_| anyhow::anyhow!("Bokeh checkpoint request timed out"))??;
+    anyhow::ensure!(
+        message
+            .parent_header
+            .as_ref()
+            .is_some_and(|parent| parent.msg_id == request_id),
+        "Bokeh checkpoint reply had an unexpected parent"
+    );
+    let buffers = message
+        .buffers
+        .into_iter()
+        .map(|buffer| buffer.to_vec())
+        .collect();
+    let JupyterMessageContent::UnknownMessage(unknown) = message.content else {
+        anyhow::bail!("Bokeh checkpoint request received an unexpected reply type");
+    };
+    parse_checkpoint_reply(RawBokehKernelMessage {
+        msg_type: unknown.msg_type,
+        content: unknown.content,
+        buffers,
+    })
+}
 
 const HISTORY_CACHE_CAPACITY: usize = 64;
 
@@ -303,6 +460,34 @@ fn try_send_comm_update(
     }
 }
 
+fn try_schedule_bokeh_checkpoint(
+    visualization_tx: &crate::output_prep::NonBlockingSender<VisualizationStateCommand>,
+    session_id: String,
+    force: bool,
+) {
+    match visualization_tx
+        .try_send(VisualizationStateCommand::CheckpointBokehSession { session_id, force })
+    {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(
+            VisualizationStateCommand::CheckpointBokehSession { session_id, .. },
+        )) => {
+            debug!(
+                "[bokeh-session] Deferring checkpoint for session {} because the visualization queue is full",
+                session_id
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(
+            VisualizationStateCommand::CheckpointBokehSession { session_id, .. },
+        )) => {
+            warn!(
+                "[bokeh-session] Cannot checkpoint session {} because the visualization queue is closed",
+                session_id
+            );
+        }
+    }
+}
+
 async fn resolve_output_widget_replay_state(
     replay_cache: &mut HashMap<String, Vec<serde_json::Value>>,
     comm_id: &str,
@@ -405,6 +590,8 @@ pub struct JupyterKernel {
     pub env_path: Option<PathBuf>,
     /// Session ID for Jupyter protocol.
     session_id: String,
+    /// Unique identity for this kernel process generation.
+    kernel_id: String,
     /// Automerge actor ID for kernel writes.
     kernel_actor_id: String,
     /// Connection info for the kernel.
@@ -428,7 +615,7 @@ pub struct JupyterKernel {
     /// Handle to the heartbeat monitor task (detects unresponsive kernel).
     heartbeat_task: Option<JoinHandle<()>>,
     /// Channel for coalesced comm state writes (IOPub -> coalesce task).
-    comm_coalesce_tx: Option<mpsc::UnboundedSender<(String, serde_json::Value)>>,
+    comm_coalesce_tx: Option<mpsc::UnboundedSender<CommCoalesceMessage>>,
     /// Handle to the coalescing task for comm state CRDT writes.
     comm_coalesce_task: Option<JoinHandle<()>>,
     /// Execution IDs sent through this kernel.
@@ -436,6 +623,8 @@ pub struct JupyterKernel {
     registered_execution_ids: Arc<StdMutex<HashSet<String>>>,
     /// Work command sender for iopub/shell tasks.
     work_cmd_tx: Option<crate::output_prep::NonBlockingSender<WorkCommand>>,
+    /// Bounded visualization checkpoint requests for the runtime agent.
+    visualization_cmd_tx: Option<crate::output_prep::NonBlockingSender<VisualizationStateCommand>>,
     /// Lifecycle command sender for iopub/shell tasks.
     lifecycle_cmd_tx: Option<mpsc::UnboundedSender<LifecycleSignal>>,
     /// Monotonic counter for comm insertion order (written to RuntimeStateDoc).
@@ -444,10 +633,18 @@ pub struct JupyterKernel {
     pending_history: Arc<StdMutex<HashMap<String, oneshot::Sender<Vec<HistoryEntry>>>>>,
     /// Pending completion requests: msg_id -> response channel.
     pending_completions: PendingCompletions,
+    /// Pending typed Bokeh patch replies on the primary shell connection.
+    pending_bokeh_requests: PendingBokehRequests,
+    /// Independent shell requester for document checkpoint serialization.
+    bokeh_checkpoint_requester: Option<BokehCheckpointRequester>,
+    /// Owns the independent checkpoint shell connection.
+    bokeh_checkpoint_task: Option<JoinHandle<()>>,
     /// Per-kernel LRU cache for history searches.
     history_cache: HistoryLruCache,
     /// Terminal emulators for stream outputs (stdout/stderr).
     stream_terminals: Arc<tokio::sync::Mutex<StreamTerminals>>,
+    /// Redacts callback stdout/stderr before it leaves the kernel boundary.
+    output_redactor: Arc<OutputRedactor>,
 }
 
 impl KernelConnection for JupyterKernel {
@@ -1310,7 +1507,8 @@ impl KernelConnection for JupyterKernel {
         // Create command channels for queue processing. Lifecycle commands are
         // control-plane signals and must not be backpressured by bounded output
         // work such as captured Output widget updates.
-        let (lifecycle_cmd_tx, work_cmd_tx, command_receivers) = queue_command_channels(100);
+        let (lifecycle_cmd_tx, visualization_cmd_tx, work_cmd_tx, command_receivers) =
+            queue_command_channels(100);
 
         // Shared state refs for spawned tasks
         let registered_execution_ids: Arc<StdMutex<HashSet<String>>> =
@@ -1319,6 +1517,7 @@ impl KernelConnection for JupyterKernel {
         let pending_history: Arc<StdMutex<HashMap<String, oneshot::Sender<Vec<HistoryEntry>>>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let pending_completions: PendingCompletions = Arc::new(StdMutex::new(HashMap::new()));
+        let pending_bokeh_requests: PendingBokehRequests = Arc::new(StdMutex::new(HashMap::new()));
         let stream_terminals = Arc::new(tokio::sync::Mutex::new(StreamTerminals::new()));
 
         // Spawn process watcher — detects process exit and signals via oneshot
@@ -1353,6 +1552,7 @@ impl KernelConnection for JupyterKernel {
         let iopub_registered_execution_ids = registered_execution_ids.clone();
         let iopub_lifecycle_tx = lifecycle_cmd_tx.clone();
         let iopub_work_tx = work_cmd_tx.clone();
+        let iopub_visualization_tx = visualization_cmd_tx.clone();
         let blob_store = shared.blob_store.clone();
         let iopub_comm_seq = comm_seq.clone();
         let iopub_stream_terminals = stream_terminals.clone();
@@ -1360,6 +1560,8 @@ impl KernelConnection for JupyterKernel {
         let comms_for_iopub = shared.comms.clone();
         let iopub_output_redactor = output_redactor.clone();
         let iopub_output_blob_publisher = shared.output_blob_publisher.clone();
+        let bokeh_output_blob_publisher = iopub_output_blob_publisher.clone();
+        let bokeh_kernel_id = kernel_id.clone();
         // IOPub writes use transactions with the base kernel actor. Async
         // blob/manifest work is completed before the document transaction.
         let iopub_kernel_actor_id = kernel_actor_id.clone();
@@ -1368,6 +1570,7 @@ impl KernelConnection for JupyterKernel {
             blob_store.clone(),
             iopub_output_blob_publisher,
             iopub_kernel_actor_id.clone(),
+            kernel_id.clone(),
             iopub_lifecycle_tx.clone(),
             iopub_output_redactor.clone(),
         );
@@ -1383,7 +1586,7 @@ impl KernelConnection for JupyterKernel {
             crate::output_committer::start_output_committer(output_commit_context);
 
         // Create coalescing channel early so the IOPub task can capture the sender.
-        let (coalesce_tx, coalesce_rx) = mpsc::unbounded_channel::<(String, serde_json::Value)>();
+        let (coalesce_tx, coalesce_rx) = mpsc::unbounded_channel::<CommCoalesceMessage>();
         let comm_coalesce_tx_for_iopub = Some(coalesce_tx.clone());
 
         let iopub_panic_cmd_tx = lifecycle_cmd_tx.clone();
@@ -1405,6 +1608,12 @@ impl KernelConnection for JupyterKernel {
                 // and CommClose arms so we can route without a CRDT read on the
                 // hot path.
                 let mut comm_targets: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                let mut comm_models: std::collections::HashMap<String, (String, String)> =
+                    std::collections::HashMap::new();
+                let mut mpl_canvas_image_modes: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                let mut mpl_canvas_sizes: std::collections::HashMap<String, (u64, u64)> =
                     std::collections::HashMap::new();
 
                 let comm_coalesce_tx = comm_coalesce_tx_for_iopub;
@@ -2126,6 +2335,24 @@ impl KernelConnection for JupyterKernel {
                                             .get("_model_name")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("");
+                                        comm_models.insert(
+                                            open.comm_id.0.clone(),
+                                            (model_module.to_string(), model_name.to_string()),
+                                        );
+                                        if crate::matplotlib_widget::is_mpl_canvas_model(
+                                            model_module,
+                                            model_name,
+                                        ) {
+                                            if let Some(size) =
+                                                mpl_size_from_state(&state_with_blobs)
+                                            {
+                                                mpl_canvas_sizes
+                                                    .insert(open.comm_id.0.clone(), size);
+                                            }
+                                            mpl_canvas_image_modes
+                                                .entry(open.comm_id.0.clone())
+                                                .or_insert_with(|| "full".to_string());
+                                        }
                                         let seq = iopub_comm_seq.fetch_add(1, Ordering::Relaxed);
                                         let lock_wait = lock_start.elapsed();
                                         if lock_wait > std::time::Duration::from_millis(5) {
@@ -2234,8 +2461,33 @@ impl KernelConnection for JupyterKernel {
                                         "[comm_msg] comm_id={} method={:?}",
                                         msg.comm_id.0, method
                                     );
+                                    let is_mpl_canvas = comm_models
+                                        .get(&msg.comm_id.0)
+                                        .is_some_and(|(model_module, model_name)| {
+                                            crate::matplotlib_widget::is_mpl_canvas_model(
+                                                model_module,
+                                                model_name,
+                                            )
+                                        });
+                                    let mut mpl_binary_broadcast_mode: Option<String> = None;
                                     if method == Some("update") {
                                         if let Some(state_delta) = data.get("state") {
+                                            if is_mpl_canvas {
+                                                if let Some(mode) = state_delta
+                                                    .get("_image_mode")
+                                                    .and_then(|v| v.as_str())
+                                                {
+                                                    mpl_canvas_image_modes.insert(
+                                                        msg.comm_id.0.clone(),
+                                                        mode.to_string(),
+                                                    );
+                                                }
+                                                if let Some(size) = mpl_size_from_state(state_delta)
+                                                {
+                                                    mpl_canvas_sizes
+                                                        .insert(msg.comm_id.0.clone(), size);
+                                                }
+                                            }
                                             if let Some(new_msg_id) =
                                                 state_delta.get("msg_id").and_then(|v| v.as_str())
                                             {
@@ -2280,9 +2532,52 @@ impl KernelConnection for JupyterKernel {
                                                 state_delta.clone()
                                             };
                                             if let Some(ref tx) = comm_coalesce_tx {
-                                                let _ = tx
-                                                    .send((msg.comm_id.0.clone(), coalesce_delta));
+                                                let _ = tx.send(CommCoalesceMessage::StateDelta {
+                                                    comm_id: msg.comm_id.0.clone(),
+                                                    delta: coalesce_delta,
+                                                });
                                             }
+                                        }
+                                    }
+                                    if method != Some("update") && is_mpl_canvas {
+                                        match crate::matplotlib_widget::parse_mpl_canvas_custom_message(&data) {
+                                                Some(crate::matplotlib_widget::MplCanvasCustomMessage::ImageMode(mode)) => {
+                                                    mpl_canvas_image_modes
+                                                        .insert(msg.comm_id.0.clone(), mode);
+                                                }
+                                                Some(crate::matplotlib_widget::MplCanvasCustomMessage::Resize(size)) => {
+                                                    if let Some(size) = size {
+                                                        mpl_canvas_sizes.insert(
+                                                            msg.comm_id.0.clone(),
+                                                            size,
+                                                        );
+                                                    }
+                                                }
+                                            Some(crate::matplotlib_widget::MplCanvasCustomMessage::Binary) => {
+                                                    let mode = mpl_canvas_image_modes
+                                                        .get(&msg.comm_id.0)
+                                                        .map(String::as_str)
+                                                        .unwrap_or("full");
+                                                if mode == "full" {
+                                                    if let (Some(first_buffer), Some(tx)) =
+                                                            (buffers.first(), comm_coalesce_tx.as_ref())
+                                                        {
+                                                            let _ = tx.send(
+                                                                CommCoalesceMessage::MplCanvasFrame {
+                                                                    comm_id: msg.comm_id.0.clone(),
+                                                                    png: first_buffer.clone(),
+                                                                    size: mpl_canvas_sizes
+                                                                        .get(&msg.comm_id.0)
+                                                                        .copied(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                mpl_binary_broadcast_mode =
+                                                    Some(mode.to_string());
+                                            }
+                                            Some(crate::matplotlib_widget::MplCanvasCustomMessage::Other)
+                                            | None => {}
                                         }
                                     }
 
@@ -2295,9 +2590,19 @@ impl KernelConnection for JupyterKernel {
                                     }
 
                                     if method != Some("update") {
+                                        let broadcast_content = if let Some(mode) =
+                                            mpl_binary_broadcast_mode.as_ref()
+                                        {
+                                            content_with_mpl_canvas_image_mode(
+                                                content.clone(),
+                                                mode,
+                                            )
+                                        } else {
+                                            content.clone()
+                                        };
                                         let _ = broadcast_tx.send(NotebookBroadcast::Comm {
                                             msg_type: message.header.msg_type.clone(),
-                                            content: content.clone(),
+                                            content: broadcast_content,
                                             buffers: buffers.clone(),
                                         });
                                     }
@@ -2323,6 +2628,9 @@ impl KernelConnection for JupyterKernel {
                                         .remove(&close.comm_id.0)
                                         .map(|t| crate::dx_blob_comm::is_dx_target(&t))
                                         .unwrap_or(false);
+                                    comm_models.remove(&close.comm_id.0);
+                                    mpl_canvas_image_modes.remove(&close.comm_id.0);
+                                    mpl_canvas_sizes.remove(&close.comm_id.0);
                                     if was_dx_target {
                                         continue;
                                     }
@@ -2345,6 +2653,66 @@ impl KernelConnection for JupyterKernel {
                                         .with_doc(|sd| sd.remove_comm(&close.comm_id.0))
                                     {
                                         warn!("[runtime-state] {}", e);
+                                    }
+                                }
+
+                                JupyterMessageContent::UnknownMessage(unknown)
+                                    if unknown.msg_type == crate::bokeh_session::BOKEH_EVENT =>
+                                {
+                                    // The initial display output creates the durable session
+                                    // record. Drain ordinary output work before accepting a
+                                    // later patch from the same ordered IOPub stream.
+                                    output_committer.flush_for_ordering().await;
+                                    let raw_buffers = message
+                                        .buffers
+                                        .iter()
+                                        .map(|buffer| buffer.to_vec())
+                                        .collect::<Vec<_>>();
+                                    match crate::bokeh_session::ingest_kernel_event(
+                                        &unknown.content,
+                                        &raw_buffers,
+                                        &bokeh_kernel_id,
+                                        &state_for_iopub,
+                                        &blob_store,
+                                        &bokeh_output_blob_publisher,
+                                        &broadcast_tx,
+                                    )
+                                    .await
+                                    {
+                                        Ok(crate::bokeh_session::BokehEventIngest::Applied {
+                                            checkpoint_needed: true,
+                                        }) => {
+                                            let session_id = unknown
+                                                .content
+                                                .get("session_id")
+                                                .and_then(serde_json::Value::as_str)
+                                                .unwrap_or_default()
+                                                .to_string();
+                                            if !session_id.is_empty() {
+                                                try_schedule_bokeh_checkpoint(
+                                                    &iopub_visualization_tx,
+                                                    session_id,
+                                                    false,
+                                                );
+                                            }
+                                        }
+                                        Ok(
+                                            crate::bokeh_session::BokehEventIngest::ResyncNeeded {
+                                                session_id,
+                                            },
+                                        ) => {
+                                            try_schedule_bokeh_checkpoint(
+                                                &iopub_visualization_tx,
+                                                session_id,
+                                                true,
+                                            );
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => {
+                                            warn!(
+                                                "[bokeh-session] Failed to ingest kernel event: {error}"
+                                            );
+                                        }
                                     }
                                 }
 
@@ -2495,6 +2863,19 @@ impl KernelConnection for JupyterKernel {
             }
         }
 
+        let (bokeh_checkpoint_tx, bokeh_checkpoint_rx) = mpsc::channel(1);
+        let bokeh_checkpoint_requester = BokehCheckpointRequester {
+            tx: bokeh_checkpoint_tx,
+        };
+        let bokeh_checkpoint_task = spawn_best_effort(
+            "bokeh-checkpoint-shell",
+            run_bokeh_checkpoint_requester(
+                connection_info.clone(),
+                session_id.clone(),
+                bokeh_checkpoint_rx,
+            ),
+        );
+
         // Split shell into reader/writer
         let (shell_writer, mut shell_reader) = shell.split();
 
@@ -2504,6 +2885,7 @@ impl KernelConnection for JupyterKernel {
         let shell_registered_execution_ids = registered_execution_ids.clone();
         let shell_pending_history = pending_history.clone();
         let shell_pending_completions = pending_completions.clone();
+        let shell_pending_bokeh_requests = pending_bokeh_requests.clone();
         let shell_state = shared.state.clone();
         let shell_blob_store = shared.blob_store.clone();
         let shell_kernel_actor_id = kernel_actor_id.clone();
@@ -2660,6 +3042,26 @@ impl KernelConnection for JupyterKernel {
                                         }
                                     }
                                 }
+                                JupyterMessageContent::UnknownMessage(unknown)
+                                    if unknown.msg_type == BOKEH_PATCH_REPLY =>
+                                {
+                                    if let Some(ref parent) = msg.parent_header {
+                                        if let Ok(mut pending) = shell_pending_bokeh_requests.lock()
+                                        {
+                                            if let Some(tx) = pending.remove(&parent.msg_id) {
+                                                let _ = tx.send(RawBokehKernelMessage {
+                                                    msg_type: unknown.msg_type,
+                                                    content: unknown.content,
+                                                    buffers: msg
+                                                        .buffers
+                                                        .into_iter()
+                                                        .map(|buffer| buffer.to_vec())
+                                                        .collect(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
                                 _ => {
                                     debug!(
                                         "[jupyter-kernel] shell reply: type={}",
@@ -2809,6 +3211,8 @@ impl KernelConnection for JupyterKernel {
             "comm-coalesce",
             async move {
                 let mut pending: HashMap<String, serde_json::Value> = HashMap::new();
+                let mut pending_mpl_frames: HashMap<String, PendingMplCanvasFrame> = HashMap::new();
+                let mut mpl_frame_seq: HashMap<String, u64> = HashMap::new();
                 let mut timer = tokio::time::interval(std::time::Duration::from_millis(16));
                 timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2816,7 +3220,7 @@ impl KernelConnection for JupyterKernel {
                     tokio::select! {
                         msg = coalesce_rx.recv() => {
                             match msg {
-                                Some((comm_id, delta)) => {
+                                Some(CommCoalesceMessage::StateDelta { comm_id, delta }) => {
                                     let entry = pending.entry(comm_id)
                                         .or_insert_with(|| serde_json::json!({}));
                                     if let (Some(existing), Some(new)) =
@@ -2827,16 +3231,69 @@ impl KernelConnection for JupyterKernel {
                                         }
                                     }
                                 }
+                                Some(CommCoalesceMessage::MplCanvasFrame { comm_id, png, size }) => {
+                                    pending_mpl_frames.insert(
+                                        comm_id,
+                                        PendingMplCanvasFrame { png, size },
+                                    );
+                                }
                                 None => break,
                             }
                         }
                         _ = timer.tick() => {
-                            if pending.is_empty() {
+                            if pending.is_empty() && pending_mpl_frames.is_empty() {
                                 continue;
                             }
                             let mut batch = std::mem::take(&mut pending);
                             for delta in batch.values_mut() {
                                 *delta = blob_store_large_state_values(delta, &coalesce_blob_store).await;
+                            }
+                            let frame_batch = std::mem::take(&mut pending_mpl_frames);
+                            for (comm_id, frame) in frame_batch {
+                                match coalesce_blob_store.put(&frame.png, "image/png").await {
+                                    Ok(hash) => {
+                                        let seq = mpl_frame_seq
+                                            .entry(comm_id.clone())
+                                            .and_modify(|seq| *seq = seq.saturating_add(1))
+                                            .or_insert(1);
+                                        let size = frame
+                                            .size
+                                            .map(|(width, height)| serde_json::json!([width, height]))
+                                            .unwrap_or(serde_json::Value::Null);
+                                        let mut checkpoint = serde_json::Map::new();
+                                        checkpoint.insert(
+                                            crate::matplotlib_widget::MPL_CANVAS_CHECKPOINT_KEY
+                                                .to_string(),
+                                            serde_json::json!({
+                                                "version": 1,
+                                                "frame": {
+                                                    "blob": hash,
+                                                    "size": frame.png.len(),
+                                                    "media_type": "image/png",
+                                                },
+                                                "image_mode": "full",
+                                                "size": size,
+                                                "frame_seq": *seq,
+                                            }),
+                                        );
+                                        let entry = batch
+                                            .entry(comm_id)
+                                            .or_insert_with(|| serde_json::json!({}));
+                                        if let (Some(existing), Some(new)) =
+                                            (entry.as_object_mut(), Some(&checkpoint))
+                                        {
+                                            for (k, v) in new {
+                                                existing.insert(k.clone(), v.clone());
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "[comms-doc] Failed to blob-store matplotlib canvas checkpoint: {}",
+                                            e
+                                        );
+                                    }
+                                }
                             }
                             if let Err(e) = coalesce_comms.with_doc(|cd| {
                                 let heads = cd.get_heads();
@@ -2883,6 +3340,7 @@ impl KernelConnection for JupyterKernel {
             launched_config,
             env_path,
             session_id,
+            kernel_id: kernel_id.clone(),
             kernel_actor_id,
             connection_info: Some(connection_info),
             connection_file: Some(connection_file_path),
@@ -2899,12 +3357,17 @@ impl KernelConnection for JupyterKernel {
             comm_coalesce_task: Some(comm_coalesce_task),
             registered_execution_ids,
             work_cmd_tx: Some(work_cmd_tx),
+            visualization_cmd_tx: Some(visualization_cmd_tx),
             lifecycle_cmd_tx: Some(lifecycle_cmd_tx),
             comm_seq,
             pending_history,
             pending_completions,
+            pending_bokeh_requests,
+            bokeh_checkpoint_requester: Some(bokeh_checkpoint_requester),
+            bokeh_checkpoint_task: Some(bokeh_checkpoint_task),
             history_cache: HistoryLruCache::new(HISTORY_CACHE_CAPACITY),
             stream_terminals,
+            output_redactor,
         };
 
         info!("[jupyter-kernel] Kernel started: {}", kernel_id);
@@ -3002,6 +3465,10 @@ impl KernelConnection for JupyterKernel {
         if let Some(task) = self.shell_reader_task.take() {
             task.abort();
         }
+        self.bokeh_checkpoint_requester.take();
+        if let Some(task) = self.bokeh_checkpoint_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.process_watcher_task.take() {
             task.abort();
         }
@@ -3073,6 +3540,7 @@ impl KernelConnection for JupyterKernel {
         self.connection_file = None;
         self.registered_execution_ids.lock().unwrap().clear();
         self.work_cmd_tx = None;
+        self.visualization_cmd_tx = None;
         self.lifecycle_cmd_tx = None;
 
         info!("[jupyter-kernel] Kernel shutdown complete");
@@ -3147,6 +3615,39 @@ impl KernelConnection for JupyterKernel {
             comm_id
         );
         Ok(())
+    }
+
+    // ── Bokeh document sessions ─────────────────────────────────────────
+
+    async fn apply_bokeh_session_patch(
+        &mut self,
+        request: BokehSessionPatchRequest,
+    ) -> Result<BokehKernelPatchResponse> {
+        let (content, buffers) = patch_request_wire(&request);
+        let raw = self
+            .send_bokeh_shell_request(BOKEH_PATCH_REQUEST, content, buffers)
+            .await?;
+        let mut response = parse_patch_reply(raw)?;
+        response.stdout = self
+            .output_redactor
+            .redact_text(&response.stdout)
+            .into_owned();
+        response.stderr = self
+            .output_redactor
+            .redact_text(&response.stderr)
+            .into_owned();
+        if let Some(error) = response.error_output.take() {
+            response.error_output = Some(self.output_redactor.redact_output_value(&error));
+        }
+        Ok(response)
+    }
+
+    fn bokeh_session_checkpoint_request(
+        &self,
+        session_id: String,
+    ) -> Option<BokehCheckpointFuture> {
+        let requester = self.bokeh_checkpoint_requester.clone()?;
+        Some(Box::pin(async move { requester.request(session_id).await }))
     }
 
     // ── Completions ──────────────────────────────────────────────────────
@@ -3273,6 +3774,10 @@ impl KernelConnection for JupyterKernel {
         &self.kernel_type
     }
 
+    fn kernel_id(&self) -> &str {
+        &self.kernel_id
+    }
+
     fn env_source(&self) -> &str {
         &self.env_source
     }
@@ -3297,6 +3802,50 @@ impl KernelConnection for JupyterKernel {
 }
 
 impl JupyterKernel {
+    async fn send_bokeh_shell_request(
+        &mut self,
+        msg_type: &str,
+        content: serde_json::Value,
+        buffers: Vec<Bytes>,
+    ) -> Result<RawBokehKernelMessage> {
+        let pending = self.pending_bokeh_requests.clone();
+        let shell = self
+            .shell_writer
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("No kernel running"))?;
+
+        let mut message: JupyterMessage = UnknownMessage {
+            msg_type: msg_type.to_string(),
+            content,
+        }
+        .into();
+        message.buffers = buffers;
+        let msg_id = message.header.msg_id.clone();
+        let (tx, rx) = oneshot::channel();
+        pending
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Bokeh request lock poisoned"))?
+            .insert(msg_id.clone(), tx);
+
+        if let Err(error) = shell.send(message).await {
+            if let Ok(mut guard) = pending.lock() {
+                guard.remove(&msg_id);
+            }
+            return Err(error.into());
+        }
+
+        match recv_oneshot_with_timeout(rx, std::time::Duration::from_secs(10)).await {
+            TimedOneShot::Received(reply) => Ok(reply),
+            TimedOneShot::SenderDropped => Err(anyhow::anyhow!("Bokeh request cancelled")),
+            TimedOneShot::TimedOut => {
+                if let Ok(mut guard) = pending.lock() {
+                    guard.remove(&msg_id);
+                }
+                Err(anyhow::anyhow!("Bokeh request timed out"))
+            }
+        }
+    }
+
     /// Get an InterruptHandle for concurrent interrupt without &mut self.
     pub fn interrupt_handle(&self) -> Option<InterruptHandle> {
         self.connection_info.as_ref().map(|ci| InterruptHandle {
@@ -3465,7 +4014,8 @@ mod tests {
 
     #[test]
     fn comm_update_replay_is_best_effort_when_work_queue_is_full() {
-        let (_lifecycle_tx, tx, mut receivers) = crate::output_prep::queue_command_channels(1);
+        let (_lifecycle_tx, _visualization_tx, tx, mut receivers) =
+            crate::output_prep::queue_command_channels(1);
 
         try_send_comm_update(
             &tx,

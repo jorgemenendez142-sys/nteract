@@ -18,12 +18,15 @@ Three nteract MCP servers may be available. Always use the right one:
 
 1. **Always prefer `nteract-dev`** (`mcp__nteract-dev__*` tools) for development work in this repo. It connects to the per-worktree dev daemon and includes the dev tools for managing the build/daemon lifecycle.
 2. **Never use `nteract-nightly` or `nteract` for development.** They connect to system-installed daemons and will not reflect your source changes.
-3. If `nteract-dev` tools are not available, fall back to `cargo xtask` commands — not to the system MCP servers.
-4. The dev tools (`up`, `down`, `status`, `logs`, `vite_logs`) live on the `nteract-dev` server. They manage the dev daemon and build pipeline — prefer them over manual terminal commands.
+3. **Never use installed Codex plugin notebook servers for source work.** Servers named `nteract-notebook`, `nightly`, or older `notebook` tool aliases come from the installed stable/nightly plugin cache, not this worktree. They can attach to a different active notebook than the local Browser/Vite app.
+4. If `nteract-dev` tools are not available, fall back to `cargo xtask` commands — not to the system or installed plugin MCP servers.
+5. The dev tools (`up`, `down`, `status`, `logs`, `vite_logs`) live on the `nteract-dev` server. They manage the dev daemon and build pipeline — prefer them over manual terminal commands when available.
 
 ## nteract-dev tool surface
 
-Two verbs plus three read-only tools, layered on top of the proxied `runt mcp` toolset:
+The advertised tool list varies by mode:
+
+**Owner/isolated mode** (Claude Code `.mcp.json`) — manages daemon lifecycle:
 
 | Tool | Purpose |
 |------|---------|
@@ -33,17 +36,29 @@ Two verbs plus three read-only tools, layered on top of the proxied `runt mcp` t
 | `logs` | Tail the daemon log. Arg: `lines` (default 50). |
 | `vite_logs` | Tail the Vite dev server log. Arg: `lines` (default 50). |
 
+**Attach mode** (Codex `.codex/config.toml`) — connects to an existing daemon:
+
+| Tool | Purpose |
+|------|---------|
+| `status` | Read-only report of `nteract-dev`, child, and daemon state. |
+| `logs` | Tail the daemon log. Arg: `lines` (default 50). |
+| `vite_logs` | Tail the Vite dev server log. Arg: `lines` (default 50). |
+
+All modes proxy the full `runt mcp` notebook tool surface.
+
 ## MCP Server
 
 `nteract-dev` proxies `runt mcp` (Rust-native, direct Automerge access, no Python overhead). It auto-builds `runt` on startup and watches `crates/runt-mcp/src/` for hot reload. For the installed app, `runt mcp` ships as a sidecar binary — no Python or uv required.
 
 `nteract-dev` runs in explicit modes. Claude Code uses owner mode from
 `.mcp.json`, so it may start, restart, rebuild, and stop the worktree daemon.
-Codex project config uses attach mode, so Codex connects to an already-running
-worktree daemon but does not own its lifecycle. When falling back to manual
-commands, `cargo xtask dev-daemon`, `cargo xtask notebook`, and
-`cargo xtask run-mcp` derive the current git worktree and pass the dev env to
-subprocesses; direnv is not required for those xtask paths.
+Codex app/CLI uses attach mode from `.codex/config.toml`, so it connects to an
+already-running worktree daemon but does not own its lifecycle. Both configs set
+`cwd = "."`; that is load-bearing because it starts `mcp-supervisor` from the
+repo root, letting it derive this exact worktree instead of another checkout.
+When falling back to manual commands, `cargo xtask dev-daemon`, `cargo xtask
+notebook`, and `cargo xtask run-mcp` derive the current git worktree and pass
+the dev env to subprocesses; direnv is not required for those xtask paths.
 
 ## System daemon CLI (`runt` / `runt-nightly`)
 
@@ -74,6 +89,9 @@ Verify that the three MCP servers connect to the correct daemons:
 status
 # Expected socket: ~/.cache/runt-nightly/worktrees/{hash}/runtimed.sock
 
+# Codex app/CLI should list a project-scoped nteract-dev with cwd "."
+codex mcp get nteract-dev
+
 # 2. List active notebooks on nteract-nightly (should show user's notebooks)
 mcp__nteract-nightly__list_active_notebooks
 # Should list real notebooks like coordination.ipynb
@@ -97,6 +115,7 @@ env -i HOME=$HOME /usr/local/bin/runt-nightly daemon status --json | jq -r '.soc
 - nteract-dev socket path doesn't contain `worktrees/` → using system daemon instead of a worktree daemon
 - nteract-nightly shows empty notebook list → connecting to dev daemon instead of system daemon
 - nteract-nightly MCP process has `RUNTIMED_DEV=1` in environment → env var stripping failed
+- Codex only lists `nteract-notebook` / `nightly` and not `nteract-dev` → the session is missing the project-scoped dev MCP config; use `cargo xtask` until the session is restarted from this repo
 
 **Fix:** Start the dev daemon from the repo root with `cargo xtask dev-daemon`
 or use the owner-mode `nteract-dev` `up` tool. Use direnv only if you want the

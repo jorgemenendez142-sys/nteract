@@ -1,17 +1,17 @@
 [package]
 name = "runtime-doc"
-version = "0.3.2"
+version = "0.4.3"
 edition.workspace = true
-description = "RuntimeStateDoc and RuntimeStateHandle — per-notebook Automerge document for daemon-authoritative runtime state"
+description = "RuntimeStateDoc and RuntimeStateHandle — per-notebook Automerge document for runtime-authoritative state"
 repository.workspace = true
 license.workspace = true
 
 [dependencies]
 automerge = { workspace = true }
 automerge-recovery = { path = "../automerge-recovery" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 automunge = { path = "../automunge" }
-tokio = { version = "1", features = ["sync"] }
-tracing = "0.1"
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
 thiserror = { workspace = true }

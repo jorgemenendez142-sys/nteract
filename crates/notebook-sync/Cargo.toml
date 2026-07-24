@@ -1,6 +1,6 @@
 [package]
 name = "notebook-sync"
-version = "0.4.2"
+version = "0.5.3"
 edition.workspace = true
 description = "Automerge-based notebook sync client with direct document access"
 repository.workspace = true
@@ -14,16 +14,18 @@ automerge = { workspace = true }
 automerge-recovery = { path = "../automerge-recovery" }
 notebook-doc = { path = "../notebook-doc" }
 runtime-doc = { path = "../runtime-doc" }
+comments-doc = { path = "../comments-doc" }
 notebook-protocol = { path = "../notebook-protocol" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-sha2 = "0.11"
-hex = "0.4"
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 uuid = { workspace = true }
-log = "0.4"
+log = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 
 [dev-dependencies]
 runt-workspace = { path = "../runt-workspace" }

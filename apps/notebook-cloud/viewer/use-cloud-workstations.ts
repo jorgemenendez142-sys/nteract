@@ -1,44 +1,24 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo } from "react";
 import type { WorkstationAttachmentState } from "runtimed";
 
 import {
-  projectNotebookWorkstationLaunchReadiness,
-  projectNotebookWorkstationSelection,
+  projectNotebookWorkstationSurface,
   type NotebookCommandToolbarWorkstationAction,
   type NotebookShellCapabilities,
 } from "@/components/notebook";
 
+import { useCloudStores } from "./cloud-stores-context";
 import type { CloudPrototypeAuthState } from "./collaborator-auth";
 import type { CloudViewerConfig } from "./cloud-viewer-session";
 import {
-  CLOUD_WORKSTATION_PAIRING_POLL_INTERVAL_MS,
-  cloudWorkstationConnectCommand,
-  cloudWorkstationRefreshIntervalMs,
-  fetchCloudWorkstationPairingStatus,
-  fetchCloudWorkstations,
-  mintCloudWorkstationPairingCode,
-  requestCloudWorkstationAttachment,
-  setCloudDefaultWorkstation,
-  type CloudWorkstationPairingStatus,
-  type CloudWorkstationsState,
-} from "./workstations-client";
+  useCloudWorkstationMutation,
+  useCloudWorkstationPairing,
+  useCloudWorkstationsController,
+  useCloudWorkstationsError,
+  useCloudWorkstationsRegistry,
+} from "./use-cloud-workstations-store";
 
-export interface CloudWorkstationPairing {
-  id: string;
-  code: string;
-  connectCommand: string;
-  expiresAt: string;
-  status: CloudWorkstationPairingStatus;
-  workstationId: string | null;
-  workstationName: string | null;
-  error: string | null;
-}
-
-interface CloudWorkstationMutationState {
-  kind: "idle" | "default" | "attach";
-  message: string | null;
-  workstationId: string | null;
-}
+export type { CloudWorkstationPairing } from "./cloud-workstations-store";
 
 interface AttachWorkstationOptions {
   message?: string;
@@ -68,370 +48,113 @@ export function useCloudWorkstationManager({
   panelIsOpen,
   onOpenWorkstationsRail,
 }: UseCloudWorkstationManagerInput) {
-  const [workstationsState, setWorkstationsState] = useState<CloudWorkstationsState>({
-    defaultWorkstationId: null,
-    workstations: [],
-  });
-  const [workstationsError, setWorkstationsError] = useState<string | null>(null);
-  const [workstationMutation, setWorkstationMutation] = useState<CloudWorkstationMutationState>({
-    kind: "idle",
-    message: null,
-    workstationId: null,
-  });
-
+  const { workstations } = useCloudStores();
   const canChooseHostedWorkstation =
     capabilities.access.source === "cloud" &&
     capabilities.auth.canUseAuthenticatedIdentity &&
     capabilities.access.level === "owner";
   const canLoadHostedWorkstations = canLoadCloudWorkstations && canChooseHostedWorkstation;
 
-  const refreshCloudWorkstations = useCallback(
-    async (signal?: AbortSignal) => {
-      if (!canLoadHostedWorkstations || !config.workstationsEndpoint) {
-        if (!capabilities.auth.canUseAuthenticatedIdentity) {
-          setWorkstationsState({ defaultWorkstationId: null, workstations: [] });
-        }
-        setWorkstationsError(null);
-        return;
-      }
-      try {
-        const next = await fetchCloudWorkstations(config.workstationsEndpoint, authState, signal);
-        if (signal?.aborted) return;
-        setWorkstationsState(next);
-        setWorkstationsError(null);
-      } catch (error) {
-        if (signal?.aborted) return;
-        setWorkstationsError(error instanceof Error ? error.message : String(error));
-      }
+  // The store owns the registry poll, mutations, and pairing lifecycle. The rail
+  // wipes the registry only on lost authenticated identity - a transient loss of
+  // hosted eligibility keeps the last-good registry.
+  useCloudWorkstationsController({
+    auth: authState,
+    workstationsEndpoint: config.workstationsEndpoint,
+    defaultEndpoint: config.workstationDefaultEndpoint,
+    attachEndpoint: config.workstationAttachEndpoint,
+    canFetch: canLoadHostedWorkstations,
+    panelIsOpen,
+    gateCadenceUntilSettled: false,
+    closedGate: {
+      status: capabilities.auth.canUseAuthenticatedIdentity ? "loading" : "signed_out",
+      wipeRegistry: !capabilities.auth.canUseAuthenticatedIdentity,
     },
-    [
-      authState,
-      canLoadHostedWorkstations,
-      capabilities.auth.canUseAuthenticatedIdentity,
-      config.workstationsEndpoint,
-    ],
-  );
+  });
 
-  useEffect(() => {
-    const controller = new AbortController();
-    void refreshCloudWorkstations(controller.signal);
-    return () => controller.abort();
-  }, [refreshCloudWorkstations]);
+  const registry = useCloudWorkstationsRegistry();
+  const workstationMutation = useCloudWorkstationMutation();
+  const workstationsError = useCloudWorkstationsError();
+  const pairingWithName = useCloudWorkstationPairing();
 
   const handleSetDefaultWorkstation = useCallback(
-    async (workstationId: string) => {
-      if (!config.workstationDefaultEndpoint) {
-        return;
-      }
-      setWorkstationMutation({
-        kind: "default",
-        message: null,
-        workstationId,
-      });
-      try {
-        const defaultWorkstationId = await setCloudDefaultWorkstation(
-          config.workstationDefaultEndpoint,
-          authState,
-          workstationId,
-        );
-        setWorkstationsState((previous) => ({
-          ...previous,
-          defaultWorkstationId: defaultWorkstationId ?? workstationId,
-        }));
-        setWorkstationsError(null);
-        await refreshCloudWorkstations();
-      } catch (error) {
-        setWorkstationsError(error instanceof Error ? error.message : String(error));
-      } finally {
-        setWorkstationMutation({ kind: "idle", message: null, workstationId: null });
-      }
-    },
-    [authState, config.workstationDefaultEndpoint, refreshCloudWorkstations],
+    (workstationId: string) => workstations.setDefault(workstationId),
+    [workstations],
   );
 
   const handleAttachWorkstation = useCallback(
-    async (workstationId: string, options: AttachWorkstationOptions = {}) => {
+    (workstationId: string, options: AttachWorkstationOptions = {}): Promise<boolean> => {
       if (!config.workstationAttachEndpoint) {
-        return false;
+        return Promise.resolve(false);
       }
-      setWorkstationMutation({
-        kind: "attach",
-        message:
-          options.message ?? "Starting compute. Waiting for the workstation to join this notebook.",
-        workstationId,
-      });
       if (options.revealPanel) {
         onOpenWorkstationsRail();
       }
-      try {
-        await requestCloudWorkstationAttachment(
-          config.workstationAttachEndpoint,
-          authState,
-          workstationId,
-          { replaceExisting: options.replaceExisting === true },
-        );
-        setWorkstationsError(null);
-        await refreshCloudWorkstations();
-        return true;
-      } catch (error) {
-        setWorkstationsError(error instanceof Error ? error.message : String(error));
-        setWorkstationMutation({ kind: "idle", message: null, workstationId: null });
-        await refreshCloudWorkstations();
-        return false;
-      }
+      return workstations.attach(workstationId, {
+        message: options.message,
+        replaceExisting: options.replaceExisting,
+      });
     },
-    [authState, config.workstationAttachEndpoint, onOpenWorkstationsRail, refreshCloudWorkstations],
+    [config.workstationAttachEndpoint, onOpenWorkstationsRail, workstations],
   );
 
-  const [pairing, setPairing] = useState<CloudWorkstationPairing | null>(null);
+  const handleStartPairing = useCallback(() => workstations.startPairing(), [workstations]);
+  const handleCancelPairing = useCallback(() => workstations.cancelPairing(), [workstations]);
 
-  const handleStartPairing = useCallback(async () => {
-    if (!config.workstationsEndpoint) {
-      return;
-    }
-    try {
-      const minted = await mintCloudWorkstationPairingCode(config.workstationsEndpoint, authState);
-      setPairing({
-        id: minted.id,
-        code: minted.code,
-        connectCommand: cloudWorkstationConnectCommand(window.location.origin, minted.code),
-        expiresAt: minted.expiresAt,
-        status: "pending",
-        workstationId: null,
-        workstationName: null,
-        error: null,
-      });
-    } catch (error) {
-      setPairing({
-        id: "",
-        code: "",
-        connectCommand: "",
-        expiresAt: new Date(0).toISOString(),
-        status: "expired",
-        workstationId: null,
-        workstationName: null,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }, [authState, config.workstationsEndpoint]);
-
-  const handleCancelPairing = useCallback(() => {
-    setPairing(null);
-  }, []);
-
-  const pairingPollActive =
-    pairing !== null &&
-    pairing.id !== "" &&
-    (pairing.status === "pending" || pairing.status === "redeemed");
-
-  useEffect(() => {
-    if (!pairingPollActive || !config.workstationsEndpoint) {
-      return;
-    }
-    const endpoint = config.workstationsEndpoint;
-    let disposed = false;
-    let timer: number | null = null;
-    let activeController: AbortController | null = null;
-    const poll = () => {
-      timer = window.setTimeout(() => {
-        const controller = new AbortController();
-        activeController = controller;
-        const pairingId = pairing.id;
-        void fetchCloudWorkstationPairingStatus(endpoint, authState, pairingId, controller.signal)
-          .then((next) => {
-            if (disposed || controller.signal.aborted) return;
-            setPairing((previous) =>
-              previous && previous.id === pairingId
-                ? {
-                    ...previous,
-                    status: next.status,
-                    workstationId: next.workstationId,
-                    error: null,
-                  }
-                : previous,
-            );
-            if (next.status === "registered") {
-              void refreshCloudWorkstations();
-            }
-          })
-          .catch(() => {
-            // Transient poll failures are invisible; the next tick retries.
-          })
-          .finally(() => {
-            if (activeController === controller) {
-              activeController = null;
-            }
-            if (!disposed) {
-              poll();
-            }
-          });
-      }, CLOUD_WORKSTATION_PAIRING_POLL_INTERVAL_MS);
-    };
-    poll();
-    return () => {
-      disposed = true;
-      if (timer !== null) {
-        window.clearTimeout(timer);
-      }
-      activeController?.abort();
-    };
-  }, [authState, config.workstationsEndpoint, pairing?.id, pairingPollActive]);
-
-  // The expiry transition is client-driven so the card flips to "expired"
-  // even if no poll lands exactly at the boundary.
-  useEffect(() => {
-    if (!pairing || pairing.status !== "pending") {
-      return;
-    }
-    const remaining = Date.parse(pairing.expiresAt) - Date.now();
-    if (!Number.isFinite(remaining)) {
-      return;
-    }
-    if (remaining <= 0) {
-      setPairing((previous) =>
-        previous && previous.id === pairing.id ? { ...previous, status: "expired" } : previous,
-      );
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      setPairing((previous) =>
-        previous && previous.id === pairing.id && previous.status === "pending"
-          ? { ...previous, status: "expired" }
-          : previous,
-      );
-    }, remaining);
-    return () => window.clearTimeout(timer);
-  }, [pairing]);
-
-  const pairingWithName = useMemo<CloudWorkstationPairing | null>(() => {
-    if (!pairing) {
-      return null;
-    }
-    if (!pairing.workstationId) {
-      return pairing;
-    }
-    const registered = workstationsState.workstations.find(
-      (workstation) => workstation.id === pairing.workstationId,
-    );
-    return registered ? { ...pairing, workstationName: registered.displayName } : pairing;
-  }, [pairing, workstationsState.workstations]);
-
-  const workstationRefreshIntervalMs = cloudWorkstationRefreshIntervalMs({
-    canChooseHostedWorkstation: canLoadHostedWorkstations,
-    hasRegisteredWorkstations: workstationsState.workstations.length > 0,
-    mutationKind: workstationMutation.kind,
-    panelIsOpen,
-  });
-
-  useEffect(() => {
-    if (workstationRefreshIntervalMs === null) {
-      return;
-    }
-    let disposed = false;
-    let timer: number | null = null;
-    let activeController: AbortController | null = null;
-    const scheduleRefresh = () => {
-      timer = window.setTimeout(() => {
-        const controller = new AbortController();
-        activeController = controller;
-        void refreshCloudWorkstations(controller.signal).finally(() => {
-          if (activeController === controller) {
-            activeController = null;
-          }
-          if (!disposed) {
-            scheduleRefresh();
-          }
-        });
-      }, workstationRefreshIntervalMs);
-    };
-    scheduleRefresh();
-    return () => {
-      disposed = true;
-      if (timer !== null) {
-        window.clearTimeout(timer);
-      }
-      activeController?.abort();
-    };
-  }, [refreshCloudWorkstations, workstationRefreshIntervalMs]);
-
-  const workstationSelection = useMemo(
+  const workstationSurface = useMemo(
     () =>
-      projectNotebookWorkstationSelection({
+      projectNotebookWorkstationSurface({
         activeAttachment: workstationAttachment,
+        capabilities,
         canRegisterWorkstation: canChooseHostedWorkstation,
         canSelectWorkstation: canChooseHostedWorkstation,
         canSetDefaultWorkstation: canChooseHostedWorkstation,
-        defaultWorkstationId: workstationsState.defaultWorkstationId,
-        registeredWorkstations: workstationsState.workstations,
+        canStartWorkstation: canChooseHostedWorkstation,
+        defaultWorkstationId: registry.defaultWorkstationId,
+        loadingMessage:
+          !canLoadCloudWorkstations && canChooseHostedWorkstation
+            ? "Preparing workstation access..."
+            : null,
+        mutation: workstationMutation,
+        registeredWorkstations: registry.workstations,
+        registryError: workstationsError,
       }),
-    [canChooseHostedWorkstation, workstationAttachment, workstationsState],
+    [
+      canChooseHostedWorkstation,
+      canLoadCloudWorkstations,
+      capabilities,
+      registry,
+      workstationAttachment,
+      workstationMutation,
+      workstationsError,
+    ],
   );
-
-  const workstationLaunchReadiness = useMemo(
-    () =>
-      projectNotebookWorkstationLaunchReadiness({
-        capabilities,
-        selection: workstationSelection,
-      }),
-    [capabilities, workstationSelection],
-  );
+  const workstationSelection = workstationSurface.selection;
+  const workstationLaunchReadiness = workstationSurface.launchReadiness;
+  const workstationPanelStatusMessage = workstationSurface.panelStatusMessage;
+  const canStartSelectedWorkstation = workstationSurface.canStartSelectedWorkstation;
 
   const workstationAction = useMemo<NotebookCommandToolbarWorkstationAction | null>(() => {
-    const { primaryAction, workstationId } = workstationLaunchReadiness;
-    if (workstationMutation.kind === "attach" && workstationMutation.workstationId) {
-      const pendingTarget =
-        workstationLaunchReadiness.workstationId === workstationMutation.workstationId
-          ? workstationLaunchReadiness.targetLabel
-          : null;
+    const action = workstationSurface.toolbarAction;
+    if (!action) return null;
+    if (action.disabled || action.kind !== "attach_workstation" || !action.workstationId) {
       return {
-        disabled: true,
-        label: "Starting",
-        pending: true,
-        title: pendingTarget
-          ? `Starting compute on ${pendingTarget}`
-          : "Starting compute on the selected workstation",
-        onClick: () => {},
+        disabled: action.disabled,
+        label: action.label,
+        pending: action.pending,
+        title: action.title,
+        onClick: onOpenWorkstationsRail,
       };
     }
-    return primaryAction.kind !== "none" && primaryAction.label && primaryAction.title
-      ? {
-          label: primaryAction.label,
-          title: primaryAction.title,
-          onClick:
-            primaryAction.kind === "attach_workstation" && workstationId
-              ? () => handleAttachWorkstation(workstationId)
-              : onOpenWorkstationsRail,
-        }
-      : null;
-  }, [
-    handleAttachWorkstation,
-    onOpenWorkstationsRail,
-    workstationLaunchReadiness,
-    workstationMutation.kind,
-    workstationMutation.workstationId,
-  ]);
-
-  const workstationPanelStatusMessage =
-    workstationMutation.message ??
-    (!canLoadCloudWorkstations && canChooseHostedWorkstation
-      ? "Preparing workstation access..."
-      : null) ??
-    workstationsError ??
-    (workstationLaunchReadiness.state === "workstation_unavailable"
-      ? workstationLaunchReadiness.detail
-      : null);
-
-  useEffect(() => {
-    if (workstationMutation.kind !== "attach" || !workstationAttachment?.workstation_id) {
-      return;
-    }
-    if (
-      !workstationMutation.workstationId ||
-      workstationMutation.workstationId === workstationAttachment.workstation_id
-    ) {
-      setWorkstationMutation({ kind: "idle", message: null, workstationId: null });
-    }
-  }, [workstationAttachment?.workstation_id, workstationMutation]);
+    const workstationId = action.workstationId;
+    return {
+      disabled: action.disabled,
+      label: action.label,
+      pending: action.pending,
+      title: action.title,
+      onClick: () => handleAttachWorkstation(workstationId),
+    };
+  }, [handleAttachWorkstation, onOpenWorkstationsRail, workstationSurface.toolbarAction]);
 
   const startSelectedWorkstation = useCallback(
     async (options: Omit<AttachWorkstationOptions, "revealPanel"> = {}) => {
@@ -444,14 +167,9 @@ export function useCloudWorkstationManager({
     },
     [handleAttachWorkstation, onOpenWorkstationsRail, workstationLaunchReadiness.workstationId],
   );
-  const canStartSelectedWorkstation =
-    canChooseHostedWorkstation &&
-    workstationMutation.kind !== "attach" &&
-    Boolean(workstationLaunchReadiness.workstationId);
-
   return useMemo(
     () => ({
-      busyWorkstationId: workstationMutation.workstationId,
+      busyWorkstationId: workstationSurface.busyWorkstationId,
       canStartSelectedWorkstation,
       onStartSelectedWorkstation: canChooseHostedWorkstation ? startSelectedWorkstation : undefined,
       onAttachWorkstation: canChooseHostedWorkstation
@@ -474,8 +192,8 @@ export function useCloudWorkstationManager({
       handleStartPairing,
       startSelectedWorkstation,
       pairingWithName,
+      workstationSurface.busyWorkstationId,
       workstationAction,
-      workstationMutation.workstationId,
       workstationPanelStatusMessage,
       workstationSelection,
     ],

@@ -39,6 +39,7 @@ import { VegaOutput } from "@/components/outputs/vega-output";
 import { VideoOutput } from "@/components/outputs/video-output";
 import { OutputArea } from "@/components/cell/OutputArea";
 import { getElementsNotebookScenario } from "@/components/notebook-scenarios";
+import { SurfaceFrame } from "@/components/surface-primitives";
 import "@/components/widgets/controls";
 import { WidgetStoreContext } from "@/components/widgets/widget-store-context";
 import { createWidgetStore, type WidgetStore } from "@/components/widgets/widget-store";
@@ -798,23 +799,21 @@ function RendererCard({
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-lg border border-fd-border bg-fd-card">
-      <div className="flex items-start justify-between gap-3 border-b border-fd-border p-4">
-        <div className="flex min-w-0 items-center gap-2">
-          <Icon className="size-4 flex-none text-fd-muted-foreground" aria-hidden="true" />
-          <div className="min-w-0">
-            <h2 className="text-sm font-semibold">{title}</h2>
-            <div className="mt-1 break-words font-mono text-[11px] leading-4 text-fd-muted-foreground [overflow-wrap:anywhere]">
-              {source}
-            </div>
-          </div>
-        </div>
-        <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
-          rendered
-        </span>
-      </div>
-      <div className="p-4">{children}</div>
-    </section>
+    <SurfaceFrame
+      title={title}
+      source={source}
+      icon={<Icon aria-hidden="true" />}
+      badge={<RenderedBadge />}
+      bodyClassName="p-4"
+    >
+      {children}
+    </SurfaceFrame>
+  );
+}
+
+function RenderedBadge() {
+  return (
+    <span className="text-[11px] font-medium text-emerald-700 dark:text-emerald-300">rendered</span>
   );
 }
 
@@ -890,7 +889,7 @@ export function OutputRenderersExample() {
 
   return (
     <div className="not-prose space-y-6" data-testid="output-renderers-example">
-      <section className="rounded-lg border border-sky-500/30 bg-sky-500/10 p-4 text-sky-900 dark:text-sky-100">
+      <section className="border-l border-fd-border py-1 pl-4 text-fd-muted-foreground">
         <div className="flex items-start gap-3">
           <ListFilter className="mt-0.5 size-4 flex-none" aria-hidden="true" />
           <div>
@@ -1293,10 +1292,10 @@ export function OutputRenderersExample() {
                 <div>
                   <span
                     className={[
-                      "inline-flex rounded-full border px-2 py-1 text-[11px] font-medium",
+                      "inline-flex text-[11px] font-medium",
                       safe
-                        ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                        : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+                        ? "text-emerald-700 dark:text-emerald-300"
+                        : "text-amber-700 dark:text-amber-300",
                     ].join(" ")}
                   >
                     {safe ? "main DOM" : "iframe adapter"}

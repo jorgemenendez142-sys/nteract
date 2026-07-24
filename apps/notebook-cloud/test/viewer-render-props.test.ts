@@ -81,8 +81,13 @@ test("cloud home keeps prototype controls out of the primary auth surface", () =
   assert.match(homeSource, /aria-label="Notebook sign-in"/);
   assert.match(homeSource, /className="cloud-home-copy"/);
   assert.match(homeSource, /className="cloud-home-kicker"/);
-  assert.match(homeSource, /NTERACT/);
-  assert.match(homeSource, /<h1>Bring computation to life\.<\/h1>/);
+  assert.match(homeSource, /const localMode = Boolean\(localDevAuth\)/);
+  assert.match(homeSource, /localMode \? "LOCAL MODE" : "NTERACT"/);
+  assert.match(homeSource, /localMode \? "Open local notebooks\." : "Bring computation to life\."/);
+  assert.match(
+    homeSource,
+    /Use local auth to create notebooks and test the live room on this machine\./,
+  );
   assert.match(
     homeSource,
     /Sign in to create live notebooks, share work with colleagues, and attach compute\./,
@@ -96,7 +101,7 @@ test("cloud home keeps prototype controls out of the primary auth surface", () =
     homeSource,
     /const signInConfigured = Boolean\(localDevAuth \|\| authConfig\.oidc\)/,
   );
-  assert.match(homeSource, /window\.location\.assign\(localDevAuth\.authUrl\)/);
+  assert.match(homeSource, /window\.location\.assign\(authConfig\.localDev!\.authUrl\)/);
   assert.match(homeSource, /const hasLocalDevAuth = authState\.mode === "dev"/);
   assert.doesNotMatch(homeSource, /showPrototypeDevControls/);
   assert.doesNotMatch(homeSource, /className="cloud-home-scope"/);
@@ -111,20 +116,22 @@ test("cloud home keeps prototype controls out of the primary auth surface", () =
 });
 
 test("cloud callback keeps sign-in handoff in the entry surface language", () => {
-  const cssPath = new URL("../viewer/index.css", import.meta.url);
-  const cssText = readFileSync(cssPath, "utf8");
-  const callbackSource = viewerFunctionSource("OidcCallbackView");
+  const callbackSource = readFileSync(
+    new URL("../viewer/oidc-callback-standalone.ts", import.meta.url),
+    "utf8",
+  );
 
-  assert.match(callbackSource, /className="cloud-home"/);
-  assert.match(callbackSource, /className="cloud-home-layout"/);
-  assert.match(callbackSource, /aria-label="nteract sign-in callback"/);
-  assert.match(callbackSource, /className="cloud-home-panel"/);
+  assert.match(callbackSource, /cloud-oidc-shell/);
+  assert.match(callbackSource, /cloud-oidc-layout/);
+  assert.match(callbackSource, /setAttribute\("aria-label", "nteract sign-in callback"\)/);
+  assert.match(callbackSource, /cloud-oidc-panel/);
   assert.match(callbackSource, /returning to the notebook/);
+  assert.match(callbackSource, /Try again/);
   assert.match(callbackSource, /Back to nteract/);
-  assert.match(callbackSource, /data-mode=\{status\.kind\}/);
-  assert.match(cssText, /\.cloud-home-status-spinner/);
+  assert.match(callbackSource, /status\.kind/);
+  assert.match(callbackSource, /cloud-oidc-spin/);
   assert.doesNotMatch(callbackSource, /cloud-report-toolbar/);
-  assert.doesNotMatch(callbackSource, /className="flex min-h-screen/);
+  assert.doesNotMatch(callbackSource, /flex min-h-screen/);
 });
 
 test("cloud notebook startup loading uses route-shaped shell chrome", () => {
@@ -151,17 +158,23 @@ test("cloud notebook startup loading uses route-shaped shell chrome", () => {
 });
 
 test("cloud viewer keeps pending access-request polling quiet", () => {
-  const sourceText = viewerFileContaining("CLOUD_ACCESS_REQUEST_POLL_INTERVAL_MS");
-
-  assert.match(sourceText, /const CLOUD_ACCESS_REQUEST_POLL_INTERVAL_MS = 30_000;/);
-  assert.match(sourceText, /function shouldPollPendingCloudAccessRequest\(\): boolean/);
-  assert.match(sourceText, /document\.visibilityState !== "hidden"/);
-  assert.match(sourceText, /let pollInFlight = false;/);
-  assert.match(sourceText, /if \(!shouldPollPendingCloudAccessRequest\(\) \|\| pollInFlight\)/);
-  assert.match(
-    sourceText,
-    /document\.addEventListener\("visibilitychange", handleVisibilityChange\)/,
+  // The poll moved into the access-request store: a 30s fixed-rate createPoll
+  // whose single exhaustMap and document-visibility gate replace the viewer's
+  // hand-rolled setInterval + pollInFlight boolean + visibilitychange listener.
+  const storeText = readFileSync(
+    new URL("../viewer/cloud-access-request-store.ts", import.meta.url),
+    "utf8",
   );
+  assert.match(storeText, /const CLOUD_ACCESS_REQUEST_POLL_INTERVAL_MS = 30_000;/);
+  assert.match(storeText, /strategy: "fixed-rate"/);
+  assert.match(storeText, /effectiveAccessRequest\?\.status === "pending"/);
+  assert.match(storeText, /active\$: visible\$/);
+  assert.match(storeText, /documentVisible\$/);
+
+  // The viewer entry delegates to the store and no longer hand-rolls the poll.
+  assert.match(viewerCorpus, /useCloudAccessRequestController\(/);
+  assert.doesNotMatch(viewerCorpus, /shouldPollPendingCloudAccessRequest/);
+  assert.doesNotMatch(viewerCorpus, /let pollInFlight = false;/);
 });
 
 test("cloud viewer routes notebook header controls through the shared shell chrome", () => {
@@ -190,7 +203,7 @@ test("cloud viewer routes notebook header controls through the shared shell chro
   assert.match(sourceText, /<NotebookDocumentToolbar[\s\S]*capabilities=\{shellCapabilities\}/);
   assert.match(
     sourceText,
-    /presence=\{[\s\S]*<CloudNotebookTitle[\s\S]*title=\{notebookTitle\}[\s\S]*canRename=\{catalogAccessResolved && catalogGrantsDocumentEdit\}[\s\S]*onRename=\{saveCloudNotebookTitle\}/,
+    /presence=\{[\s\S]*<CloudNotebookTitle[\s\S]*title=\{notebookStageGated \? gatedNotebookTitle : notebookTitle\}[\s\S]*canRename=\{catalogAccessResolved && catalogGrantsDocumentEdit\}[\s\S]*onRename=\{saveCloudNotebookTitle\}/,
   );
   assert.match(
     sourceText,
@@ -198,9 +211,9 @@ test("cloud viewer routes notebook header controls through the shared shell chro
   );
   assert.match(sourceText, /cloudNotebookTitleDisplay,/);
   assert.match(sourceText, /cloudNotebookUrlAfterRename,/);
-  assert.match(titleSourceText, /className="cloud-notebook-home-link"/);
+  assert.match(titleSourceText, /homeLink: "cloud-notebook-home-link"/);
   assert.match(titleSourceText, /<House aria-hidden="true" \/>/);
-  assert.match(titleSourceText, /<PencilLine aria-hidden="true" \/>/);
+  assert.match(titleSourceText, /renameButtonTitle="Rename notebook"/);
   assert.doesNotMatch(titleSourceText, /cloud-notebook-logo/);
   assert.doesNotMatch(sourceText, /function shouldShowCloudNotebookCommandToolbar/);
   assert.doesNotMatch(sourceText, /toolbarClassName="cloud-report-toolbar"/);
@@ -213,19 +226,28 @@ test("cloud viewer routes notebook header controls through the shared shell chro
     /buildCloudShareAccessRows\(\{ acl, invites, accessRequests \}\)/,
   );
   assert.match(sourceText, /editControls=\{[\s\S]*<CloudNotebookEditModeButton/);
+  assert.match(sourceText, /editControls=\{[\s\S]*notebookHeaderChrome\.showEditModeControl \? \(/);
   assert.match(
     sourceText,
     /authControls=\{[\s\S]*shouldShowCloudHeaderSignIn\(authState, \{[\s\S]*hasAppSession,[\s\S]*\}\) \? \(/,
   );
   assert.match(sourceText, /authControls=\{[\s\S]*<CloudNotebookSignInButton/);
   assert.match(sourceText, /const beginNotebookAuth = useCallback/);
-  assert.match(sourceText, /window\.location\.assign\(localDevAuth\.authUrl\)/);
+  assert.match(sourceText, /window\.location\.assign\(authConfig\.localDev\.authUrl\)/);
   assert.match(
     sourceText,
     /onSignInAgain=\{authConfig\.localDev \|\| authConfig\.oidc \? beginNotebookAuth : undefined\}/,
   );
   assert.match(sourceText, /const hasAppSession = Boolean\(appSessionStatus\.session\)/);
-  assert.match(sourceText, /projectCloudAccessRequestTransition\(\{/);
+  // Edit-access requests delegate to the access-request store; the loaded-request
+  // transition itself lives in the store, not the viewer entry.
+  assert.match(
+    sourceText,
+    /const requestCloudEditAccess = useCallback\(\(\) => \{[\s\S]*accessRequest\.requestEditAccess\(\);/,
+  );
+  assert.match(sourceText, /projection\.kind === "dismissed"/);
+  assert.match(sourceText, /icon=\{<Info className="h-4 w-4" \/>\}/);
+  assert.doesNotMatch(sourceText, /projection\.kind === "dismissed"[\s\S]{0,240}AlertCircle/);
   // The connection/identity slot is filled by the shared quiet component:
   // avatar + connectivity dot, driven by the stable status bridge. It must
   // never regress into a text pill or a second status label surface. The
@@ -259,9 +281,13 @@ test("cloud viewer routes notebook header controls through the shared shell chro
     sessionSourceText,
     /connectionStatusBridge\.noteTeardownRetry\(\);[\s\S]{0,600}?const teardownFlush = disposeCurrentRuntime\(\);/,
   );
-  assert.match(sourceText, /useState\(initialCloudRailCollapsed\)/);
-  assert.match(sourceText, /function initialCloudRailCollapsed/);
-  assert.match(sourceText, /function initialCloudRailCollapsed\(\): boolean \{[\s\S]*return true;/);
+  assert.match(sourceText, /useNotebookRailUiState/);
+  assert.match(
+    sourceText,
+    /const \{ activePanelId: activeRailPanel, collapsed: railCollapsed \} = useNotebookRailUiState\(\)/,
+  );
+  assert.doesNotMatch(sourceText, /useState\(initialCloudRailCollapsed\)/);
+  assert.doesNotMatch(sourceText, /function initialCloudRailCollapsed/);
   assert.doesNotMatch(sourceText, /packagesSummary=/);
   assert.doesNotMatch(sourceText, /workstationsSummary=/);
   assert.match(
@@ -270,7 +296,7 @@ test("cloud viewer routes notebook header controls through the shared shell chro
   );
   assert.match(
     sourceText,
-    /if \(!shouldShowCloudWorkstationsPanel && activeRailPanel === "workstations"\) \{[\s\S]*setActiveRailPanel\("outline"\)/,
+    /if \(!shouldShowCloudWorkstationsPanel && activeRailPanel === "workstations"\) \{[\s\S]*setActiveNotebookRailPanel\("outline"\)/,
   );
   assert.match(
     sourceText,
@@ -441,7 +467,12 @@ test("cloud viewer presents live-room failures as one host notice", () => {
   assert.match(noticesText, /function cloudConnectionNoticeDisplay/);
   assert.match(noticesText, /hasReadableSnapshot: boolean/);
   assert.match(noticesText, /Sign in required\./);
+  assert.match(noticesText, /Sign in to open the live notebook room\./);
   assert.match(noticesText, /Notebook access needed\./);
+  assert.match(noticesText, /message: CLOUD_CONNECTION_NO_ACCESS_DIAGNOSTIC/);
+  assert.match(noticesText, /Notebook not found\./);
+  assert.match(noticesText, /CLOUD_CONNECTION_NOT_FOUND_DIAGNOSTIC/);
+  assert.match(noticesText, /tone: "success"/);
   assert.match(noticesText, /Live room unavailable\./);
   assert.match(noticesText, /The notebook will load once the account or connection is refreshed\./);
   assert.match(noticesText, /tone=\{connectionNotice\.tone\}/);

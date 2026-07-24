@@ -16,7 +16,7 @@ use super::{arg_bool, arg_str, assert_cell_exists, tool_error};
 
 fn cells_resource_result(message: String, notebook_id: &str) -> CallToolResult {
     CallToolResult::success(vec![
-        Content::text(message),
+        formatting::assistant_text(message),
         Content::resource_link(crate::resources::notebook_cells_resource_link(notebook_id)),
     ])
 }
@@ -63,7 +63,8 @@ pub async fn execute_cell(
     let cell_id = arg_str(request, "cell_id")
         .ok_or_else(|| McpError::invalid_params("Missing required parameter: cell_id", None))?;
 
-    let handle = require_handle!(server);
+    let access = require_session_access!(server, Execute);
+    let handle = access.handle.clone();
 
     let timeout_secs = request
         .arguments
@@ -87,15 +88,25 @@ pub async fn execute_cell(
 
     let peer_label = server.get_peer_label().await;
     crate::presence::emit_focus(&handle, cell_id, &peer_label).await;
+    if let Err(error) = server.ensure_session_access_current(&access).await {
+        return super::session_access_error(error);
+    }
 
-    let result = execution::execute_and_wait(
+    let result = match execution::execute_and_wait(
         &handle,
         cell_id,
         Duration::from_secs_f64(timeout_secs),
         &server.blob_base_url,
         &server.blob_store_path,
     )
-    .await;
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return super::execution_dispatch_error(error),
+    };
+    if let Err(error) = server.ensure_session_access_current(&access).await {
+        return super::session_access_error(error);
+    }
 
     super::build_execution_result(&result, &handle, server).await
 }
@@ -110,7 +121,8 @@ pub async fn run_all_cells(
     server: &NteractMcp,
     request: &CallToolRequestParams,
 ) -> Result<CallToolResult, McpError> {
-    let handle = require_handle!(server);
+    let access = require_session_access!(server, Execute);
+    let handle = access.handle.clone();
 
     let wait = arg_bool(request, "wait").unwrap_or(true);
 
@@ -123,9 +135,15 @@ pub async fn run_all_cells(
 
     // Fire-and-forget: queue cells and return immediately.
     if !wait {
-        let result = execution::run_all_and_queue(&handle).await;
-        if result.status == "error" {
-            return tool_error("Failed to queue cells for execution");
+        if let Err(error) = server.ensure_session_access_current(&access).await {
+            return super::session_access_error(error);
+        }
+        let result = match execution::run_all_and_queue(&handle).await {
+            Ok(result) => result,
+            Err(error) => return super::execution_dispatch_error(error),
+        };
+        if let Err(error) = server.ensure_session_access_current(&access).await {
+            return super::session_access_error(error);
         }
         let n = result.cell_execution_ids.len();
         let mut lines = vec![format!("Queued {n} cells for execution")];
@@ -139,7 +157,17 @@ pub async fn run_all_cells(
     }
 
     // Wait mode: run all cells and collect outputs.
-    let result = execution::run_all_and_wait(&handle, Duration::from_secs_f64(timeout_secs)).await;
+    if let Err(error) = server.ensure_session_access_current(&access).await {
+        return super::session_access_error(error);
+    }
+    let result =
+        match execution::run_all_and_wait(&handle, Duration::from_secs_f64(timeout_secs)).await {
+            Ok(result) => result,
+            Err(error) => return super::execution_dispatch_error(error),
+        };
+    if let Err(error) = server.ensure_session_access_current(&access).await {
+        return super::session_access_error(error);
+    }
 
     let cells = handle.get_cells();
     let runtime_state = handle.get_runtime_state().ok();
@@ -212,7 +240,7 @@ pub async fn run_all_cells(
     // Build per-cell output content.
     let comms = runtime_state.as_ref().map(|rs| &rs.comms);
     let mut content_items = vec![
-        rmcp::model::Content::text(header.clone()),
+        formatting::assistant_text(header.clone()),
         rmcp::model::Content::resource_link(crate::resources::notebook_cells_resource_link(
             handle.notebook_id(),
         )),
@@ -234,9 +262,9 @@ pub async fn run_all_cells(
 
         // Resolve outputs from the execution's output manifests.
         let output_manifests = &exec.outputs;
-        let outputs = if !output_manifests.is_empty() {
+        let (outputs, resolved_outputs_by_manifest) = if !output_manifests.is_empty() {
             // Batch execute path — always preview mode. No per-cell opt-out.
-            runtimed_outputs::output_resolver::resolve_cell_outputs_for_llm(
+            let aligned = runtimed_outputs::output_resolver::resolve_cell_outputs_for_llm_aligned(
                 output_manifests,
                 runtimed_outputs::output_resolver::ResolveCtx {
                     blob_base_url: server.blob_base_url.as_deref(),
@@ -246,9 +274,11 @@ pub async fn run_all_cells(
                     ..Default::default()
                 },
             )
-            .await
+            .await;
+            let outputs = aligned.iter().flatten().cloned().collect();
+            (outputs, aligned)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         // Text content: cell header + output text items.
@@ -260,37 +290,39 @@ pub async fn run_all_cells(
             Some(display_status),
             eid,
         );
-        content_items.push(rmcp::model::Content::text(cell_header));
-        let output_summaries = formatting::format_outputs_summary_lines(&outputs, 120);
+        content_items.push(formatting::assistant_text(cell_header));
+        let output_summaries = formatting::format_outputs_summary_lines_aligned(
+            &resolved_outputs_by_manifest,
+            output_manifests,
+            120,
+        );
         if !output_summaries.is_empty() {
-            content_items.push(rmcp::model::Content::text(format!(
+            content_items.push(formatting::assistant_text(format!(
                 "Output summary:\n{}",
                 output_summaries.join("\n")
             )));
         }
         content_items.extend(formatting::outputs_to_content_items(&outputs));
 
-        // Structured content for MCP Apps: use manifests from the cell snapshot
-        // (which include ContentRef entries needed for structured rendering).
+        // Structured content for MCP Apps: use the same manifest slice resolved
+        // above so resolved summaries stay aligned to their source manifests.
         // Extract the inner "cell" object — cell_structured_content_from_manifests
         // returns {"cell": {...}, "blob_base_url": "..."} but the multi-cell
         // wrapper expects CellData directly in the cells[] array.
-        // Outputs live in RuntimeStateDoc, keyed by execution_id; fetch them
-        // alongside the snapshot.
         let cell_snapshot = handle.get_cell(&cell.id);
         if let Some(snap) = cell_snapshot {
-            let snap_outputs = handle.get_cell_outputs(&cell.id).unwrap_or_default();
-            if !snap_outputs.is_empty() {
+            if !output_manifests.is_empty() {
                 let wrapped = crate::structured::cell_structured_content_from_manifests(
                     crate::structured::CellStructuredContentManifestInput {
                         cell_id: &snap.id,
                         cell_type: &snap.cell_type,
                         source: &snap.source,
-                        output_manifests: &snap_outputs,
+                        output_manifests,
                         execution_count: exec.execution_count,
                         status: display_status,
                         blob_base_url: &server.blob_base_url,
                         comms,
+                        resolved_outputs_by_manifest: Some(&resolved_outputs_by_manifest),
                     },
                 );
                 if let Some(mut cell_data) = wrapped.get("cell").cloned() {
@@ -345,9 +377,13 @@ pub async fn get_results(
     })?;
     let full_output = arg_bool(request, "full_output").unwrap_or(false);
 
-    let handle = {
-        let guard = server.session.read().await;
-        guard.as_ref().map(|session| session.handle.clone())
+    let (handle, access_error) = match server
+        .session_access(crate::session::SessionRequirement::RuntimeRead)
+        .await
+    {
+        Ok(Some(access)) => (Some(access.handle), None),
+        Ok(None) => (None, None),
+        Err(error) => (None, Some(error)),
     };
 
     if let Some(handle) = handle.as_ref() {
@@ -405,6 +441,10 @@ pub async fn get_results(
         .await;
     }
 
+    if let Some(error) = access_error {
+        return super::session_access_error(error);
+    }
+
     tool_error(&format!(
         "Execution not found: {execution_id}. It may have been evicted and no durable result record was found."
     ))
@@ -445,8 +485,8 @@ async fn render_execution_result(
     );
 
     // Resolve outputs from the execution's manifests
-    let outputs = if !exec.outputs.is_empty() {
-        output_resolver::resolve_cell_outputs_for_llm(
+    let (outputs, resolved_outputs_by_manifest) = if !exec.outputs.is_empty() {
+        let aligned = output_resolver::resolve_cell_outputs_for_llm_aligned(
             &exec.outputs,
             output_resolver::ResolveCtx {
                 blob_base_url: server.blob_base_url.as_deref(),
@@ -460,19 +500,23 @@ async fn render_execution_result(
                 execution_cell_map: execution_cell_map.as_ref(),
             },
         )
-        .await
+        .await;
+        let outputs = aligned.iter().flatten().cloned().collect();
+        (outputs, aligned)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
-    let mut items = vec![rmcp::model::Content::text(header)];
-    let output_summaries = formatting::format_outputs_summary_lines(&outputs, 120);
+    let mut items = vec![formatting::assistant_text(header)];
+    let output_summaries = formatting::format_outputs_summary_lines_aligned(
+        &resolved_outputs_by_manifest,
+        &exec.outputs,
+        120,
+    );
     if output_summaries.is_empty() {
-        items.push(rmcp::model::Content::text(
-            "Output summary: 0 outputs".to_string(),
-        ));
+        items.push(formatting::assistant_text("Output summary: 0 outputs"));
     } else {
-        items.push(rmcp::model::Content::text(format!(
+        items.push(formatting::assistant_text(format!(
             "Output summary:\n{}",
             output_summaries.join("\n")
         )));
@@ -480,11 +524,11 @@ async fn render_execution_result(
 
     if !is_terminal && outputs.is_empty() {
         // No outputs yet — make it crystal clear
-        items.push(rmcp::model::Content::text(format!(
+        items.push(formatting::assistant_text(format!(
             "Status: {display_status}. No outputs available yet."
         )));
     } else if !is_terminal {
-        items.push(rmcp::model::Content::text(format!(
+        items.push(formatting::assistant_text(format!(
             "⚠ Status: {display_status}. Outputs below may be incomplete."
         )));
         items.extend(formatting::outputs_to_content_items(&outputs));
@@ -521,6 +565,7 @@ async fn render_execution_result(
                 status: display_status,
                 blob_base_url: &server.blob_base_url,
                 comms,
+                resolved_outputs_by_manifest: Some(&resolved_outputs_by_manifest),
             },
         );
         wrapped.get("cell").cloned().map(|mut cell_data| {

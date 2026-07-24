@@ -18,6 +18,16 @@ import { cloudFriendlyPeerLabel, cloudVisiblePeerLabel } from "./presence";
 export interface CloudNotebookShellCapabilityInput {
   authState: CloudPrototypeAuthState;
   /**
+   * Viewer self display resolved by the Cloud user store. When provided, these
+   * profile fields win over the legacy auth-claim derivation below; null or
+   * empty fields fall back independently so early connection frames keep the
+   * current auth-derived identity until the store has a better answer.
+   */
+  selfDisplay?: {
+    label?: string | null;
+    imageUrl?: string | null;
+  };
+  /**
    * Document access used for UI projection. During reconnect this can come
    * from the authenticated notebook catalog so owners do not see stale
    * request-access chrome. Actual mutation and execution authority still comes
@@ -60,6 +70,10 @@ export interface CloudNotebookShellCapabilityInput {
    */
   kernelStatusLabel?: string | null;
   /**
+   * RuntimeStateDoc-derived room-link heartbeat from the runtime peer.
+   */
+  runtimeLastSeenAt?: string | null;
+  /**
    * Room-host-owned RuntimeStateDoc workstation attachment snapshot. When
    * present this is the durable notebook-visible source for the selected
    * compute target; live presence remains the fallback while older rooms have
@@ -78,6 +92,7 @@ export interface CloudNotebookShellCapabilityInput {
 export function cloudNotebookShellCapabilities({
   accessConnectionScope,
   authState,
+  selfDisplay,
   connectionScope,
   connectionActorLabel = null,
   connectionPeerLabel = null,
@@ -89,6 +104,7 @@ export function cloudNotebookShellCapabilities({
   runtimeAvailable = false,
   runtimePeerCount = runtimeAvailable ? 1 : 0,
   kernelStatusLabel = null,
+  runtimeLastSeenAt = null,
   workstationAttachment = null,
   hostCapabilities,
 }: CloudNotebookShellCapabilityInput): NotebookShellCapabilities {
@@ -106,16 +122,23 @@ export function cloudNotebookShellCapabilities({
   const authenticated = hasAppSession || authState.mode === "dev" || authState.mode === "oidc";
   const authNeedsAttention =
     !hasAppSession && (authState.mode === "invalid" || authState.mode === "oidc_expired");
-  const identityLabel = connectionPeerLabel?.trim()
-    ? cloudVisiblePeerLabel(connectionPeerLabel, connectionActorLabel)
-    : cloudIdentityDisplayLabel(authState, connectionActorLabel);
-  const identityImageUrl = cloudIdentityImageUrl(authState);
+  const identityLabel =
+    normalizedSelfDisplayValue(selfDisplay?.label) ??
+    (connectionPeerLabel?.trim()
+      ? cloudVisiblePeerLabel(connectionPeerLabel, connectionActorLabel)
+      : cloudIdentityDisplayLabel(authState, connectionActorLabel));
+  const identityImageUrl =
+    normalizedSelfDisplayValue(selfDisplay?.imageUrl) ?? cloudIdentityImageUrl(authState);
+  const visibleRuntimePeerCount = Math.max(0, Math.floor(runtimePeerCount));
+  const hasRuntimePeer = visibleRuntimePeerCount > 0;
+  const attachmentIdleWake = workstationAttachment?.status === "idle";
   const attachmentConnected = workstationAttachmentIsConnected(workstationAttachment);
-  const attachmentExecutionAvailable = workstationAttachmentCanExecute(workstationAttachment);
+  const attachmentExecutionAvailable =
+    workstationAttachmentCanExecute(workstationAttachment) && hasRuntimePeer;
   const hasAttachmentSnapshot = workstationAttachment !== null;
   const effectiveRuntimeConnected = hasAttachmentSnapshot ? attachmentConnected : runtimeAvailable;
   const effectiveRuntimeAvailable = hasAttachmentSnapshot
-    ? attachmentExecutionAvailable
+    ? attachmentExecutionAvailable || attachmentIdleWake
     : runtimeAvailable;
   const auth = {
     canSignIn: !hasAppSession && authState.mode !== "oidc",
@@ -142,6 +165,7 @@ export function cloudNotebookShellCapabilities({
       runtimeAvailable: effectiveRuntimeAvailable,
       runtimePeerCount,
       kernelStatusLabel,
+      runtimeLastSeenAt,
       workstationAttachment,
       canChooseHostedWorkstation,
     }),
@@ -192,6 +216,7 @@ function cloudRuntimeTarget({
   runtimeAvailable,
   runtimePeerCount,
   kernelStatusLabel,
+  runtimeLastSeenAt,
   workstationAttachment,
   canChooseHostedWorkstation,
 }: {
@@ -199,6 +224,7 @@ function cloudRuntimeTarget({
   runtimeAvailable: boolean;
   runtimePeerCount: number;
   kernelStatusLabel: string | null;
+  runtimeLastSeenAt: string | null;
   workstationAttachment: WorkstationAttachmentState | null;
   canChooseHostedWorkstation: boolean;
 }): NotebookShellRuntimeTargetProjection {
@@ -215,11 +241,21 @@ function cloudRuntimeTarget({
       defaultEnvironmentLabel: "Runtime peer",
       environmentLabel: "Runtime peer",
       runtimePeerCount: visibleRuntimePeerCount || 1,
+      roomLink: {
+        status: "connected",
+        statusLabel: "Connected",
+        lastSeenAt: runtimeLastSeenAt,
+      },
     };
   }
   const attachmentTarget = projectNotebookRuntimeTargetFromWorkstationAttachment(
     workstationAttachment,
-    { runtimePeerCount: visibleRuntimePeerCount, kernelStatusLabel },
+    {
+      runtimePeerCount: visibleRuntimePeerCount,
+      kernelStatusLabel,
+      requireRuntimePeer: true,
+      runtimeLastSeenAt,
+    },
   );
   if (attachmentTarget) {
     return attachmentTarget;
@@ -237,6 +273,11 @@ function cloudRuntimeTarget({
       environmentLabel: "Current Python",
       kernelStatusLabel,
       runtimePeerCount: visibleRuntimePeerCount || 1,
+      roomLink: {
+        status: "connected",
+        statusLabel: "Connected",
+        lastSeenAt: runtimeLastSeenAt,
+      },
     };
   }
   return {
@@ -254,6 +295,12 @@ function cloudRuntimeTarget({
   };
 }
 
+/**
+ * Legacy fallback for the viewer's own label. Cloud callers should pass
+ * `selfDisplay.label` from CloudUserStore when it has a resolved profile,
+ * presence seed, or self seed; this remains the auth-claim fallback for the
+ * first frame and non-store callers.
+ */
 function cloudIdentityDisplayLabel(
   authState: CloudPrototypeAuthState,
   actorLabel?: string | null,
@@ -273,8 +320,17 @@ function cloudIdentityDisplayLabel(
   return looksLikeEmailAddress(user) ? cloudFriendlyPeerLabel({ actorLabel, email: user }) : user;
 }
 
+/**
+ * Legacy fallback for the viewer's own avatar. CloudUserStore's
+ * `selfDisplay.imageUrl` takes precedence when present so D1/profile upgrades
+ * and seeded self avatars flow through the same identity path.
+ */
 function cloudIdentityImageUrl(authState: CloudPrototypeAuthState): string | null {
   return authState.oidcClaims?.picture?.trim() || null;
+}
+
+function normalizedSelfDisplayValue(value: string | null | undefined): string | null {
+  return value?.trim() || null;
 }
 
 function looksLikeEmailAddress(value: string): boolean {

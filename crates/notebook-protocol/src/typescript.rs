@@ -21,9 +21,11 @@ pub const NOTEBOOK_REQUEST_TYPES: &[&str] = &[
     "run_all_cells",
     "run_all_cells_guarded",
     "send_comm",
+    "apply_bokeh_session_patch",
     "get_history",
     "complete",
     "save_notebook",
+    "reconcile_notebook_source",
     "clone_as_ephemeral",
     "sync_environment",
     "approve_trust",
@@ -45,12 +47,16 @@ pub const NOTEBOOK_RESPONSE_RESULTS: &[&str] = &[
     "guard_rejected",
     "all_cells_queued",
     "notebook_saved",
-    "save_error",
+    "notebook_already_current",
+    "notebook_save_blocked",
+    "notebook_source_reconciled",
+    "notebook_source_reconciliation_blocked",
     "notebook_cloned",
     "ok",
     "error",
     "history_result",
     "completion_result",
+    "bokeh_session_patch",
     "sync_environment_complete",
     "sync_environment_failed",
     "doc_bytes",
@@ -61,7 +67,7 @@ pub const NOTEBOOK_RESPONSE_RESULTS: &[&str] = &[
     "blob_upload_error",
 ];
 
-pub const SESSION_CONTROL_TYPES: &[&str] = &["sync_status"];
+pub const SESSION_CONTROL_TYPES: &[&str] = &["sync_status", "hosted_bridge_status"];
 pub const NOTEBOOK_DOC_PHASES: &[&str] = &["pending", "syncing", "interactive"];
 pub const RUNTIME_STATE_PHASES: &[&str] = &["pending", "syncing", "ready"];
 pub const INITIAL_LOAD_PHASES: &[&str] = &["not_needed", "streaming", "ready", "failed"];
@@ -74,6 +80,7 @@ const FRAME_TYPES: &[(&str, u8)] = &[
     ("PRESENCE", frame_types::PRESENCE),
     ("RUNTIME_STATE_SYNC", frame_types::RUNTIME_STATE_SYNC),
     ("COMMS_DOC_SYNC", frame_types::COMMS_DOC_SYNC),
+    ("COMMENTS_DOC_SYNC", frame_types::COMMENTS_DOC_SYNC),
     ("POOL_STATE_SYNC", frame_types::POOL_STATE_SYNC),
     ("SESSION_CONTROL", frame_types::SESSION_CONTROL),
     ("PUT_BLOB", frame_types::PUT_BLOB),
@@ -163,10 +170,6 @@ pub fn generated_request_types_ts() -> String {
     format!(
         r#"{GENERATED_HEADER}import type {{ QueueEntry }} from "./runtime-state";
 
-export interface GuardedNotebookProvenance {{
-  observed_heads: string[];
-}}
-
 export interface DependencyGuard {{
   observed_heads: string[];
 }}
@@ -230,6 +233,33 @@ export interface CommRequestMessage {{
   channel: string;
 }}
 
+export interface BokehSessionBufferRef {{
+  id: string;
+  blob: string;
+  size: number;
+  media_type: string;
+}}
+
+export interface BokehSessionPatchRequest {{
+  session_id: string;
+  transaction_id: string;
+  base_revision: number;
+  patch: Record<string, unknown>;
+  buffers?: Array<{{ id: string; data: number[] }}>;
+  buffer_refs?: BokehSessionBufferRef[];
+}}
+
+export type BokehSessionPatchReply =
+  | {{ status: "accepted"; session_id: string; transaction_id: string; revision: number }}
+  | {{ status: "stale"; session_id: string; transaction_id: string; revision: number }}
+  | {{
+      status: "error";
+      session_id: string;
+      transaction_id: string;
+      revision?: number | null;
+      error: string;
+    }};
+
 export interface BlobUploadPart {{
   part_number: number;
   sha256: string;
@@ -259,6 +289,7 @@ export type NotebookRequest =
       observed_heads: string[];
     }}
   | {{ type: "send_comm"; message: CommRequestMessage }}
+  | {{ type: "apply_bokeh_session_patch"; request: BokehSessionPatchRequest }}
   | {{
       type: "get_history";
       /** Glob-style pattern to match. null for no filter. */
@@ -276,6 +307,7 @@ export type NotebookRequest =
       /** Target path. Omit or null to save in place. */
       path?: string | null;
     }}
+  | {{ type: "reconcile_notebook_source"; operation: SourceReconciliation }}
   | {{ type: "clone_as_ephemeral"; source_notebook_id: string }}
   | {{ type: "sync_environment"; guard?: DependencyGuard | null }}
   | {{ type: "approve_trust"; observed_heads?: string[] | null }}
@@ -333,8 +365,38 @@ export type NotebookResponse =
   | {{ result: "no_kernel" }}
   | {{ result: "guard_rejected"; reason: string }}
   | {{ result: "all_cells_queued"; queued: QueueEntry[] }}
-  | {{ result: "notebook_saved"; path: string }}
-  | {{ result: "save_error"; error: SaveErrorKind }}
+  | {{
+      result: "notebook_saved";
+      path: string;
+      exported_heads: string[];
+      save_sequence: number;
+    }}
+  | {{
+      result: "notebook_already_current";
+      path: string;
+      exported_heads: string[];
+      save_sequence: number;
+    }}
+  | {{
+      result: "notebook_save_blocked";
+      path?: string | null;
+      save_sequence?: number | null;
+      reason: SaveBlockedReason;
+    }}
+  | {{
+      result: "notebook_source_reconciled";
+      operation: SourceReconciliationOperation;
+      path: string;
+      archived_journal?: string | null;
+      exported_heads: string[];
+      save_sequence: number;
+      source_generation: number;
+    }}
+  | {{
+      result: "notebook_source_reconciliation_blocked";
+      operation: SourceReconciliationOperation;
+      reason: SourceReconciliationBlockedReason;
+    }}
   | {{ result: "notebook_cloned"; notebook_id: string; working_dir?: string | null }}
   | {{ result: "ok" }}
   | {{ result: "error"; error: string }}
@@ -345,6 +407,7 @@ export type NotebookResponse =
       cursor_start: number;
       cursor_end: number;
     }}
+  | {{ result: "bokeh_session_patch"; reply: BokehSessionPatchReply }}
   | {{ result: "sync_environment_complete"; synced_packages: string[] }}
   | {{ result: "sync_environment_failed"; error: string; needs_restart: boolean }}
   | {{ result: "doc_bytes"; bytes: number[] }}
@@ -354,19 +417,35 @@ export type NotebookResponse =
   | {{ result: "blob_upload_aborted"; upload_id: string }}
   | {{ result: "blob_upload_error"; reason: BlobUploadErrorKind }};
 
-/**
- * Structured save failures returned in `NotebookResponse::SaveError`.
- * Mirrors `notebook_protocol::protocol::SaveErrorKind`.
- */
-export type SaveErrorKind =
-  | {{
-      type: "path_already_open";
-      /** UUID of the room that currently holds this path. */
-      uuid: string;
-      /** The conflicting path. */
-      path: string;
-    }}
+/** A save request that did not commit a file checkpoint. */
+export type SaveBlockedReason =
+  | {{ type: "path_already_open"; uuid: string; path: string }}
+  | {{ type: "sequence_exhausted" }}
+  | {{ type: "superseded"; latest_sequence: number }}
+  | {{ type: "source_conflict"; message: string }}
+  | {{ type: "source_degraded"; message: string }}
   | {{ type: "io"; message: string }};
+
+/** A deliberate policy for resolving recovered state against its disk source. */
+export type SourceReconciliation =
+  | {{ type: "save_recovered_as"; path: string }}
+  | {{ type: "keep_recovered_and_overwrite_source" }}
+  | {{ type: "archive_recovery_and_reload_source" }};
+
+export type SourceReconciliationOperation =
+  | "save_recovered_as"
+  | "keep_recovered_and_overwrite_source"
+  | "archive_recovery_and_reload_source";
+
+export type SourceReconciliationBlockedReason =
+  | {{ type: "not_required"; message: string }}
+  | {{ type: "busy" }}
+  | {{ type: "no_bound_source" }}
+  | {{ type: "target_must_differ"; bound_path: string; requested_path: string }}
+  | {{ type: "path_already_open"; uuid: string; path: string }}
+  | {{ type: "invalid_source"; message: string }}
+  | {{ type: "io"; message: string }}
+  | {{ type: "save"; reason: SaveBlockedReason }};
 
 export type BlobUploadErrorKind =
   | {{ kind: "size_mismatch" }}
@@ -394,9 +473,10 @@ export type BlobDurability = "durable" | "ephemeral";
 /// `ConnectionScope` method it mirrors.
 type ScopeCapabilityRow = (&'static str, &'static str, fn(ConnectionScope) -> bool);
 
-/// Capability predicates exported to TypeScript, each row generated from the
-/// corresponding `ConnectionScope` method so the hosted room and the daemon
-/// evaluate the same lattice (punchlist HCA-2 / BS-12).
+/// Capability predicates exported to TypeScript for hosted room connections.
+/// Local daemon connections share the same scope model, but use a local-only
+/// blob-upload predicate so same-UID editor attachments keep working until
+/// hosted editor uploads ship with reference-path validation.
 const SCOPE_CAPABILITIES: &[ScopeCapabilityRow] = &[
     (
         "allowsNotebookWrite",
@@ -410,7 +490,7 @@ const SCOPE_CAPABILITIES: &[ScopeCapabilityRow] = &[
     ),
     (
         "allowsBlobUpload",
-        "upload blobs (PUT_BLOB frames and multipart upload requests)",
+        "upload blobs on hosted room connections (PUT_BLOB frames and multipart upload requests)",
         ConnectionScope::allows_blob_upload,
     ),
     (
@@ -502,6 +582,7 @@ export function parseConnectionScope(value: string): ConnectionScope {{
 pub fn generated_protocol_contract_ts() -> String {
     format!(
         r#"{GENERATED_HEADER}import type {{
+  HostedBridgeStatus,
   InitialLoadPhase,
   NotebookDocPhase,
   RuntimeStatePhase,
@@ -536,7 +617,9 @@ export const NOTEBOOK_RESPONSE_RESULTS_EXHAUSTIVE: MissingUnionMember<
   ? true
   : never = true;
 
-export type SessionControlMessage = {{ type: "sync_status" }} & SessionStatus;
+export type SessionControlMessage =
+  | ({{ type: "sync_status" }} & SessionStatus)
+  | {{ type: "hosted_bridge_status"; status: HostedBridgeStatus }};
 
 export const SESSION_CONTROL_TYPES = [
 {}

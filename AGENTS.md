@@ -2,7 +2,10 @@
 
 <!-- This file is canonical. CLAUDE.md is a symlink to AGENTS.md. -->
 
-This is a map. Subsystem details live in nested `AGENTS.md` files next to code, auto-loaded rules live in `.claude/rules/`, and repository skills live in `.agents/skills/`. Claude reads the same skills through the `.claude/skills` symlink. Run `cargo xtask help` for build commands.
+Subsystem details live in nested `AGENTS.md` files next to code, auto-loaded
+rules live in `.claude/rules/`, and repository skills live in `.agents/skills/`.
+Claude reads the same skills through the `.claude/skills` symlink. Run
+`cargo xtask help` for build commands.
 
 ## Project positioning
 
@@ -22,46 +25,62 @@ work as a Draft ADR just because it mentions architecture. Graduate durable
 technical decisions to `docs/adr/`, durable product requirements to `docs/prd/`,
 scoped execution work to `docs/plans/`, evidence and follow-up lists to
 `docs/audits/`, benchmark evidence to `docs/measurements/`, operational
-procedures to `docs/runbooks/`, and time-bound transfer notes to
-`docs/handoffs/`.
+procedures to `docs/runbooks/`.
 
-## Skills
+## Design system and Elements
 
-Use `.agents/skills/` when the task matches:
-- `architecture` — docs taxonomy, ADR/memo/PRD placement, cross-cutting architecture, and source-grounded proposal work
-- `automerge-sync` — sync protocol internals, document model, reconnection, peer state, in-flight suppression, protocol design patterns, convergence debugging
-- `daemon-dev` — daemon development, Python bindings, build system, kernel debugging, xtask workflows
-- `execution-pipeline` — end-to-end cell execution: required_heads → ExecuteCell → CellQueued → RuntimeStateDoc polling → output-sync grace → output resolution
-- `frontend-dev` — frontend development, TypeScript bindings (ts-rs), UI iteration workflows
-- `mcp-session-lifecycle` — MCP proxy supervision, daemon watch loop, session state, rejoin/reconnect races, room eviction
-- `pr-reviewer` — opencode-backed Bedrock PR reviews with isolated worktrees and structured findings
-- `releasing` — version bumps, tag conventions, release procedures
-- `testing` — choosing test strategies, running verification, E2E, diagnostics collection
+For UI, design-system, or product-surface work, start with the
+`frontend-dev` repo skill and `apps/elements/content/docs/index.mdx` before
+editing app code. This includes Elements, cloud dashboard, notebook shell,
+toolbar, cells, output rendering, comments, runtime/package UI, search, themes,
+and shared components.
 
-## Subsystem guides
+Treat `apps/elements` as the stable review artifact layer for visual notebook
+surfaces. The catalog details live in the Elements docs and `frontend-dev`
+skill, not in this top-level routing file.
 
-| Topic | Doc |
-|------|-----|
-| Architecture + daemon | `crates/runtimed/AGENTS.md` |
-| Frontend architecture | `apps/notebook/src/AGENTS.md` |
-| Hosted cloud rooms | `apps/notebook-cloud/AGENTS.md` |
-| UI components (Shadcn + nteract) | `src/components/ui/AGENTS.md` |
-| Wire protocol & sync | `crates/notebook-wire/AGENTS.md` |
-| Widgets | `src/components/widgets/AGENTS.md` |
-| Environments / trust | `crates/kernel-env/AGENTS.md` |
-| Iframe sandbox & renderer plugins | `src/components/isolated/AGENTS.md` |
-| CRDT mutation rules | `crates/notebook-doc/AGENTS.md` |
-| Logging | `.claude/rules/logging.md` |
+Then read the nested ownership rules for the code you will touch:
+`apps/notebook/src/AGENTS.md` for desktop/shared notebook app wiring,
+`apps/notebook-cloud/AGENTS.md` for hosted cloud shell, authority, and viewer
+boundaries, and `src/components/ui/AGENTS.md` for shared UI, cell, editor, and
+output primitives. For notebook shell convergence, also read
+`docs/adr/notebook-host-shell-convergence.md`.
+
+Use those files to keep cloud app chrome separate from the shared notebook
+shell. Host-specific auth, ACL, sharing, workstation, routing, and side-effect
+boundaries should not fork common notebook presentation without an explicit
+reason.
+
+## Frontend reactive state and RxJS
+
+For RxJS, shared-store, `useSyncExternalStore`, or WASM-backed projection work,
+start with the `frontend-dev` repo skill and
+`docs/adr/frontend-sync-bridge.md`. This includes
+`packages/runtimed/src/sync-engine.ts`, `packages/runtimed/src/*store*.ts`,
+`packages/runtimed/src/observable-store.ts`, `packages/runtimed/src/poll.ts`,
+`src/components/notebook/state/*`, `apps/notebook/src/lib/notebook-sync-store-bridge.ts`,
+`apps/notebook-cloud/viewer/*store*.ts`,
+`apps/notebook-cloud/viewer/use-cloud-*-store.ts`, and
+`apps/notebook-cloud/viewer/browser-signals.ts`.
+
+Use the durable owner first: Automerge documents, RuntimeStateDoc, CommsDoc,
+CommentsDoc, or host-owned API/session facts. React state is local UI state,
+not a second source of truth. Keep RxJS sources private, expose readonly
+observables or named domain hooks, and test timers/cancellation with virtual
+time. Any async path that writes into a store after `await` must prove the
+current handle/session/auth/endpoint still matches or carry an activation
+epoch that invalidates stale completions.
 
 ## MCP servers
 
 Three may be visible. Pick by purpose. Full details in `.claude/rules/mcp-servers.md` (auto-loaded everywhere).
 
-- **`nteract-dev`** — default for development. Per-worktree dev daemon, dev tools (`up`, `down`, `status`, `logs`, `vite_logs`) plus 26 proxied notebook tools. Prefer `up` over manual `cargo xtask dev-daemon`.
+- **`nteract-dev`** — default for development. Per-worktree dev daemon. Owner/isolated mode exposes dev tools (`up`, `down`, `status`, `logs`, `vite_logs`); attach mode (Codex) exposes read-only supervisor tools (`status`, `logs`, `vite_logs`) plus proxied notebook tools. Prefer `up` over manual `cargo xtask dev-daemon`.
 - **`nteract-nightly`** — system nightly daemon. Diagnostics only.
 - **`nteract`** — system stable daemon. Diagnostics only.
+- **Codex plugin notebook servers** (`nteract-notebook`, `nightly`, or older `notebook` tool names) — installed release/plugin surfaces. Diagnostics only for source work; they may attach to a different active notebook than the local Browser/Vite app.
 
-If `nteract-dev` is unavailable, fall back to `cargo xtask` (derives the worktree env on its own). Use system MCP servers only for diagnostics.
+If `nteract-dev` is unavailable, fall back to `cargo xtask` (derives the worktree env on its own). Use system or installed plugin MCP servers only for diagnostics.
 
 ## Required before commit
 
@@ -79,7 +98,7 @@ Types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `build`, `perf`
 
 ## Load-bearing invariants
 
-Most invariants auto-load from `.claude/rules/*.md` and nested `AGENTS.md` files when you edit matching paths. Two that don't fit any path scope:
+Most invariants auto-load from `.claude/rules/*.md` and nested `AGENTS.md` files when you edit matching paths. A few that don't fit any path scope:
 
 ### Tokio mutex guards stay within synchronous blocks
 

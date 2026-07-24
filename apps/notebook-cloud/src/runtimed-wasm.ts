@@ -11,6 +11,9 @@ import initWasm, {
   RuntimeStatePeerHandle,
 } from "../../notebook/src/wasm/runtimed-wasm/runtimed_wasm.js";
 
+export type RuntimedWasmModule =
+  typeof import("../../notebook/src/wasm/runtimed-wasm/runtimed_wasm.js");
+
 let initialized: Promise<void> | undefined;
 
 type RuntimedWasmInitInput = Parameters<typeof initWasm>[0];
@@ -182,11 +185,15 @@ export async function loadRoomHostSnapshot(
   notebookBytes: Uint8Array,
   runtimeStateBytes: Uint8Array,
   commsBytes?: Uint8Array,
+  commentsBytes?: Uint8Array,
 ): Promise<RoomHostHandle> {
   await initializeRuntimedWasm();
   const host = RoomHostHandle.load_snapshot(notebookBytes, runtimeStateBytes);
   if (commsBytes) {
     host.load_comms_doc(commsBytes);
+  }
+  if (commentsBytes) {
+    host.load_comments_doc(commentsBytes);
   }
   return host;
 }

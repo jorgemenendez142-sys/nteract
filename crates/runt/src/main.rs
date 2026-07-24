@@ -2,12 +2,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 extern crate runtimed_client as runtimed;
+mod cloud_cli;
 mod notebook_cli;
 mod workstation_cli;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
+use std::future::Future;
 use std::time::Duration;
 use tabled::{settings::Style, Table, Tabled};
 
@@ -178,6 +180,11 @@ enum Commands {
     Nb {
         #[command(subcommand)]
         command: Box<notebook_cli::NotebookCommands>,
+    },
+    /// Hosted cloud notebooks via the daemon-mediated bridge
+    Cloud {
+        #[command(subcommand)]
+        command: cloud_cli::CloudCommands,
     },
     /// Offer this machine's compute to hosted notebooks (pair, run, status)
     Workstation {
@@ -564,6 +571,7 @@ async fn async_main(command: Option<Commands>) -> Result<()> {
         }
         Some(Commands::Diagnostics { output }) => diagnostics_command(output).await?,
         Some(Commands::Nb { command }) => notebook_cli::command(*command).await?,
+        Some(Commands::Cloud { command }) => cloud_cli::command(command).await?,
         Some(Commands::Workstation { command }) => workstation_cli::command(command).await?,
         Some(Commands::Config { command }) => config_command(command).await?,
         Some(Commands::Mcp { no_show, socket }) => {
@@ -739,6 +747,7 @@ async fn run_mcp_server(no_show: bool) -> Result<()> {
     // Grab shared state handles before serving (serve consumes the server)
     let session = server.session().clone();
     let session_for_shutdown = session.clone();
+    let session_intent_epoch = server.session_intent_epoch().clone();
     let peer_label = server.peer_label_shared().clone();
     let last_session_drop = server.last_session_drop().clone();
     let parked_sessions = server.parked_sessions().clone();
@@ -766,6 +775,7 @@ async fn run_mcp_server(no_show: bool) -> Result<()> {
             peer_label,
             last_session_drop,
             parked_sessions,
+            session_intent_epoch,
         )
         .await
     });
@@ -970,9 +980,9 @@ async fn pool_command(command: PoolCommands) -> Result<()> {
 
             match query_daemon_info(runt_workspace::default_socket_path()).await {
                 Some(info) => {
-                    // Ping the daemon at the endpoint recorded in daemon.json,
-                    // not the default socket path — the daemon may have been
-                    // started with a custom --socket.
+                    // Ping the daemon at the endpoint returned by
+                    // GetDaemonInfo, not the default socket path — the daemon
+                    // may have been started with a custom --socket.
                     let info_client = PoolClient::new(std::path::PathBuf::from(&info.endpoint));
                     let alive = info_client.ping().await.is_ok();
 
@@ -1007,7 +1017,7 @@ async fn pool_command(command: PoolCommands) -> Result<()> {
                     }
                 }
                 None => {
-                    eprintln!("Daemon not running (no daemon.json found)");
+                    eprintln!("Daemon not running (daemon info unavailable)");
                     std::process::exit(1);
                 }
             }
@@ -1182,12 +1192,12 @@ async fn stop_process_by_pid(_pid: u32) -> Result<()> {
 
 /// Clean up stale daemon info files.
 fn cleanup_stale_daemon_info() -> Result<()> {
-    use runtimed::singleton::{daemon_info_path, daemon_lock_path};
+    use runtimed::singleton::daemon_lock_path;
 
-    let info_path = daemon_info_path();
+    let info_path = legacy_daemon_info_path();
     if info_path.exists() {
         std::fs::remove_file(&info_path)?;
-        println!("Cleaned up stale daemon.json");
+        println!("Cleaned up legacy daemon.json");
     }
 
     let lock_path = daemon_lock_path();
@@ -1197,6 +1207,116 @@ fn cleanup_stale_daemon_info() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn legacy_daemon_info_path() -> PathBuf {
+    runt_workspace::daemon_base_dir().join("daemon.json")
+}
+
+const DAEMON_START_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_START_CONFIRM_INTERVAL: Duration = Duration::from_millis(250);
+const DAEMON_START_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonStartupStatus {
+    Running,
+    NotRunning { detail: String },
+}
+
+impl DaemonStartupStatus {
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Running => "running",
+            Self::NotRunning { detail } => detail,
+        }
+    }
+}
+
+async fn probe_daemon_startup_status() -> DaemonStartupStatus {
+    let socket_path = runt_workspace::default_socket_path();
+    let daemon_info = tokio::time::timeout(
+        DAEMON_START_PROBE_TIMEOUT,
+        runtimed_client::singleton::query_daemon_info(socket_path.clone()),
+    )
+    .await;
+
+    let Some(info) = (match daemon_info {
+        Ok(info) => info,
+        Err(_) => {
+            return DaemonStartupStatus::NotRunning {
+                detail: format!(
+                    "timed out waiting for daemon info on {}",
+                    shorten_path(&socket_path)
+                ),
+            };
+        }
+    }) else {
+        return DaemonStartupStatus::NotRunning {
+            detail: format!(
+                "daemon socket {} did not return live daemon info",
+                shorten_path(&socket_path)
+            ),
+        };
+    };
+
+    let client = runtimed::client::PoolClient::new(PathBuf::from(&info.endpoint));
+    match tokio::time::timeout(DAEMON_START_PROBE_TIMEOUT, client.ping_version()).await {
+        Ok(Ok(_)) => DaemonStartupStatus::Running,
+        Ok(Err(error)) => DaemonStartupStatus::NotRunning {
+            detail: format!("daemon at {} did not answer ping: {error}", info.endpoint),
+        },
+        Err(_) => DaemonStartupStatus::NotRunning {
+            detail: format!("timed out pinging daemon at {}", info.endpoint),
+        },
+    }
+}
+
+async fn wait_for_daemon_start_confirmation<F, Fut>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut status_probe: F,
+) -> DaemonStartupStatus
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = DaemonStartupStatus>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let status = status_probe().await;
+        if status.is_running() || tokio::time::Instant::now() >= deadline {
+            return status;
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let sleep_for = if poll_interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            poll_interval.min(remaining)
+        };
+        tokio::time::sleep(sleep_for).await;
+    }
+}
+
+async fn confirm_daemon_started() -> Result<()> {
+    match wait_for_daemon_start_confirmation(
+        DAEMON_START_CONFIRM_TIMEOUT,
+        DAEMON_START_CONFIRM_INTERVAL,
+        probe_daemon_startup_status,
+    )
+    .await
+    {
+        DaemonStartupStatus::Running => Ok(()),
+        status => Err(anyhow::anyhow!(
+            "daemon did not become ready within {}s: {}",
+            DAEMON_START_CONFIRM_TIMEOUT.as_secs(),
+            status.detail()
+        )),
+    }
 }
 
 /// Three-step hybrid stop: socket shutdown → service manager → signal escalation.
@@ -1212,12 +1332,8 @@ async fn stop_daemon_smart(
             Ok(Ok(())) => {
                 // Shutdown request succeeded, wait for daemon to exit
                 if wait_for_pid_exit(info.pid, Duration::from_secs(5)).await {
-                    // Give Drop handler a moment to clean up daemon.json
+                    // Give the daemon a moment to release its lock.
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    // Verify cleanup (defensive - prevents PID reuse if Drop didn't run)
-                    if runtimed::singleton::daemon_info_path().exists() {
-                        cleanup_stale_daemon_info().ok();
-                    }
                     println!("Daemon stopped gracefully.");
                     return Ok(());
                 } else {
@@ -1250,7 +1366,7 @@ async fn stop_daemon_smart(
                     // Process still running, fall through to signal escalation
                     eprintln!("Warning: Service manager stop succeeded but daemon still running (orphaned?)");
                 } else {
-                    // No daemon.json, assume success
+                    // No socket metadata, assume success
                     println!("Service manager stop completed.");
                     return Ok(());
                 }
@@ -1289,7 +1405,7 @@ async fn stop_daemon_smart(
             }
         }
     } else {
-        // No daemon.json and service manager stop didn't help
+        // No socket metadata and service manager stop didn't help
         println!("No daemon info found, assuming daemon is stopped.");
         Ok(())
     }
@@ -1304,10 +1420,8 @@ async fn daemon_command(command: DaemonCommands) -> Result<()> {
     let mut manager = ServiceManager::default();
 
     // Get daemon info first so we can use its endpoint for the client.
-    // Prefer the socket (`GetDaemonInfo`) over the legacy `daemon.json`
-    // sidecar — the daemon answers from live state, so a response is
-    // proof the daemon is alive. `query_daemon_info` retains the
-    // file-read fallback for the one-release compat window.
+    // Query live daemon metadata over the socket. A response proves the daemon
+    // is alive and avoids stale sidecar state after crashes or force-kills.
     let daemon_info = query_daemon_info(runt_workspace::default_socket_path()).await;
 
     // Create client using daemon's actual endpoint if available, otherwise default
@@ -1320,7 +1434,7 @@ async fn daemon_command(command: DaemonCommands) -> Result<()> {
         DaemonCommands::Status { json } => {
             let installed = manager.is_installed();
             let pong_info = if daemon_info.is_some() {
-                // Use timeout to prevent hanging on stale daemon.json
+                // Use a timeout so a disappearing daemon cannot hang status.
                 tokio::time::timeout(Duration::from_secs(3), client.ping_version())
                     .await
                     .ok()
@@ -1548,6 +1662,10 @@ async fn daemon_command(command: DaemonCommands) -> Result<()> {
                 runt_workspace::daemon_service_basename()
             );
             manager.start()?;
+            if let Err(e) = confirm_daemon_started().await {
+                eprintln!("Failed to start daemon: {e}");
+                std::process::exit(1);
+            }
             println!("Service started.");
         }
         DaemonCommands::Stop => {
@@ -1608,6 +1726,10 @@ async fn daemon_command(command: DaemonCommands) -> Result<()> {
 
             // Start via service manager
             manager.start()?;
+            if let Err(e) = confirm_daemon_started().await {
+                eprintln!("Failed to restart daemon: {e}");
+                std::process::exit(1);
+            }
             println!("Service restarted.");
         }
         DaemonCommands::Install { binary } => {
@@ -1801,7 +1923,6 @@ async fn doctor_command(
         #[cfg(not(target_os = "macos"))]
         let binary_path = runtimed_service::default_binary_path();
         let socket_path = runt_workspace::default_socket_path();
-        let daemon_json_path = runtimed::singleton::daemon_info_path();
         let service_config_path = runtimed_service::service_config_path();
 
         // Check 1: Installed binary
@@ -2112,7 +2233,7 @@ async fn doctor_command(
             detail: None,
         };
 
-        // Check 4: daemon.json state
+        // Check 4: live daemon metadata from the socket
         let (daemon_state_status, daemon_state_detail) = if let Some(info) = daemon_info {
             // Check if PID is actually running
             let pid_running = is_process_running(info.pid);
@@ -2128,7 +2249,7 @@ async fn doctor_command(
             ("missing".to_string(), None)
         };
         let daemon_state = CheckResult {
-            path: shorten_path(&daemon_json_path),
+            path: shorten_path(&socket_path),
             status: daemon_state_status.clone(),
             detail: daemon_state_detail,
         };
@@ -2210,7 +2331,7 @@ async fn doctor_command(
             }
         };
 
-        // Check 6: Can we ping the daemon? Try regardless of daemon.json state
+        // Check 6: Can we ping the daemon? Try regardless of metadata state.
         let daemon_running_result = tokio::time::timeout(Duration::from_secs(2), client.ping())
             .await
             .map(|r| r.is_ok())
@@ -2225,7 +2346,7 @@ async fn doctor_command(
             }
             .to_string(),
             detail: if daemon_running_result && daemon_state_status == "missing" {
-                Some("running but daemon.json missing".to_string())
+                Some("running but daemon info unavailable".to_string())
             } else {
                 None
             },
@@ -2328,7 +2449,6 @@ async fn doctor_command(
     #[cfg(not(target_os = "macos"))]
     let binary_path = runtimed_service::default_binary_path();
     let socket_path = runt_workspace::default_socket_path();
-    let daemon_json_path = runtimed::singleton::daemon_info_path();
     let service_config_path = runtimed_service::service_config_path();
 
     let binary_exists = binary_path.exists();
@@ -2408,24 +2528,13 @@ async fn doctor_command(
     // Fix issues if requested
     if fix {
         // Clean up stale state
-        if daemon_state_status == "stale" {
-            if let Err(e) = std::fs::remove_file(&daemon_json_path) {
+        if daemon_state_status == "stale" && socket_exists {
+            if let Err(e) = std::fs::remove_file(&socket_path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("Warning: Could not remove stale daemon.json: {}", e);
+                    eprintln!("Warning: Could not remove stale socket: {}", e);
                 }
             } else {
-                actions_taken.push("Removed stale daemon.json".to_string());
-            }
-
-            // Also remove stale socket
-            if socket_exists {
-                if let Err(e) = std::fs::remove_file(&socket_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        eprintln!("Warning: Could not remove stale socket: {}", e);
-                    }
-                } else {
-                    actions_taken.push("Removed stale socket file".to_string());
-                }
+                actions_taken.push("Removed stale socket file".to_string());
             }
         }
 
@@ -2612,7 +2721,12 @@ async fn doctor_command(
                     }
                 } else if !manager.is_installed() {
                     // Fresh install needed
-                    match manager.install(bundled_path) {
+                    let result = if no_start {
+                        manager.install_no_start(bundled_path)
+                    } else {
+                        manager.install(bundled_path)
+                    };
+                    match result {
                         Ok(()) => {
                             actions_taken
                                 .push(format!("Installed daemon from {}", bundled_path.display()));
@@ -2633,11 +2747,10 @@ async fn doctor_command(
 
         // Start if installed but not running.
         //
-        // Skipped when --no-start is set. The NSIS post-install hook passes
-        // --no-start so the daemon binary and startup script are written to
-        // disk without spawning a long-running child inside the installer's
-        // Windows Job Object. The daemon will start automatically at next
-        // login via the Startup folder entry that create_service_config() writes.
+        // Skipped when --no-start is set. The NSIS post-install hook uses this
+        // to avoid spawning a long-running child inside the installer's Windows
+        // Job Object, while Linux packaging smokes use it to stage daemon files
+        // without requiring a live user systemd session.
         if manager.is_installed() && !daemon_running_before && !no_start {
             match manager.start() {
                 Ok(()) => {
@@ -2906,18 +3019,16 @@ fn get_binary_version(path: &Path) -> Option<String> {
 
 /// Find bundled runtimed binary in common app locations
 fn find_bundled_runtimed() -> Option<PathBuf> {
-    let binary_name = if cfg!(windows) {
-        "runtimed.exe"
-    } else {
-        "runtimed"
-    };
+    let binary_names = bundled_runtimed_binary_names();
 
     // Check if we're running from within an app bundle
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(parent) = current_exe.parent() {
-            let sibling = parent.join(binary_name);
-            if sibling.exists() {
-                return Some(sibling);
+            for binary_name in &binary_names {
+                let sibling = parent.join(binary_name);
+                if sibling.exists() {
+                    return Some(sibling);
+                }
             }
         }
     }
@@ -2927,12 +3038,14 @@ fn find_bundled_runtimed() -> Option<PathBuf> {
     {
         let mut locations = Vec::new();
         for app_name in runt_workspace::desktop_app_launch_candidates() {
-            locations.push(PathBuf::from(format!(
-                "/Applications/{app_name}.app/Contents/MacOS/{binary_name}"
-            )));
-            locations.push(dirs::home_dir().unwrap_or_default().join(format!(
-                "Applications/{app_name}.app/Contents/MacOS/{binary_name}"
-            )));
+            for binary_name in &binary_names {
+                locations.push(PathBuf::from(format!(
+                    "/Applications/{app_name}.app/Contents/MacOS/{binary_name}"
+                )));
+                locations.push(dirs::home_dir().unwrap_or_default().join(format!(
+                    "Applications/{app_name}.app/Contents/MacOS/{binary_name}"
+                )));
+            }
         }
         for path in &locations {
             if path.exists() {
@@ -2946,13 +3059,28 @@ fn find_bundled_runtimed() -> Option<PathBuf> {
     {
         let mut locations = Vec::new();
         for app_name in runt_workspace::desktop_app_launch_candidates() {
-            locations.push(PathBuf::from(format!(
-                "/usr/share/{app_name}/{binary_name}"
-            )));
-            locations.push(PathBuf::from(format!("/opt/{app_name}/{binary_name}")));
+            for binary_name in &binary_names {
+                locations.push(PathBuf::from(format!(
+                    "/usr/share/{app_name}/{binary_name}"
+                )));
+                locations.push(PathBuf::from(format!("/opt/{app_name}/{binary_name}")));
+            }
+        }
+        if let Some(data_dir) = dirs::data_dir() {
+            for binary_name in &binary_names {
+                locations.push(
+                    data_dir
+                        .join("nteract")
+                        .join(runt_workspace::channel_display_name())
+                        .join("bin")
+                        .join(binary_name),
+                );
+            }
         }
         // AppImage extracts to /tmp, check common paths
-        locations.push(PathBuf::from(format!("/usr/local/bin/{binary_name}")));
+        for binary_name in &binary_names {
+            locations.push(PathBuf::from(format!("/usr/local/bin/{binary_name}")));
+        }
         for path in &locations {
             if path.exists() {
                 return Some(path.clone());
@@ -2965,19 +3093,21 @@ fn find_bundled_runtimed() -> Option<PathBuf> {
     {
         let mut locations = Vec::new();
         for app_name in runt_workspace::desktop_app_launch_candidates() {
-            locations.push(
-                dirs::data_local_dir()
-                    .unwrap_or_default()
-                    .join("Programs")
-                    .join(app_name)
-                    .join(binary_name),
-            );
-            locations.push(PathBuf::from(format!(
-                "C:\\Program Files\\{app_name}\\{binary_name}"
-            )));
-            locations.push(PathBuf::from(format!(
-                "C:\\Program Files (x86)\\{app_name}\\{binary_name}"
-            )));
+            for binary_name in &binary_names {
+                locations.push(
+                    dirs::data_local_dir()
+                        .unwrap_or_default()
+                        .join("Programs")
+                        .join(app_name)
+                        .join(binary_name),
+                );
+                locations.push(PathBuf::from(format!(
+                    "C:\\Program Files\\{app_name}\\{binary_name}"
+                )));
+                locations.push(PathBuf::from(format!(
+                    "C:\\Program Files (x86)\\{app_name}\\{binary_name}"
+                )));
+            }
         }
         for path in &locations {
             if path.exists() {
@@ -2987,6 +3117,25 @@ fn find_bundled_runtimed() -> Option<PathBuf> {
     }
 
     None
+}
+
+fn bundled_runtimed_binary_names() -> Vec<String> {
+    let primary = if cfg!(windows) {
+        format!("{}.exe", runt_workspace::daemon_binary_basename())
+    } else {
+        runt_workspace::daemon_binary_basename().to_string()
+    };
+    let legacy = if cfg!(windows) {
+        "runtimed.exe".to_string()
+    } else {
+        "runtimed".to_string()
+    };
+
+    if primary == legacy {
+        vec![primary]
+    } else {
+        vec![primary, legacy]
+    }
 }
 
 // ============================================================================
@@ -3335,8 +3484,6 @@ async fn tail_log_file(path: &PathBuf, lines: usize, follow: bool) -> Result<()>
 
 /// List all running dev worktree daemons
 async fn list_worktree_daemons(json_output: bool) -> Result<()> {
-    use runtimed::client::PoolClient;
-    use runtimed::singleton::read_daemon_info;
     use serde::Serialize;
 
     let worktrees_dir = dirs::cache_dir()
@@ -3369,27 +3516,17 @@ async fn list_worktree_daemons(json_output: bool) -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            let info_path = path.join("daemon.json");
-
-            if let Some(info) = read_daemon_info(&info_path) {
-                // Check if daemon is actually running
-                let client = PoolClient::new(PathBuf::from(&info.endpoint));
-                let alive = client.ping().await.is_ok();
-
+            let socket_path = path.join("runtimed.sock");
+            if let Some(info) = runtimed::singleton::query_daemon_info(socket_path).await {
                 daemons.push(WorktreeDaemon {
                     hash,
-                    status: if alive {
-                        "running".to_string()
-                    } else {
-                        "stopped".to_string()
-                    },
+                    status: "running".to_string(),
                     worktree: info.worktree_path,
                     description: info.workspace_description,
-                    pid: if alive { Some(info.pid) } else { None },
-                    version: if alive { Some(info.version) } else { None },
+                    pid: Some(info.pid),
+                    version: Some(info.version),
                 });
             } else {
-                // Directory exists but no daemon.json
                 daemons.push(WorktreeDaemon {
                     hash,
                     status: "stopped".to_string(),
@@ -3455,7 +3592,6 @@ async fn clean_worktree_command(
     dry_run: bool,
 ) -> Result<()> {
     use runtimed::client::PoolClient;
-    use runtimed::singleton::read_daemon_info;
     use std::io::{self, Write};
 
     let worktrees_dir = dirs::cache_dir()
@@ -3548,18 +3684,10 @@ async fn clean_worktree_command(
 
     // Check daemon status and calculate sizes for each target
     for target in &mut targets {
-        // Read daemon info
-        let info_path = target.path.join("daemon.json");
-        if let Some(info) = read_daemon_info(&info_path) {
+        let socket_path = target.path.join("runtimed.sock");
+        if let Some(info) = runtimed::singleton::query_daemon_info(socket_path).await {
             target.worktree_path = info.worktree_path.clone();
-
-            // Try to ping the daemon
-            let client = PoolClient::new(PathBuf::from(&info.endpoint));
-            target.is_running =
-                tokio::time::timeout(std::time::Duration::from_secs(2), client.ping())
-                    .await
-                    .map(|r| r.is_ok())
-                    .unwrap_or(false);
+            target.is_running = true;
 
             // Check if stale (original path no longer exists)
             if let Some(ref wt_path) = target.worktree_path {
@@ -3601,9 +3729,12 @@ async fn clean_worktree_command(
     if force {
         for target in &targets {
             if target.is_running {
-                let info_path = target.path.join("daemon.json");
-                if let Some(info) = read_daemon_info(&info_path) {
-                    let client = PoolClient::new(PathBuf::from(&info.endpoint));
+                let socket_path = target.path.join("runtimed.sock");
+                if runtimed::singleton::query_daemon_info(socket_path.clone())
+                    .await
+                    .is_some()
+                {
+                    let client = PoolClient::new(socket_path);
                     print!("Stopping daemon {}... ", target.hash);
                     io::stdout().flush()?;
                     match client.shutdown().await {
@@ -4759,6 +4890,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bundled_runtimed_binary_names_try_channel_name_before_legacy_name() {
+        let names = bundled_runtimed_binary_names();
+        let expected_primary = if cfg!(windows) {
+            format!("{}.exe", runt_workspace::daemon_binary_basename())
+        } else {
+            runt_workspace::daemon_binary_basename().to_string()
+        };
+
+        assert_eq!(names.first(), Some(&expected_primary));
+        if runt_workspace::daemon_binary_basename() != "runtimed" {
+            let expected_legacy = if cfg!(windows) {
+                "runtimed.exe"
+            } else {
+                "runtimed"
+            };
+            assert_eq!(names.get(1).map(String::as_str), Some(expected_legacy));
+        }
+    }
+
     /// Test that the shutdown command correctly identifies UUIDs vs file paths.
     /// This is critical for handling both saved notebooks (paths) and untitled
     /// notebooks (UUIDs).
@@ -4821,6 +4972,54 @@ mod tests {
         assert!(
             result.is_ok(),
             "Stopping non-existent process should succeed (already dead)"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_start_confirmation_returns_after_running_probe() {
+        let attempts = std::cell::Cell::new(0);
+
+        let status = super::wait_for_daemon_start_confirmation(
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                async move {
+                    if attempt == 3 {
+                        DaemonStartupStatus::Running
+                    } else {
+                        DaemonStartupStatus::NotRunning {
+                            detail: format!("attempt {attempt} not ready"),
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(status, DaemonStartupStatus::Running);
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn daemon_start_confirmation_reports_last_probe_state_on_timeout() {
+        let status = super::wait_for_daemon_start_confirmation(
+            Duration::ZERO,
+            Duration::from_millis(1),
+            || async {
+                DaemonStartupStatus::NotRunning {
+                    detail: "launchd loaded service without a pid".to_string(),
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            DaemonStartupStatus::NotRunning {
+                detail: "launchd loaded service without a pid".to_string(),
+            }
         );
     }
 

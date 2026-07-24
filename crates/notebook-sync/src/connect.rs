@@ -25,8 +25,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 
 use notebook_protocol::connection::{
-    self, ConnectionBootstrap, FrameSink, FrameSource, Handshake, NotebookConnectionInfo,
-    ProtocolCapabilities, PROTOCOL_V4,
+    self, ConnectionBootstrap, CreateNotebookEnvironmentMode, CreateNotebookRequest, FrameSink,
+    FrameSource, Handshake, NotebookConnectionInfo, PackageManager, ProtocolCapabilities,
+    PROTOCOL_V4,
 };
 use notebook_protocol::protocol::NotebookBroadcast;
 
@@ -91,6 +92,85 @@ pub struct RelayCreateResult {
 
     /// Connection info from the daemon (notebook_id, trust status, etc).
     pub info: NotebookConnectionInfo,
+}
+
+/// What to create when connecting via the `CreateNotebook` handshake.
+///
+/// [`CreateNotebookSpec::new`] describes the common case: a non-ephemeral
+/// notebook with no seeded dependencies, a daemon-chosen notebook id, the
+/// daemon's default package manager, auto environment mode, and an anonymous
+/// actor. Override individual fields (struct update syntax reads well) for
+/// the exceptions. The spec converts into the wire
+/// [`CreateNotebookRequest`] in one place; `typed_bootstrap` and the wire
+/// `operator` are owned by the connect functions, not by callers.
+#[derive(Debug, Clone)]
+pub struct CreateNotebookSpec {
+    /// Runtime type, e.g. "python" or "deno".
+    pub runtime: String,
+
+    /// Working directory for project file detection (pyproject.toml,
+    /// pixi.toml, environment.yml). Untitled notebooks have no path to
+    /// derive it from.
+    pub working_dir: Option<PathBuf>,
+
+    /// Notebook id hint for restoring an untitled notebook from a previous
+    /// session. `None` lets the daemon generate a fresh UUID.
+    pub notebook_id: Option<String>,
+
+    /// Actor label for this peer (e.g. `"local:kyle/desktop:window"`).
+    /// The wire `operator` suffix is derived from it: the text after the
+    /// first `/`, or the whole label when it contains none, so a bare
+    /// operator string passes through unchanged. [`connect_create`] also
+    /// uses it as the local Automerge actor until the daemon returns the
+    /// assembled authenticated label. Empty means anonymous.
+    pub actor_label: String,
+
+    /// When true the room lives only in memory; no .automerge is persisted
+    /// to disk. MCP agents use this for scratch compute.
+    pub ephemeral: bool,
+
+    /// Package manager preference. `None` uses the daemon's
+    /// default_python_env setting.
+    pub package_manager: Option<PackageManager>,
+
+    /// Dependencies seeded into notebook metadata before kernel auto-launch.
+    pub dependencies: Vec<String>,
+
+    /// Environment inheritance mode. `None` lets the daemon default to auto.
+    pub environment_mode: Option<CreateNotebookEnvironmentMode>,
+}
+
+impl CreateNotebookSpec {
+    /// Spec for `runtime` with every other field at its default (see the
+    /// type-level docs for what the defaults mean).
+    pub fn new(runtime: impl Into<String>) -> Self {
+        Self {
+            runtime: runtime.into(),
+            working_dir: None,
+            notebook_id: None,
+            actor_label: String::new(),
+            ephemeral: false,
+            package_manager: None,
+            dependencies: Vec::new(),
+            environment_mode: None,
+        }
+    }
+
+    /// Wire request for the `CreateNotebook` handshake. Always requests a
+    /// typed bootstrap; the operator suffix comes from `actor_label`.
+    fn into_request(self) -> CreateNotebookRequest {
+        CreateNotebookRequest {
+            runtime: self.runtime,
+            working_dir: self.working_dir.map(|p| p.to_string_lossy().to_string()),
+            notebook_id: self.notebook_id,
+            ephemeral: if self.ephemeral { Some(true) } else { None },
+            package_manager: self.package_manager,
+            environment_mode: self.environment_mode,
+            dependencies: self.dependencies,
+            typed_bootstrap: Some(true),
+            operator: operator_from_actor_label(&self.actor_label),
+        }
+    }
 }
 
 /// Platform-specific helper macro to connect to the daemon socket.
@@ -198,7 +278,10 @@ pub async fn connect_with_options(
 
     // Receive protocol capabilities. New daemons respond with a typed
     // SessionControl bootstrap; old daemons ignore typed_bootstrap and send the
-    // legacy untyped JSON frame.
+    // legacy untyped JSON frame. A NotebookSync attach normally yields bare
+    // ProtocolCapabilities; a refusal (the notebook is gone) arrives as a
+    // NotebookConnectionInfo with `error` set, which recv_typed_capabilities
+    // surfaces as an Err so we don't attach to an empty room.
     let caps = recv_typed_capabilities(&mut reader).await?;
     check_daemon_protocol_version(&caps);
 
@@ -275,70 +358,73 @@ pub async fn connect_open(
         })
 }
 
-/// Connect and create a new notebook.
+/// Connect and open a hosted cloud notebook through the daemon-mediated
+/// bridge.
+///
+/// The daemon resolves `url` against its machine-local cloud domain registry,
+/// dials the hosted room with its own credential, and serves this connection
+/// from the bridged daemon-local room. The returned connection info carries
+/// the daemon-local room id and the cloud-principal actor label this peer
+/// must author under.
+pub async fn connect_open_hosted(
+    socket_path: PathBuf,
+    url: &str,
+    operator: Option<String>,
+) -> Result<OpenResult, SyncError> {
+    let stream = connect_stream!(&socket_path);
+    let (reader, writer) = tokio::io::split(stream);
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut writer = tokio::io::BufWriter::new(writer);
+
+    connection::send_preamble(&mut writer).await?;
+
+    let handshake = Handshake::OpenHostedNotebook {
+        url: url.to_string(),
+        typed_bootstrap: Some(true),
+        operator,
+    };
+    connection::send_json_frame(&mut writer, &handshake)
+        .await
+        .map_err(|e| SyncError::Protocol(format!("Send handshake: {}", e)))?;
+
+    let info = recv_typed_connection_info(&mut reader).await?;
+
+    if let Some(ref error) = info.error {
+        return Err(SyncError::Protocol(error.clone()));
+    }
+
+    let notebook_id = info.notebook_id.clone();
+    let actor_label =
+        info.capabilities.actor_label.clone().ok_or_else(|| {
+            SyncError::Protocol("hosted open returned no actor label".to_string())
+        })?;
+
+    let bootstrap = notebook_doc::NotebookDoc::bootstrap(
+        notebook_doc::TextEncoding::UnicodeCodePoint,
+        &actor_label,
+    );
+    let doc = bootstrap.into_inner();
+    let peer_state = sync::State::new();
+
+    build_and_spawn(doc, peer_state, notebook_id, reader, writer)
+        .await
+        .map(|(handle, broadcast_rx)| OpenResult {
+            handle,
+            broadcast_rx,
+            info,
+        })
+}
+
+/// Connect and create a new notebook described by `spec`.
 ///
 /// The daemon creates an empty notebook room with one code cell and
 /// returns connection info with a generated UUID as the notebook_id.
-#[allow(clippy::too_many_arguments)]
 pub async fn connect_create(
     socket_path: PathBuf,
-    runtime: &str,
-    working_dir: Option<PathBuf>,
-    actor_label: &str,
-    ephemeral: bool,
-    package_manager: Option<notebook_protocol::connection::PackageManager>,
-    dependencies: Vec<String>,
+    spec: CreateNotebookSpec,
 ) -> Result<CreateResult, SyncError> {
-    connect_create_with_environment_mode(
-        socket_path,
-        runtime,
-        working_dir,
-        actor_label,
-        ephemeral,
-        package_manager,
-        dependencies,
-        None,
-    )
-    .await
-}
+    let actor_label = spec.actor_label.clone();
 
-#[allow(clippy::too_many_arguments)]
-pub async fn connect_create_with_environment_mode(
-    socket_path: PathBuf,
-    runtime: &str,
-    working_dir: Option<PathBuf>,
-    actor_label: &str,
-    ephemeral: bool,
-    package_manager: Option<notebook_protocol::connection::PackageManager>,
-    dependencies: Vec<String>,
-    environment_mode: Option<notebook_protocol::connection::CreateNotebookEnvironmentMode>,
-) -> Result<CreateResult, SyncError> {
-    connect_create_inner(
-        socket_path,
-        runtime,
-        working_dir,
-        None,
-        actor_label,
-        ephemeral,
-        package_manager,
-        dependencies,
-        environment_mode,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn connect_create_inner(
-    socket_path: PathBuf,
-    runtime: &str,
-    working_dir: Option<PathBuf>,
-    notebook_id: Option<String>,
-    actor_label: &str,
-    ephemeral: bool,
-    package_manager: Option<notebook_protocol::connection::PackageManager>,
-    dependencies: Vec<String>,
-    environment_mode: Option<notebook_protocol::connection::CreateNotebookEnvironmentMode>,
-) -> Result<CreateResult, SyncError> {
     let stream = connect_stream!(&socket_path);
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(reader);
@@ -348,19 +434,7 @@ async fn connect_create_inner(
     connection::send_preamble(&mut writer).await?;
 
     // Send create handshake
-    let handshake = Handshake::CreateNotebook {
-        runtime: runtime.to_string(),
-        working_dir: working_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
-        notebook_id,
-        ephemeral: if ephemeral { Some(true) } else { None },
-        package_manager,
-        environment_mode,
-        dependencies,
-        typed_bootstrap: Some(true),
-        operator: operator_from_actor_label(actor_label),
-    };
+    let handshake = Handshake::CreateNotebook(spec.into_request());
     connection::send_json_frame(&mut writer, &handshake)
         .await
         .map_err(|e| SyncError::Protocol(format!("Send handshake: {}", e)))?;
@@ -381,7 +455,7 @@ async fn connect_create_inner(
         info.capabilities
             .actor_label
             .as_deref()
-            .unwrap_or(actor_label),
+            .unwrap_or(&actor_label),
     );
     let doc = bootstrap.into_inner();
     let peer_state = sync::State::new();
@@ -617,50 +691,67 @@ pub async fn connect_open_relay_with_operator(
     Ok(RelayOpenResult { handle, info })
 }
 
+/// Open a hosted cloud notebook as a relay — transparent byte pipe, no local document.
+///
+/// The daemon resolves and owns the hosted credential/bridge. This client only
+/// carries the hosted locator in the connection handshake, then relays typed
+/// frames between the daemon-local room and the frontend WASM peer.
+pub async fn connect_open_hosted_relay(
+    socket_path: PathBuf,
+    url: &str,
+    frame_tx: mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<RelayOpenResult, SyncError> {
+    connect_open_hosted_relay_with_operator(socket_path, url, frame_tx, None).await
+}
+
+/// Open a hosted cloud notebook as a relay with a self-declared operator label.
+pub async fn connect_open_hosted_relay_with_operator(
+    socket_path: PathBuf,
+    url: &str,
+    frame_tx: mpsc::UnboundedSender<Vec<u8>>,
+    operator: Option<String>,
+) -> Result<RelayOpenResult, SyncError> {
+    let stream = connect_stream!(&socket_path);
+    let (reader, writer) = tokio::io::split(stream);
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut writer = tokio::io::BufWriter::new(writer);
+
+    connection::send_preamble(&mut writer).await?;
+
+    let handshake = Handshake::OpenHostedNotebook {
+        url: url.to_string(),
+        typed_bootstrap: Some(true),
+        operator,
+    };
+    connection::send_json_frame(&mut writer, &handshake)
+        .await
+        .map_err(|e| SyncError::Protocol(format!("Send handshake: {e}")))?;
+
+    let info = recv_typed_connection_info(&mut reader).await?;
+    if let Some(ref error) = info.error {
+        return Err(SyncError::Protocol(error.clone()));
+    }
+
+    let notebook_id = info.notebook_id.clone();
+    info!(
+        "[relay] Connected to hosted room {} (relay mode, no initial sync)",
+        notebook_id
+    );
+
+    let handle = spawn_relay(notebook_id, frame_tx, reader, writer);
+    Ok(RelayOpenResult { handle, info })
+}
+
 /// Create a notebook as a relay — transparent byte pipe, no local document.
 ///
 /// Same as `connect_open_relay` but for new notebooks. Performs the
-/// CreateNotebook handshake, then immediately starts piping.
-#[allow(clippy::too_many_arguments)]
+/// CreateNotebook handshake, then immediately starts piping. The relay has
+/// no local document, so only the operator derived from `spec.actor_label`
+/// matters for identity; the frontend WASM peer owns the sync protocol.
 pub async fn connect_create_relay(
     socket_path: PathBuf,
-    runtime: &str,
-    working_dir: Option<PathBuf>,
-    notebook_id: Option<String>,
+    spec: CreateNotebookSpec,
     frame_tx: mpsc::UnboundedSender<Vec<u8>>,
-    ephemeral: bool,
-    package_manager: Option<notebook_protocol::connection::PackageManager>,
-    dependencies: Vec<String>,
-    environment_mode: Option<notebook_protocol::connection::CreateNotebookEnvironmentMode>,
-) -> Result<RelayCreateResult, SyncError> {
-    connect_create_relay_with_operator(
-        socket_path,
-        runtime,
-        working_dir,
-        notebook_id,
-        frame_tx,
-        ephemeral,
-        package_manager,
-        dependencies,
-        environment_mode,
-        None,
-    )
-    .await
-}
-
-/// Create a notebook as a relay with a self-declared operator label.
-#[allow(clippy::too_many_arguments)]
-pub async fn connect_create_relay_with_operator(
-    socket_path: PathBuf,
-    runtime: &str,
-    working_dir: Option<PathBuf>,
-    notebook_id: Option<String>,
-    frame_tx: mpsc::UnboundedSender<Vec<u8>>,
-    ephemeral: bool,
-    package_manager: Option<notebook_protocol::connection::PackageManager>,
-    dependencies: Vec<String>,
-    environment_mode: Option<notebook_protocol::connection::CreateNotebookEnvironmentMode>,
-    operator: Option<String>,
 ) -> Result<RelayCreateResult, SyncError> {
     let stream = connect_stream!(&socket_path);
     let (reader, writer) = tokio::io::split(stream);
@@ -671,19 +762,7 @@ pub async fn connect_create_relay_with_operator(
     connection::send_preamble(&mut writer).await?;
 
     // Send create handshake
-    let handshake = Handshake::CreateNotebook {
-        runtime: runtime.to_string(),
-        working_dir: working_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
-        notebook_id,
-        ephemeral: if ephemeral { Some(true) } else { None },
-        package_manager,
-        environment_mode,
-        dependencies,
-        typed_bootstrap: Some(true),
-        operator,
-    };
+    let handshake = Handshake::CreateNotebook(spec.into_request());
     connection::send_json_frame(&mut writer, &handshake)
         .await
         .map_err(|e| SyncError::Protocol(format!("Send handshake: {}", e)))?;
@@ -799,6 +878,8 @@ where
         cmd_rx,
         frame_tx,
         notebook_id: notebook_id.clone(),
+        #[cfg(test)]
+        heartbeat_interval: None,
     };
 
     tokio::spawn(async move {
@@ -832,7 +913,14 @@ async fn recv_typed_capabilities<R: AsyncRead + Unpin>(
     if is_typed_bootstrap_frame(&frame) {
         match parse_typed_bootstrap_payload(&frame[1..])? {
             ConnectionBootstrap::ProtocolCapabilities { capabilities } => Ok(capabilities),
-            ConnectionBootstrap::NotebookConnectionInfo { info } => Ok(info.capabilities),
+            // A populated `error` means the daemon refused this attach (e.g. an
+            // untitled notebook that is gone); surface it as the definitive
+            // NotebookUnavailable (not a retryable Protocol error) so the caller
+            // does not attach to an empty room.
+            ConnectionBootstrap::NotebookConnectionInfo { info } => match info.error {
+                Some(error) => Err(SyncError::NotebookUnavailable(error)),
+                None => Ok(info.capabilities),
+            },
         }
     } else {
         serde_json::from_slice(&frame)
@@ -902,6 +990,64 @@ mod bootstrap_tests {
             actual.actor_label.as_deref(),
             Some("local:kyle/desktop:legacy")
         );
+    }
+
+    #[tokio::test]
+    async fn recv_typed_capabilities_surfaces_connection_info_error() {
+        // A daemon refusal (e.g. an untitled notebook that is gone) arrives as a
+        // NotebookConnectionInfo with `error` set. recv_typed_capabilities must
+        // surface it as an Err, not silently return capabilities — otherwise the
+        // caller attaches to an empty room.
+        let refused = NotebookConnectionInfo {
+            capabilities: ProtocolCapabilities::v4(Some("2.6.0".into())),
+            notebook_id: String::new(),
+            cell_count: 0,
+            needs_trust_approval: false,
+            error: Some("Notebook abc is no longer available (not found or evicted)".into()),
+            ephemeral: false,
+            notebook_path: None,
+        };
+        let mut buf = Vec::new();
+        connection::send_typed_bootstrap_frame(
+            &mut buf,
+            &ConnectionBootstrap::notebook_connection_info(refused),
+        )
+        .await
+        .unwrap();
+
+        let mut reader = std::io::Cursor::new(buf);
+        let err = recv_typed_capabilities(&mut reader).await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::NotebookUnavailable(ref msg) if msg.contains("no longer available")),
+            "expected refusal surfaced as NotebookUnavailable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_typed_capabilities_extracts_caps_from_connection_info_without_error() {
+        // A NotebookConnectionInfo with no error still yields its capabilities
+        // (a normal attach response can carry it).
+        let info = NotebookConnectionInfo {
+            capabilities: ProtocolCapabilities::v4(Some("2.6.0".into()))
+                .with_identity("local:kyle/desktop:ok", "owner"),
+            notebook_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            cell_count: 1,
+            needs_trust_approval: false,
+            error: None,
+            ephemeral: false,
+            notebook_path: None,
+        };
+        let mut buf = Vec::new();
+        connection::send_typed_bootstrap_frame(
+            &mut buf,
+            &ConnectionBootstrap::notebook_connection_info(info),
+        )
+        .await
+        .unwrap();
+
+        let mut reader = std::io::Cursor::new(buf);
+        let caps = recv_typed_capabilities(&mut reader).await.unwrap();
+        assert_eq!(caps.actor_label.as_deref(), Some("local:kyle/desktop:ok"));
     }
 
     #[tokio::test]

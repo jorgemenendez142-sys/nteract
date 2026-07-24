@@ -5,6 +5,7 @@ import {
   NOTEBOOK_RAIL_TAKEOVER_PANEL_CLASS_NAMES,
   NOTEBOOK_RAIL_TAKEOVER_STAGE_CLASS_NAME,
   NotebookPackagesPanel,
+  NotebookOutlinePanel,
   NotebookRail,
 } from "../NotebookRail";
 
@@ -50,6 +51,18 @@ describe("NotebookRail", () => {
       screen.getByText("Add Markdown headings to structure your notebook. They will appear here."),
     ).toBeVisible();
     expect(screen.queryByText("No headings yet.")).not.toBeInTheDocument();
+  });
+
+  it("accepts document-specific outline labels", () => {
+    render(
+      <NotebookOutlinePanel
+        items={[]}
+        ariaLabel="Document outline"
+        emptyMessage="Add headings to structure this document."
+      />,
+    );
+
+    expect(screen.getByText("Add headings to structure this document.")).toBeVisible();
   });
 
   it("renders outline items and reports selection through the adapter callback", () => {
@@ -109,6 +122,24 @@ describe("NotebookRail", () => {
     fireEvent.click(screen.getByRole("button", { name: "Packages" }));
     expect(onActivePanelChange).toHaveBeenCalledWith("packages");
     expect(onCollapsedChange).toHaveBeenCalledWith(false);
+  });
+
+  it("labels the comments rail as Discussions", () => {
+    render(
+      <NotebookRail
+        activePanelId="comments"
+        collapsed={false}
+        outlineItems={outlineItems}
+        packagesPanel={<NotebookPackagesPanel>Packages</NotebookPackagesPanel>}
+        commentsPanel={<div>Thread list</div>}
+        onActivePanelChange={vi.fn()}
+        onCollapsedChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Discussions" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Discussions" })).toBeVisible();
+    expect(screen.getByText("Thread list")).toBeVisible();
   });
 
   it("does not show the workstations rail item until the host supplies a panel", () => {
